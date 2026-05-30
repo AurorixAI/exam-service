@@ -1,0 +1,489 @@
+"""
+Integration tests — full HTTP API flow using TestClient + SQLite in-memory.
+
+Covers every endpoint end-to-end:
+  1. POST /exams/generate
+  2. POST /exams/{id}/publish
+  3. GET  /exams/{id}
+  4. GET  /exams/by-code/{code}
+  5. POST /exams/by-code/{code}/start
+  6. POST /exam-sessions/{id}/submit
+  7. GET  /exam-sessions/{id}/results
+  8. GET  /exams/{id}/sessions (list sessions)
+  9. POST /exams/{id}/close
+  10. Textbook endpoints (mocked DB rows)
+  11. Error paths (404, 400, 410)
+  12. Full student journey (generate → publish → start → submit → results)
+"""
+from __future__ import annotations
+
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
+os.environ.setdefault("APP_ENV", "testing")
+
+import pytest
+from unittest.mock import patch, MagicMock
+from tests.conftest import make_task, make_exam_in_db, make_session_in_db
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+TASKS_POOL = [
+    make_task(f"TASK_{i:03d}", answer=str(i * 3), difficulty="B")
+    for i in range(1, 11)
+]
+
+
+def mock_task_repo(tasks=None):
+    """Returns a context-manager mock that replaces TaskRepository."""
+    if tasks is None:
+        tasks = TASKS_POOL
+    m = MagicMock()
+    m.get_tasks_by_skills.return_value = tasks
+    m.get_tasks_by_toc_ids.return_value = tasks
+    m.expand_toc_ids.return_value = list(range(1, 5))
+    return m
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. POST /api/v1/exams/generate
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestGenerateExam:
+    def test_generate_by_skills_success(self, client):
+        with patch("src.api.router.TaskRepository", return_value=mock_task_repo()):
+            resp = client.post("/api/v1/exams/generate", json={
+                "title": "Алгебра 8 класс",
+                "skill_ids": ["SK_001", "SK_002"],
+                "tasks_count": 5,
+                "time_minutes": 45,
+            })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "draft"
+        assert data["tasks_count"] == 5
+        assert "exam_id" in data
+
+    def test_generate_by_toc_ids_success(self, client):
+        with patch("src.api.router.TaskRepository", return_value=mock_task_repo()):
+            resp = client.post("/api/v1/exams/generate", json={
+                "title": "Учебник Алгебра 8",
+                "paragraph_ids": [1, 2, 3],
+                "tasks_count": 5,
+                "time_minutes": 30,
+            })
+        assert resp.status_code == 200
+        assert resp.json()["tasks_count"] == 5
+
+    def test_generate_fails_without_source(self, client):
+        resp = client.post("/api/v1/exams/generate", json={
+            "title": "Без источника",
+            "tasks_count": 5,
+        })
+        assert resp.status_code == 400
+        assert "skill_ids" in resp.json()["detail"] or "paragraph_ids" in resp.json()["detail"]
+
+    def test_generate_fails_no_tasks_found(self, client):
+        empty_repo = MagicMock()
+        empty_repo.get_tasks_by_skills.return_value = []
+        with patch("src.api.router.TaskRepository", return_value=empty_repo):
+            resp = client.post("/api/v1/exams/generate", json={
+                "title": "Пустой экзамен",
+                "skill_ids": ["SK_NONEXISTENT"],
+                "tasks_count": 5,
+            })
+        assert resp.status_code == 400
+
+    def test_generate_title_too_short(self, client):
+        resp = client.post("/api/v1/exams/generate", json={
+            "title": "",
+            "skill_ids": ["SK_001"],
+            "tasks_count": 5,
+        })
+        assert resp.status_code == 422  # Pydantic validation
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. POST /api/v1/exams/{id}/publish
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPublishExam:
+    def test_publish_draft_success(self, client, db):
+        exam = make_exam_in_db(db, status="draft")
+        resp = client.post(f"/api/v1/exams/{exam.id}/publish", json={
+            "teacher_name": "Айгуль Серикова",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "active"
+        assert data["access_code"].startswith("EX")
+        assert len(data["access_code"]) == 10
+
+    def test_publish_not_found(self, client):
+        resp = client.post("/api/v1/exams/NONEXISTENT/publish", json={})
+        assert resp.status_code == 404
+
+    def test_publish_already_active(self, client, db):
+        exam = make_exam_in_db(db, status="active")
+        resp = client.post(f"/api/v1/exams/{exam.id}/publish", json={})
+        assert resp.status_code == 400
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. GET /api/v1/exams/{id}
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestGetExam:
+    def test_get_existing_exam(self, client, db):
+        exam = make_exam_in_db(db)
+        resp = client.get(f"/api/v1/exams/{exam.id}")
+        assert resp.status_code == 200
+        assert resp.json()["exam_id"] == exam.id
+        assert resp.json()["title"] == "Тестовый экзамен"
+
+    def test_get_nonexistent_returns_404(self, client):
+        resp = client.get("/api/v1/exams/DOES_NOT_EXIST")
+        assert resp.status_code == 404
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. GET /api/v1/exams/by-code/{code}
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestGetExamByCode:
+    def test_get_active_exam_by_code(self, client, db):
+        exam = make_exam_in_db(db, status="active")
+        # Manually set an access_code
+        exam.access_code = "EXTEST1234"
+        db.commit()
+
+        resp = client.get("/api/v1/exams/by-code/EXTEST1234")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["exam_id"] == exam.id
+        assert data["status"] == "active"
+
+    def test_get_draft_exam_by_code_returns_410(self, client, db):
+        exam = make_exam_in_db(db, status="draft")
+        exam.access_code = "EXDRAFT001"
+        db.commit()
+
+        resp = client.get("/api/v1/exams/by-code/EXDRAFT001")
+        assert resp.status_code == 410
+
+    def test_get_unknown_code_returns_404(self, client):
+        resp = client.get("/api/v1/exams/by-code/XXNOTEXIST")
+        assert resp.status_code == 404
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. POST /api/v1/exams/by-code/{code}/start
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestStartExam:
+    def _create_active_exam(self, db, code="EXSTART001"):
+        exam = make_exam_in_db(db, status="active", tasks=TASKS_POOL[:5])
+        exam.access_code = code
+        db.commit()
+        return exam
+
+    def test_start_creates_session(self, client, db):
+        self._create_active_exam(db)
+        resp = client.post("/api/v1/exams/by-code/EXSTART001/start", json={
+            "student_name": "Асель Нурланова",
+            "class_level": 8,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "session_id" in data
+        assert data["variant_number"] == 1
+        assert len(data["tasks"]) == 5
+        assert data["time_minutes"] == 45
+
+    def test_start_tasks_have_no_correct_answer(self, client, db):
+        """Tasks returned to student must NOT expose correct_answer."""
+        self._create_active_exam(db, code="EXSTART002")
+        resp = client.post("/api/v1/exams/by-code/EXSTART002/start", json={
+            "student_name": "Тест Студент",
+        })
+        for task in resp.json()["tasks"]:
+            assert "correct_answer" not in task
+
+    def test_start_closed_exam_returns_410(self, client, db):
+        exam = make_exam_in_db(db, status="closed")
+        exam.access_code = "EXCLOSED01"
+        db.commit()
+        resp = client.post("/api/v1/exams/by-code/EXCLOSED01/start", json={
+            "student_name": "Тест",
+        })
+        assert resp.status_code == 410
+
+    def test_start_requires_student_name(self, client, db):
+        self._create_active_exam(db, code="EXSTART003")
+        resp = client.post("/api/v1/exams/by-code/EXSTART003/start", json={
+            "student_name": "",
+        })
+        assert resp.status_code == 422
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. POST /api/v1/exam-sessions/{id}/submit
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSubmitExam:
+    def test_submit_all_correct(self, client, db):
+        tasks = [make_task(f"TASK_{i:03d}", answer=str(i * 3)) for i in range(1, 4)]
+        exam = make_exam_in_db(db, tasks=tasks)
+        session = make_session_in_db(db, exam)
+
+        answers = {t["task_id"]: t["correct_answer"] for t in tasks}
+        resp = client.post(f"/api/v1/exam-sessions/{session.id}/submit", json={
+            "answers": answers,
+            "time_spent_seconds": 120,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["correct_count"] == 3
+        assert data["total_tasks"] == 3
+        assert data["score"] == 30   # 3 × 10
+        assert data["percentage"] == 100.0
+
+    def test_submit_all_wrong(self, client, db):
+        tasks = [make_task("TASK_001", answer="42")]
+        exam = make_exam_in_db(db, tasks=tasks)
+        session = make_session_in_db(db, exam)
+
+        resp = client.post(f"/api/v1/exam-sessions/{session.id}/submit", json={
+            "answers": {"TASK_001": "99"},
+            "time_spent_seconds": 60,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["correct_count"] == 0
+        assert data["percentage"] == 0.0
+
+    def test_submit_partial(self, client, db):
+        tasks = [
+            make_task("TASK_001", answer="10"),
+            make_task("TASK_002", answer="20"),
+            make_task("TASK_003", answer="30"),
+        ]
+        exam = make_exam_in_db(db, tasks=tasks)
+        session = make_session_in_db(db, exam)
+
+        resp = client.post(f"/api/v1/exam-sessions/{session.id}/submit", json={
+            "answers": {"TASK_001": "10", "TASK_002": "99", "TASK_003": "30"},
+        })
+        data = resp.json()
+        assert data["correct_count"] == 2
+        assert data["percentage"] == pytest.approx(66.7, abs=0.1)
+
+    def test_submit_with_comma_decimal(self, client, db):
+        tasks = [make_task("TASK_001", answer="3.14", answer_type="decimal")]
+        exam = make_exam_in_db(db, tasks=tasks)
+        session = make_session_in_db(db, exam)
+
+        resp = client.post(f"/api/v1/exam-sessions/{session.id}/submit", json={
+            "answers": {"TASK_001": "3,14"},
+        })
+        assert resp.json()["correct_count"] == 1
+
+    def test_submit_twice_returns_400(self, client, db):
+        exam = make_exam_in_db(db)
+        session = make_session_in_db(db, exam, status="submitted")
+
+        resp = client.post(f"/api/v1/exam-sessions/{session.id}/submit", json={
+            "answers": {},
+        })
+        assert resp.status_code == 400
+
+    def test_submit_unknown_session_returns_404(self, client):
+        resp = client.post("/api/v1/exam-sessions/UNKNOWN/submit", json={"answers": {}})
+        assert resp.status_code == 404
+
+    def test_submit_empty_answers(self, client, db):
+        tasks = [make_task("TASK_001", answer="42")]
+        exam = make_exam_in_db(db, tasks=tasks)
+        session = make_session_in_db(db, exam)
+
+        resp = client.post(f"/api/v1/exam-sessions/{session.id}/submit", json={
+            "answers": {},
+        })
+        assert resp.status_code == 200
+        assert resp.json()["correct_count"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. GET /api/v1/exam-sessions/{id}/results
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestGetResults:
+    def test_results_after_submit(self, client, db):
+        tasks = [
+            make_task("TASK_001", answer="10"),
+            make_task("TASK_002", answer="20"),
+        ]
+        exam = make_exam_in_db(db, tasks=tasks)
+        session = make_session_in_db(db, exam)
+
+        # Submit first
+        client.post(f"/api/v1/exam-sessions/{session.id}/submit", json={
+            "answers": {"TASK_001": "10", "TASK_002": "99"},
+        })
+        # Now get results
+        resp = client.get(f"/api/v1/exam-sessions/{session.id}/results")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["correct_count"] == 1
+        assert data["total_tasks"] == 2
+        assert len(data["tasks"]) == 2
+
+        correct_tasks = [t for t in data["tasks"] if t["is_correct"]]
+        wrong_tasks = [t for t in data["tasks"] if not t["is_correct"]]
+        assert len(correct_tasks) == 1
+        assert len(wrong_tasks) == 1
+
+    def test_results_expose_correct_answer(self, client, db):
+        """After submission, results SHOULD show correct_answer."""
+        tasks = [make_task("TASK_001", answer="42")]
+        exam = make_exam_in_db(db, tasks=tasks)
+        session = make_session_in_db(db, exam)
+
+        client.post(f"/api/v1/exam-sessions/{session.id}/submit", json={
+            "answers": {"TASK_001": "99"},
+        })
+        resp = client.get(f"/api/v1/exam-sessions/{session.id}/results")
+        task_result = resp.json()["tasks"][0]
+        assert task_result["correct_answer"] == "42"
+        assert task_result["student_answer"] == "99"
+        assert task_result["is_correct"] is False
+
+    def test_results_before_submit_returns_400(self, client, db):
+        exam = make_exam_in_db(db)
+        session = make_session_in_db(db, exam, status="in_progress")
+        resp = client.get(f"/api/v1/exam-sessions/{session.id}/results")
+        assert resp.status_code == 400
+
+    def test_results_unknown_session_returns_404(self, client):
+        resp = client.get("/api/v1/exam-sessions/UNKNOWN/results")
+        assert resp.status_code == 404
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. POST /api/v1/exams/{id}/close
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCloseExam:
+    def test_close_active_exam(self, client, db):
+        exam = make_exam_in_db(db, status="active")
+        resp = client.post(f"/api/v1/exams/{exam.id}/close")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "closed"
+
+    def test_close_nonexistent_returns_404(self, client):
+        resp = client.post("/api/v1/exams/NOEXIST/close")
+        assert resp.status_code == 404
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 9. GET /api/v1/exams/{id}/sessions
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestListSessions:
+    def test_list_sessions_empty(self, client, db):
+        exam = make_exam_in_db(db, status="active")
+        resp = client.get(f"/api/v1/exams/{exam.id}/sessions")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_list_sessions_one(self, client, db):
+        exam = make_exam_in_db(db, status="active")
+        make_session_in_db(db, exam)
+        resp = client.get(f"/api/v1/exams/{exam.id}/sessions")
+        assert resp.status_code == 200
+        assert len(resp.json()) == 1
+
+    def test_list_sessions_nonexistent_exam(self, client):
+        resp = client.get("/api/v1/exams/NOEXIST/sessions")
+        assert resp.status_code == 404
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 10. Full student journey (E2E)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFullStudentJourney:
+    def test_generate_publish_start_submit_results(self, client, db):
+        # 1. Teacher generates exam
+        with patch("src.api.router.TaskRepository", return_value=mock_task_repo(TASKS_POOL[:3])):
+            gen = client.post("/api/v1/exams/generate", json={
+                "title": "E2E тест",
+                "skill_ids": ["SK_001"],
+                "tasks_count": 3,
+                "time_minutes": 20,
+            })
+        assert gen.status_code == 200
+        exam_id = gen.json()["exam_id"]
+
+        # 2. Teacher publishes
+        pub = client.post(f"/api/v1/exams/{exam_id}/publish", json={
+            "teacher_name": "Мария Петровна",
+        })
+        assert pub.status_code == 200
+        code = pub.json()["access_code"]
+        assert code.startswith("EX")
+
+        # 3. Student sees exam info
+        info = client.get(f"/api/v1/exams/by-code/{code}")
+        assert info.status_code == 200
+        assert info.json()["status"] == "active"
+
+        # 4. Student starts
+        start = client.post(f"/api/v1/exams/by-code/{code}/start", json={
+            "student_name": "Болат Ахметов",
+            "class_level": 9,
+        })
+        assert start.status_code == 200
+        session_id = start.json()["session_id"]
+        tasks = start.json()["tasks"]
+        assert len(tasks) == 3
+        # No correct_answer exposed
+        for t in tasks:
+            assert "correct_answer" not in t
+
+        # 5. Student submits — answer all correctly from TASKS_POOL
+        # We know the correct answers from our fixture
+        answers = {}
+        for t in TASKS_POOL[:3]:
+            answers[t["task_id"]] = t["correct_answer"]
+
+        sub = client.post(f"/api/v1/exam-sessions/{session_id}/submit", json={
+            "answers": answers,
+            "time_spent_seconds": 300,
+        })
+        assert sub.status_code == 200
+        sub_data = sub.json()
+        assert sub_data["correct_count"] == 3
+        assert sub_data["percentage"] == 100.0
+
+        # 6. Student views results
+        res = client.get(f"/api/v1/exam-sessions/{session_id}/results")
+        assert res.status_code == 200
+        res_data = res.json()
+        assert res_data["student_name"] == "Болат Ахметов"
+        assert res_data["correct_count"] == 3
+        assert all(t["is_correct"] for t in res_data["tasks"])
+
+        # 7. Teacher closes
+        close = client.post(f"/api/v1/exams/{exam_id}/close")
+        assert close.status_code == 200
+        assert close.json()["status"] == "closed"
+
+        # 8. Student can no longer start after close
+        start_after_close = client.post(f"/api/v1/exams/by-code/{code}/start", json={
+            "student_name": "Другой студент",
+        })
+        assert start_after_close.status_code == 410

@@ -1,0 +1,102 @@
+# ==============================================================================
+# ALGO Exam Service — Production Docker Compose
+# Differences from docker-compose.yml:
+#   - No default values for secrets
+#   - Postgres/Redis ports NOT exposed to host
+#   - Healthcheck uses /health/live
+# ==============================================================================
+
+version: "3.9"
+
+services:
+  exam-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: algo-exam:latest
+    container_name: algo-exam
+    ports:
+      - "8003:8003"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      APP_ENV: production
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      AUTH_SERVICE_URL: ${AUTH_SERVICE_URL:-http://algo-auth:8000}
+      CONTENT_SERVICE_URL: ${CONTENT_SERVICE_URL:-http://content-api:8004}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - algo-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: algo-postgres-exam
+    # NOTE: port NOT exposed in production
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-algo_exam}
+    volumes:
+      - exam_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB:-algo_exam}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - algo-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: algo-redis-exam
+    # NOTE: port NOT exposed in production
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - exam_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - algo-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  exam_postgres_data:
+    driver: local
+  exam_redis_data:
+    driver: local
+
+networks:
+  algo-network:
+    external: true
+    name: algo-network

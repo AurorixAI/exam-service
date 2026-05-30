@@ -1,0 +1,75 @@
+version: "3.9"
+
+services:
+  exam-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: algo-exam
+    ports:
+      - "8003:8003"
+    environment:
+      DATABASE_URL: postgresql://algo:algo_password@algo-postgres-exam:5432/algo_exam
+      CONTENT_DB_URL: postgresql://algo:algo_password@content-postgres:5432/algo_content
+      REDIS_URL: redis://algo-redis-exam:6379
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - algo-network
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: algo-postgres-exam
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_USER: algo
+      POSTGRES_PASSWORD: algo_password
+      POSTGRES_DB: algo_exam
+    volumes:
+      - exam_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U algo -d algo_exam"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - algo-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: algo-redis-exam
+    ports:
+      - "6382:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - exam_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - algo-network
+
+volumes:
+  exam_postgres_data:
+  exam_redis_data:
+
+networks:
+  algo-network:
+    external: true
+    name: algo-network
+
+
