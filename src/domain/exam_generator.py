@@ -365,7 +365,7 @@ class ExamGenerator:
                 SELECT tt.task_id, tt.exercise_number,
                        tm.skill_id, tm.difficulty, tm.question_text,
                        tm.correct_answer, tm.question_latex,
-                       FALSE AS has_template, tm.solution_steps
+                       FALSE AS has_template
                 FROM textbook_tasks tt
                 JOIN tasks_master tm ON tt.task_id = tm.id
                 WHERE tt.textbook_id = :textbook_id

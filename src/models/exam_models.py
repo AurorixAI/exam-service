@@ -65,6 +65,41 @@ class GeneratedExam(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class ExamReport(Base):
+    """
+    On-demand LLM narrative report for a whole exam (one per exam).
+
+    Generation flow:
+      POST /exams/{exam_id}/report  →  aggregate sessions → Gemini → persist here
+      GET  /exams/{exam_id}/report  →  return cached row
+
+    Force refresh: POST /exams/{exam_id}/report?force=true (overwrites)
+    """
+    __tablename__ = "exam_reports"
+
+    id = Column(String(30), primary_key=True)
+    exam_id = Column(String(30), ForeignKey("generated_exams.id"), nullable=False, unique=True)
+
+    # Snapshot of aggregated stats at generation time
+    total_students = Column(Integer, default=0)
+    submitted_count = Column(Integer, default=0)
+    avg_score_pct = Column(Numeric(5, 2), default=0)
+    pass_rate_pct = Column(Numeric(5, 2), default=0)
+
+    # Aggregated analytics snapshots (mirrors analytics endpoint output)
+    task_analytics = Column(JSONB, nullable=True)   # List[{question_preview, skill_name, correct_rate, ...}]
+    top_errors = Column(JSONB, nullable=True)        # List[{error_type, explanation, count, ...}]
+
+    # LLM narrative
+    narrative_ru = Column(Text, nullable=True)
+    narrative_generated = Column(Boolean, default=False)
+
+    # State
+    is_final = Column(Boolean, default=False)       # True when exam is closed
+    generated_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
 class ExamSession(Base):
     """
     One student's attempt at a GeneratedExam variant.
@@ -87,6 +122,9 @@ class ExamSession(Base):
     total_tasks = Column(Integer, default=0)
 
     time_spent_seconds = Column(Integer, default=0)
+
+    # {task_id: {hit: bool, distractor_value: str, error_type: str, explanation: str}}
+    distractor_analytics = Column(JSONB, nullable=True, default=None)
 
     status = Column(String(20), nullable=False, default="in_progress")
     # in_progress | submitted

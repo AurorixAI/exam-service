@@ -64,9 +64,6 @@ class VariantTask:
     answer_options: List[str] = field(default_factory=list)
     distractor_meta: List[Dict[str, Any]] = field(default_factory=list)
 
-    # Шаги решения
-    solution_steps: List[Dict[str, str]] = field(default_factory=list)
-
     # Источник
     source_task_id: str = ""  # ID оригинальной задачи
     is_original: bool = True  # False если сгенерирован из шаблона
@@ -84,7 +81,6 @@ class VariantTask:
             "difficulty": self.difficulty,
             "answer_options": self.answer_options,
             "distractor_meta": self.distractor_meta,
-            "solution_steps": self.solution_steps,
             "source_task_id": self.source_task_id,
             "is_original": self.is_original,
             "param_values": self.param_values,
@@ -512,7 +508,6 @@ class VariantOrchestrator:
             difficulty=original_task.get("difficulty", "medium"),
             answer_options=options,
             distractor_meta=distractor_meta,
-            solution_steps=steps_dicts,
             source_task_id=original_task.get("task_id", ""),
             is_original=False,
             param_values=param_values,
@@ -531,7 +526,6 @@ class VariantOrchestrator:
             difficulty=task.get("difficulty", "medium"),
             answer_options=task.get("answer_options", task.get("options", [])) or [],
             distractor_meta=task.get("distractor_meta", []),
-            solution_steps=[],
             source_task_id=task.get("task_id", ""),
             is_original=True,
             param_values={},

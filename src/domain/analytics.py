@@ -227,7 +227,6 @@ class ExamAnalytics:
                     "skill_name": str,
                     "correct_answer": str,
                     "distractors": [{"value":..., "error_type":..., "explanation":...}],
-                    "common_mistakes": [...],
                 }
 
         Returns:
@@ -322,7 +321,7 @@ class ExamAnalytics:
             else:
                 error_pattern = "unknown_error"
 
-        # 3. Пробелы в навыках (из common_mistakes + prerequisite chain)
+        # 3. Пробелы в навыках (distractor error_type + prerequisite chain)
         skill_gaps: List[SkillGap] = []
         if not is_correct:
             skill_gaps = self._identify_skill_gaps(
@@ -382,22 +381,8 @@ class ExamAnalytics:
         error_pattern: str,
         meta: Dict[str, Any],
     ) -> List[SkillGap]:
-        """Определяет пробелы: проверяет common_mistakes и prerequisites."""
+        """Определяет пробелы по навыку на основе error_pattern и prerequisites."""
         gaps: List[SkillGap] = []
-
-        # Из common_mistakes метаданных задачи
-        for mistake in meta.get("common_mistakes", []):
-            if isinstance(mistake, dict):
-                gap_skill = mistake.get("related_skill_id", skill_id)
-                gaps.append(
-                    SkillGap(
-                        skill_id=gap_skill,
-                        skill_name=mistake.get("related_skill_name", skill_name),
-                        gap_type=mistake.get("gap_type", "procedural_error"),
-                        severity=mistake.get("severity", 0.5),
-                        recommendation=mistake.get("recommendation", ""),
-                    )
-                )
 
         # Если нет конкретных ошибок — общий пробел по данному навыку
         if not gaps:

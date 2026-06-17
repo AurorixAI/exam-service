@@ -8,6 +8,9 @@ Endpoints:
     POST /exams/{id}/publish        — publish → access_code
     GET  /exams/{id}                — exam detail (teacher view)
     GET  /exams                     — list teacher's exams
+    GET  /exams/{id}/analytics      — live class analytics (no LLM, instant)
+    POST /exams/{id}/report         — generate on-demand LLM narrative report
+    GET  /exams/{id}/report         — retrieve cached report
   STUDENT (public, by access_code)
     GET  /exams/by-code/{code}      — exam info
     POST /exams/by-code/{code}/start — start session
@@ -42,7 +45,7 @@ from src.core.exceptions import (
 )
 from src.models import GeneratedExam, ExamSession
 from src.repositories.task_repo import TaskRepository, TextbookRepository
-from src.repositories.exam_repo import ExamRepository, SessionRepository
+from src.repositories.exam_repo import ExamRepository, SessionRepository, ExamReportRepository
 
 try:
     from src.domain.variant_orchestrator import VariantOrchestrator
@@ -141,6 +144,12 @@ class SubmitExamResponse(BaseModel):
     percentage: float
 
 
+class DistractorHit(BaseModel):
+    distractor_value: str
+    error_type: str
+    explanation: str
+
+
 class TaskResultItem(BaseModel):
     task_id: str
     text: str
@@ -149,6 +158,7 @@ class TaskResultItem(BaseModel):
     is_correct: bool
     options: List[str] = []
     skill_name: str = ""
+    distractor_hit: Optional[DistractorHit] = None
 
 
 class SessionResultResponse(BaseModel):
@@ -344,18 +354,29 @@ def _build_mc_options(task: dict) -> List[str]:
     return []
 
 
-def _normalise_answer(answer: str) -> str:
-    return answer.strip().lower().replace(",", ".") if answer else ""
+from src.domain.answer_utils import normalise_answer as _normalise_answer, check_answer as _check_answer
 
 
-def _check_answer(student: str, correct: str) -> bool:
-    s, c = _normalise_answer(student), _normalise_answer(correct)
-    if s == c:
-        return True
-    try:
-        return abs(float(s) - float(c)) < 0.01
-    except (ValueError, TypeError):
-        return False
+def _match_distractor(student: str, distractor_meta: list) -> dict | None:
+    """Проверяет совпадение ответа ученика с дистрактором.
+
+    Возвращает dict с данными дистрактора или None.
+    """
+    if not distractor_meta or not student:
+        return None
+    s = _normalise_answer(student)
+    for d in distractor_meta:
+        if not isinstance(d, dict):
+            continue
+        d_val = _normalise_answer(str(d.get("value", "")))
+        if s == d_val:
+            return d
+        try:
+            if abs(float(s) - float(d_val)) < 0.01:
+                return d
+        except (ValueError, TypeError):
+            pass
+    return None
 
 
 def _build_task_pool(
@@ -803,13 +824,24 @@ async def submit_exam(
     )
     tasks_raw = variant.get("tasks", []) if variant else []
 
-    # Grade
+    # Grade + distractor analytics
     correct_count = 0
+    distractor_analytics: dict = {}
     for t in tasks_raw:
         task_id = t.get("task_id", "")
         student_ans = req.answers.get(task_id, "")
-        if _check_answer(student_ans, t.get("correct_answer", "")):
+        is_correct = _check_answer(student_ans, t.get("correct_answer", ""))
+        if is_correct:
             correct_count += 1
+        else:
+            hit = _match_distractor(student_ans, t.get("distractor_meta") or [])
+            if hit:
+                distractor_analytics[task_id] = {
+                    "hit": True,
+                    "distractor_value": str(hit.get("value", "")),
+                    "error_type": hit.get("error_type", ""),
+                    "explanation": hit.get("explanation", ""),
+                }
 
     total_tasks = len(tasks_raw)
     score = correct_count * 10
@@ -818,6 +850,7 @@ async def submit_exam(
     sess_repo.submit(
         session, req.answers, score, max_score,
         correct_count, total_tasks, req.time_spent_seconds,
+        distractor_analytics=distractor_analytics or None,
     )
 
     return SubmitExamResponse(
@@ -848,6 +881,7 @@ async def get_results(session_id: str, db: Session = Depends(get_db)):
     )
     tasks_raw = variant.get("tasks", []) if variant else []
 
+    dist_analytics = session.distractor_analytics or {}
     task_items = []
     for t in tasks_raw:
         task_id = t.get("task_id", "")
@@ -855,6 +889,7 @@ async def get_results(session_id: str, db: Session = Depends(get_db)):
         student_answer = (session.answers or {}).get(task_id)
         is_correct = _check_answer(student_answer or "", correct_answer)
         options = _build_mc_options(t) if t.get("answer_options") else []
+        d_hit = dist_analytics.get(task_id)
         task_items.append(TaskResultItem(
             task_id=task_id,
             text=t.get("question_text", ""),
@@ -863,6 +898,11 @@ async def get_results(session_id: str, db: Session = Depends(get_db)):
             is_correct=is_correct,
             options=options,
             skill_name=t.get("skill_name", ""),
+            distractor_hit=DistractorHit(
+                distractor_value=d_hit["distractor_value"],
+                error_type=d_hit["error_type"],
+                explanation=d_hit["explanation"],
+            ) if d_hit else None,
         ))
 
     max_score = session.max_score or (len(tasks_raw) * 10)
@@ -1096,8 +1136,12 @@ class ExamAnalyticsResponse(BaseModel):
     submitted_sessions: int
     avg_score_pct: float
     avg_time_seconds: float
-    pass_rate_pct: float  # % scored >= 50%
-    skill_gaps: List[dict] = []
+    pass_rate_pct: float
+    # Единый список задач: correct_rate + distractor_hits вместе
+    # Отсортировано от худшего к лучшему
+    task_analytics: List[dict] = []
+    # Топ-5 самых частых ошибок по всему экзамену
+    top_errors: List[dict] = []
 
 
 @router.get("/exams/{exam_id}/analytics", response_model=ExamAnalyticsResponse,
@@ -1142,13 +1186,16 @@ async def get_exam_analytics(exam_id: str, db: Session = Depends(get_db)):
     # Per-task correctness analysis
     task_correct: Dict[str, int] = {}
     task_total: Dict[str, int] = {}
-    task_names: Dict[str, str] = {}
 
-    # Build correct-answer lookup from exam variants
+    # Build task metadata lookup from exam variants (первый вариант = эталон)
     task_lookup: Dict[str, dict] = {}
     for v in (exam.variants or []):
         for t in v.get("tasks", []):
-            task_lookup[t["task_id"]] = t
+            if t["task_id"] not in task_lookup:
+                task_lookup[t["task_id"]] = t
+
+    # {task_id: {explanation_key: {explanation, error_type, count}}}
+    task_distractor_hits: Dict[str, Dict[str, dict]] = {}
 
     for s in submitted:
         for task_id, student_ans in (s.answers or {}).items():
@@ -1157,20 +1204,100 @@ async def get_exam_analytics(exam_id: str, db: Session = Depends(get_db)):
             task_total[task_id] = task_total.get(task_id, 0) + 1
             if _check_answer(student_ans, correct_ans):
                 task_correct[task_id] = task_correct.get(task_id, 0) + 1
-            task_names[task_id] = task.get("skill_name", "")
 
-    skill_gaps = []
-    for task_id, total_attempts in task_total.items():
+        # Агрегируем дистрактор-попадания
+        for task_id, hit in (s.distractor_analytics or {}).items():
+            if not isinstance(hit, dict) or not hit.get("hit"):
+                continue
+            error_type = hit.get("error_type", "unknown")
+            explanation = hit.get("explanation", "")
+            # Ключ группировки: error_type (+ первые 60 символов для уникальности)
+            key = f"{error_type}::{explanation[:60]}"
+            bucket = task_distractor_hits.setdefault(task_id, {})
+            if key not in bucket:
+                bucket[key] = {
+                    "explanation": explanation,
+                    "error_type": error_type,
+                    "count": 0,
+                }
+            bucket[key]["count"] += 1
+
+    # ── Объединённый список задач ─────────────────────────────────────────────
+    all_task_ids = set(task_total.keys()) | set(task_distractor_hits.keys())
+    task_analytics = []
+    for task_id in all_task_ids:
+        total_attempts = task_total.get(task_id, 0)
         correct = task_correct.get(task_id, 0)
-        rate = correct / total_attempts
-        skill_gaps.append({
-            "task_id": task_id,
-            "skill_name": task_names.get(task_id, ""),
-            "correct_rate": round(rate, 3),
+        wrong = total_attempts - correct
+        rate = round(correct / total_attempts, 3) if total_attempts else 0.0
+
+        task_meta = task_lookup.get(task_id, {})
+        # Название темы: skill_name → fallback к toc/question начало
+        skill_name = (
+            task_meta.get("skill_name")
+            or task_meta.get("toc_title")
+            or ""
+        )
+        # Первые 120 символов вопроса — учитель сразу узнаёт задачу
+        question_preview = (task_meta.get("question_text") or "")[:120].strip()
+
+        hits = task_distractor_hits.get(task_id, {})
+        distractor_hits = sorted(
+            [
+                {
+                    "explanation": info["explanation"],
+                    "count": info["count"],
+                    "students_pct": round(info["count"] / max(wrong, 1) * 100, 1),
+                }
+                for info in hits.values()
+            ],
+            key=lambda x: x["count"],
+            reverse=True,
+        )
+
+        task_analytics.append({
+            "question_preview": question_preview,
+            "skill_name": skill_name,
             "attempts": total_attempts,
+            "correct_count": correct,
+            "wrong_count": wrong,
+            "correct_rate": rate,
+            "distractor_hits": distractor_hits,
         })
-    # Sorted by worst performance first
-    skill_gaps.sort(key=lambda x: x["correct_rate"])
+
+    # Сортировка: самые провальные задачи первыми
+    task_analytics.sort(key=lambda x: (x["correct_rate"], -x["attempts"]))
+
+    # ── Топ-5 типичных ошибок по всему экзамену ───────────────────────────────
+    # Агрегируем одинаковые объяснения из разных задач
+    error_aggregate: Dict[str, dict] = {}
+    for item in task_analytics:
+        for hit in item["distractor_hits"]:
+            key = hit["explanation"][:80]
+            if key not in error_aggregate:
+                error_aggregate[key] = {
+                    "explanation": hit["explanation"],
+                    "total_count": 0,
+                    "affected_tasks": [],
+                }
+            error_aggregate[key]["total_count"] += hit["count"]
+            error_aggregate[key]["affected_tasks"].append(
+                item.get("skill_name") or item["task_id"]
+            )
+
+    top_errors = sorted(
+        [
+            {
+                "explanation": v["explanation"],
+                "total_count": v["total_count"],
+                "affected_skills": list(dict.fromkeys(v["affected_tasks"]))[:3],
+                "students_pct": round(v["total_count"] / max(n_submitted, 1) * 100, 1),
+            }
+            for v in error_aggregate.values()
+        ],
+        key=lambda x: x["total_count"],
+        reverse=True,
+    )[:5]
 
     return ExamAnalyticsResponse(
         exam_id=exam_id,
@@ -1180,5 +1307,111 @@ async def get_exam_analytics(exam_id: str, db: Session = Depends(get_db)):
         avg_score_pct=round(avg_pct, 1),
         avg_time_seconds=round(avg_time, 1),
         pass_rate_pct=round(pass_rate, 1),
-        skill_gaps=skill_gaps,
+        task_analytics=task_analytics,
+        top_errors=top_errors,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# On-demand Exam Report (LLM Narrative)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class ExamReportResponse(BaseModel):
+    exam_id: str
+    title: str
+    total_students: int
+    submitted_count: int
+    avg_score_pct: float
+    pass_rate_pct: float
+    task_analytics: List[dict] = []
+    top_errors: List[dict] = []
+    narrative_ru: Optional[str] = None
+    narrative_generated: bool = False
+    is_final: bool = False
+    generated_at: Optional[str] = None
+
+
+@router.post(
+    "/exams/{exam_id}/report",
+    response_model=ExamReportResponse,
+    summary="Сгенерировать / обновить LLM-отчёт по экзамену (учитель)",
+)
+async def generate_exam_report_endpoint(
+    exam_id: str,
+    force: bool = Query(False, description="Перегенерировать даже если отчёт уже есть"),
+    db: Session = Depends(get_db),
+):
+    """
+    Генерирует нарратив с помощью Gemini на основе агрегированной аналитики.
+    Идемпотентен: повторный вызов вернёт кешированный отчёт (если force=false).
+    Параметр ?force=true перезапишет существующий отчёт.
+    """
+    from src.domain.report_generator import generate_exam_report
+
+    exam = ExamRepository(db).get_by_id(exam_id)
+    if not exam:
+        raise HTTPException(404, "Экзамен не найден")
+
+    sessions = (
+        db.query(ExamSession).filter(ExamSession.exam_id == exam_id).all()
+    )
+
+    report = generate_exam_report(db, exam=exam, sessions=sessions, force=force)
+    if report is None:
+        raise HTTPException(422, "Нет сданных работ — отчёт не может быть сформирован")
+
+    return ExamReportResponse(
+        exam_id=exam_id,
+        title=exam.title,
+        total_students=report.total_students,
+        submitted_count=report.submitted_count,
+        avg_score_pct=float(report.avg_score_pct or 0),
+        pass_rate_pct=float(report.pass_rate_pct or 0),
+        task_analytics=report.task_analytics or [],
+        top_errors=report.top_errors or [],
+        narrative_ru=report.narrative_ru,
+        narrative_generated=report.narrative_generated or False,
+        is_final=report.is_final or False,
+        generated_at=report.generated_at.isoformat() if report.generated_at else None,
+    )
+
+
+@router.get(
+    "/exams/{exam_id}/report",
+    response_model=ExamReportResponse,
+    summary="Получить сохранённый LLM-отчёт по экзамену (учитель)",
+)
+async def get_exam_report_endpoint(
+    exam_id: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Возвращает ранее сгенерированный отчёт.
+    Если отчёта ещё нет — 404, учитель должен сначала вызвать POST /exams/{id}/report.
+    """
+    exam = ExamRepository(db).get_by_id(exam_id)
+    if not exam:
+        raise HTTPException(404, "Экзамен не найден")
+
+    report = ExamReportRepository(db).get_by_exam(exam_id)
+    if not report:
+        raise HTTPException(
+            404,
+            "Отчёт ещё не сгенерирован. Вызовите POST /exams/{exam_id}/report",
+        )
+
+    return ExamReportResponse(
+        exam_id=exam_id,
+        title=exam.title,
+        total_students=report.total_students,
+        submitted_count=report.submitted_count,
+        avg_score_pct=float(report.avg_score_pct or 0),
+        pass_rate_pct=float(report.pass_rate_pct or 0),
+        task_analytics=report.task_analytics or [],
+        top_errors=report.top_errors or [],
+        narrative_ru=report.narrative_ru,
+        narrative_generated=report.narrative_generated or False,
+        is_final=report.is_final or False,
+        generated_at=report.generated_at.isoformat() if report.generated_at else None,
     )

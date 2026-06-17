@@ -100,10 +100,7 @@ class TaskMaster(Base):
     irt_difficulty = Column(Numeric(6, 4), default=0.0)
     irt_guessing = Column(Numeric(6, 4), default=0.0)
 
-    solution_steps = Column(JSONB)
     solution_explanation = Column(Text)
-    hints = Column(JSONB)
-    common_mistakes = Column(JSONB)
     distractor_meta = Column(JSONB)
     sympy_solution = Column(Text)
 
