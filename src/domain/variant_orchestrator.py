@@ -59,6 +59,9 @@ class VariantTask:
     skill_id: str = ""
     skill_name: str = ""
     difficulty: str = "medium"
+    question_latex: Optional[str] = None
+    question_image_url: Optional[str] = None
+    correct_answer_latex: Optional[str] = None
 
     # Дистракторы
     answer_options: List[str] = field(default_factory=list)
@@ -74,7 +77,10 @@ class VariantTask:
         return {
             "task_id": self.task_id,
             "question_text": self.question_text,
+            "question_latex": self.question_latex,
+            "question_image_url": self.question_image_url,
             "correct_answer": self.correct_answer,
+            "correct_answer_latex": self.correct_answer_latex,
             "answer_type": self.answer_type,
             "skill_id": self.skill_id,
             "skill_name": self.skill_name,
@@ -506,6 +512,9 @@ class VariantOrchestrator:
             skill_id=original_task.get("skill_id", ""),
             skill_name=original_task.get("skill_name", ""),
             difficulty=original_task.get("difficulty", "medium"),
+            question_latex=original_task.get("question_latex"),
+            question_image_url=original_task.get("question_image_url"),
+            correct_answer_latex=original_task.get("correct_answer_latex"),
             answer_options=options,
             distractor_meta=distractor_meta,
             source_task_id=original_task.get("task_id", ""),
@@ -519,7 +528,10 @@ class VariantOrchestrator:
         return VariantTask(
             task_id=task.get("task_id", f"VT_{uuid4().hex[:8]}"),
             question_text=task.get("question_text", task.get("text", "")),
+            question_latex=task.get("question_latex"),
+            question_image_url=task.get("question_image_url"),
             correct_answer=task.get("correct_answer", task.get("answer", "")),
+            correct_answer_latex=task.get("correct_answer_latex"),
             answer_type=task.get("answer_type", "exact_number"),
             skill_id=task.get("skill_id", ""),
             skill_name=task.get("skill_name", ""),

@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 from src.domain.answer_check import check_answer as _shared_check_answer
+from src.domain.distractor_utils import distractor_text
 
 log = logging.getLogger("exam_analytics")
 
@@ -364,7 +365,7 @@ class ExamAnalytics:
                 DistractorInsight(
                     distractor_value=str(d.get("value", "")),
                     error_type=d.get("error_type", "unknown"),
-                    explanation=d.get("explanation", ""),
+                    explanation=distractor_text(d),
                     matches_student=(ans_norm == d_norm),
                 )
             )

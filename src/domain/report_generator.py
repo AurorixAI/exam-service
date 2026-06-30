@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from src.domain.answer_utils import check_answer as _check_answer
+from src.domain.distractor_utils import resolve_analytics_explanation
 from src.domain.gemini_client import call_gemini
 from src.models import ExamSession, GeneratedExam
 from src.repositories.exam_repo import ExamReportRepository
@@ -89,7 +90,14 @@ def _aggregate(
             if not isinstance(hit, dict) or not hit.get("hit"):
                 continue
             error_type = hit.get("error_type", "unknown")
-            explanation = hit.get("explanation", "")
+            task_meta = task_lookup.get(task_id, {})
+            explanation = resolve_analytics_explanation(
+                hit,
+                student_answer=(s.answers or {}).get(task_id, ""),
+                distractor_meta=task_meta.get("distractor_meta"),
+            )
+            if not explanation:
+                continue
             key = f"{error_type}::{explanation[:60]}"
             bucket = task_distractor_hits.setdefault(task_id, {})
             if key not in bucket:

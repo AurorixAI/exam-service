@@ -52,6 +52,7 @@ class GeneratedVariantTask:
     question_image_url: Optional[str]
     answer_type: str
     correct_answer: str
+    correct_answer_latex: Optional[str] = None
     answer_options: Optional[List[str]]
     distractor_meta: Optional[List[Dict]]
     is_template_generated: bool  # True если числа изменены
@@ -133,6 +134,7 @@ class VariantFactory:
                         question_image_url=None,  # Images don't change
                         answer_type=task.get("answer_type", "exact_number"),
                         correct_answer=new_answer_str,
+                        correct_answer_latex=task.get("correct_answer_latex"),
                         answer_options=distractors,
                         distractor_meta=distractor_meta,
                         is_template_generated=True,
@@ -153,6 +155,7 @@ class VariantFactory:
             question_image_url=task.get("question_image_url"),
             answer_type=task.get("answer_type", "exact_number"),
             correct_answer=correct,
+            correct_answer_latex=task.get("correct_answer_latex"),
             answer_options=task.get("answer_options") or distractors,
             distractor_meta=distractor_meta,
             is_template_generated=False,
@@ -429,6 +432,7 @@ def generate_variant_json(
                 "question_image_url": t.question_image_url,
                 "answer_type": t.answer_type,
                 "correct_answer": t.correct_answer,
+                "correct_answer_latex": t.correct_answer_latex,
                 "answer_options": t.answer_options,
                 "distractor_meta": t.distractor_meta,
                 "is_template_generated": t.is_template_generated,

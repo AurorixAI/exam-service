@@ -100,7 +100,9 @@ class ExamTaskPublic(BaseModel):
     skill_name: str = ""
     difficulty: str = "B"
     text: str
+    question_latex: Optional[str] = None
     options: List[str] = []
+    options_latex: Optional[List[str]] = None
     image_url: Optional[str] = None
     answer_type: str = "exact_number"
     points: int = 10
@@ -153,8 +155,10 @@ class DistractorHit(BaseModel):
 class TaskResultItem(BaseModel):
     task_id: str
     text: str
+    question_latex: Optional[str] = None
     student_answer: Optional[str]
     correct_answer: str
+    correct_answer_latex: Optional[str] = None
     is_correct: bool
     options: List[str] = []
     skill_name: str = ""
@@ -275,6 +279,7 @@ class DraftTask(BaseModel):
     question_image_url: Optional[str] = None
     answer_type: str = "exact_number"
     correct_answer: str = ""
+    correct_answer_latex: Optional[str] = None
     answer_options: Optional[List[str]] = None
     distractor_meta: Optional[List[dict]] = None
     is_template_generated: bool = False
@@ -354,29 +359,31 @@ def _build_mc_options(task: dict) -> List[str]:
     return []
 
 
-from src.domain.answer_utils import normalise_answer as _normalise_answer, check_answer as _check_answer
-
-
-def _match_distractor(student: str, distractor_meta: list) -> dict | None:
-    """Проверяет совпадение ответа ученика с дистрактором.
-
-    Возвращает dict с данными дистрактора или None.
-    """
-    if not distractor_meta or not student:
-        return None
-    s = _normalise_answer(student)
-    for d in distractor_meta:
+def _build_mc_options_latex(task: dict, options: List[str]) -> List[str]:
+    """Parallel LaTeX strings for MCQ options (same order as options)."""
+    if not options:
+        return []
+    correct = task.get("correct_answer", "")
+    correct_latex = (task.get("correct_answer_latex") or "").strip()
+    latex_by_value: dict[str, str] = {}
+    if correct:
+        latex_by_value[correct] = correct_latex
+    for d in task.get("distractor_meta") or []:
         if not isinstance(d, dict):
             continue
-        d_val = _normalise_answer(str(d.get("value", "")))
-        if s == d_val:
-            return d
-        try:
-            if abs(float(s) - float(d_val)) < 0.01:
-                return d
-        except (ValueError, TypeError):
-            pass
-    return None
+        val = str(d.get("value", ""))
+        if val:
+            latex_by_value[val] = (d.get("value_latex") or "").strip()
+    return [latex_by_value.get(opt, "") for opt in options]
+
+
+from src.domain.answer_utils import normalise_answer as _normalise_answer, check_answer as _check_answer
+from src.domain.distractor_utils import (
+    build_analytics_hit,
+    match_distractor as _match_distractor,
+    normalize_distractor_meta,
+    resolve_analytics_explanation,
+)
 
 
 def _build_task_pool(
@@ -397,13 +404,13 @@ def _build_task_pool(
                 continue
             rows = task_repo.get_tasks_by_skills(req.skill_ids, diff, cnt, used)
             all_tasks.extend(rows)
-            used.extend(r["task_id"] for r in rows)
+            used.extend(r.get("task_id") or r.get("id", "") for r in rows)
         # Fill remainder if not enough per difficulty
         if len(all_tasks) < req.tasks_count:
             fill = task_repo.get_tasks_by_skills(
                 req.skill_ids, None,
                 req.tasks_count - len(all_tasks),
-                [t["task_id"] for t in all_tasks],
+                [t.get("task_id") or t.get("id", "") for t in all_tasks],
             )
             all_tasks.extend(fill)
 
@@ -418,16 +425,24 @@ def _build_task_pool(
                 continue
             rows = task_repo.get_tasks_by_toc_ids(toc_ids_expanded, diff, cnt, used)
             all_tasks.extend(rows)
-            used.extend(r["task_id"] for r in rows)
+            used.extend(r.get("task_id") or r.get("id", "") for r in rows)
         if len(all_tasks) < req.tasks_count:
             fill = task_repo.get_tasks_by_toc_ids(
                 toc_ids_expanded, None,
                 req.tasks_count - len(all_tasks),
-                [t["task_id"] for t in all_tasks],
+                [t.get("task_id") or t.get("id", "") for t in all_tasks],
             )
             all_tasks.extend(fill)
 
     return all_tasks[: req.tasks_count]
+
+
+def _normalize_content_task(task: dict) -> dict:
+    """Content API returns ``id``; exam snapshots use ``task_id``."""
+    out = dict(task)
+    if not out.get("task_id"):
+        out["task_id"] = out.get("id", "")
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -443,7 +458,7 @@ async def generate_exam(req: GenerateExamRequest, db: Session = Depends(get_db))
     task_repo = TaskRepository()
     exam_repo = ExamRepository(db)
 
-    tasks = _build_task_pool(req, task_repo)
+    tasks = [_normalize_content_task(t) for t in _build_task_pool(req, task_repo)]
     if not tasks:
         raise HTTPException(
             400,
@@ -577,8 +592,9 @@ async def get_exam_draft(exam_id: str, db: Session = Depends(get_db)):
                 question_image_url=t.get("question_image_url"),
                 answer_type=t.get("answer_type", "exact_number"),
                 correct_answer=t.get("correct_answer", ""),
+                correct_answer_latex=t.get("correct_answer_latex"),
                 answer_options=t.get("answer_options"),
-                distractor_meta=t.get("distractor_meta"),
+                distractor_meta=normalize_distractor_meta(t.get("distractor_meta")),
                 is_template_generated=t.get("is_template_generated", False),
             )
             for t in tasks_raw
@@ -784,7 +800,9 @@ async def start_exam(
             skill_name=t.get("skill_name", ""),
             difficulty=t.get("difficulty", "B"),
             text=t.get("question_text", t.get("text", "")),
+            question_latex=t.get("question_latex"),
             options=options,
+            options_latex=_build_mc_options_latex(t, options) if options else None,
             image_url=t.get("question_image_url"),
             answer_type=answer_type,
             points=10,
@@ -836,12 +854,7 @@ async def submit_exam(
         else:
             hit = _match_distractor(student_ans, t.get("distractor_meta") or [])
             if hit:
-                distractor_analytics[task_id] = {
-                    "hit": True,
-                    "distractor_value": str(hit.get("value", "")),
-                    "error_type": hit.get("error_type", ""),
-                    "explanation": hit.get("explanation", ""),
-                }
+                distractor_analytics[task_id] = build_analytics_hit(hit)
 
     total_tasks = len(tasks_raw)
     score = correct_count * 10
@@ -890,18 +903,28 @@ async def get_results(session_id: str, db: Session = Depends(get_db)):
         is_correct = _check_answer(student_answer or "", correct_answer)
         options = _build_mc_options(t) if t.get("answer_options") else []
         d_hit = dist_analytics.get(task_id)
+        hit_explanation = ""
+        if d_hit:
+            hit_explanation = resolve_analytics_explanation(
+                d_hit,
+                student_answer=student_answer or "",
+                distractor_meta=t.get("distractor_meta"),
+                match_fn=_match_distractor,
+            )
         task_items.append(TaskResultItem(
             task_id=task_id,
             text=t.get("question_text", ""),
+            question_latex=t.get("question_latex"),
             student_answer=student_answer,
             correct_answer=correct_answer,
+            correct_answer_latex=t.get("correct_answer_latex"),
             is_correct=is_correct,
             options=options,
             skill_name=t.get("skill_name", ""),
             distractor_hit=DistractorHit(
                 distractor_value=d_hit["distractor_value"],
                 error_type=d_hit["error_type"],
-                explanation=d_hit["explanation"],
+                explanation=hit_explanation,
             ) if d_hit else None,
         ))
 
@@ -1210,7 +1233,15 @@ async def get_exam_analytics(exam_id: str, db: Session = Depends(get_db)):
             if not isinstance(hit, dict) or not hit.get("hit"):
                 continue
             error_type = hit.get("error_type", "unknown")
-            explanation = hit.get("explanation", "")
+            task_meta = task_lookup.get(task_id, {})
+            explanation = resolve_analytics_explanation(
+                hit,
+                student_answer=(s.answers or {}).get(task_id, ""),
+                distractor_meta=task_meta.get("distractor_meta"),
+                match_fn=_match_distractor,
+            )
+            if not explanation:
+                continue
             # Ключ группировки: error_type (+ первые 60 символов для уникальности)
             key = f"{error_type}::{explanation[:60]}"
             bucket = task_distractor_hits.setdefault(task_id, {})
