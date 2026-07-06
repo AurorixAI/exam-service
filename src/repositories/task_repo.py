@@ -17,6 +17,13 @@ from src.clients import content_client
 BASE = "/api/v1/content"
 
 
+def _normalize_task(t: dict) -> dict:
+    """Content-service returns 'id'; exam router expects 'task_id'."""
+    if "id" in t and "task_id" not in t:
+        t = {**t, "task_id": t["id"]}
+    return t
+
+
 class TaskRepository:
     """Read tasks_master via content-service HTTP API."""
 
@@ -35,7 +42,7 @@ class TaskRepository:
             params["exclude_ids"] = exclude_ids
         resp = content_client.get(f"{BASE}/tasks", params=params)
         resp.raise_for_status()
-        return resp.json()
+        return [_normalize_task(t) for t in resp.json()]
 
     def get_tasks_by_toc_ids(
         self,
@@ -52,14 +59,14 @@ class TaskRepository:
             params["exclude_ids"] = exclude_ids
         resp = content_client.get(f"{BASE}/tasks", params=params)
         resp.raise_for_status()
-        return resp.json()
+        return [_normalize_task(t) for t in resp.json()]
 
     def get_task_by_id(self, task_id: str) -> Optional[dict]:
         resp = content_client.get(f"{BASE}/tasks/{task_id}")
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
-        return resp.json()
+        return _normalize_task(resp.json())
 
     def expand_toc_ids(self, toc_ids: List[int]) -> List[int]:
         """Recursively expand toc_ids to include all child paragraphs."""
@@ -132,4 +139,4 @@ class TextbookRepository:
             params["difficulty"] = difficulty
         resp = content_client.get(f"{BASE}/tasks", params=params)
         resp.raise_for_status()
-        return resp.json()
+        return [_normalize_task(t) for t in resp.json()]

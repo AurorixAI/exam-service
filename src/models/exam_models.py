@@ -16,6 +16,7 @@ from sqlalchemy import (
     Text,
 )
 from sqlalchemy import JSON as JSONB
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.sql import func
 
 from src.models.shared import Base
@@ -42,9 +43,9 @@ class GeneratedExam(Base):
     # Flat exam-level settings (time, shuffle, mc_mode, etc.)
     settings = Column(JSONB, nullable=False, default=dict)
 
-    # Coverage metadata
-    skills_covered = Column(JSONB, default=list)   # List[skill_id]
-    toc_ids_used = Column(JSONB, default=list)      # List[toc_id]
+    # Coverage metadata — matches migration 001 (ARRAY types)
+    skills_covered = Column(ARRAY(String), nullable=False, server_default="{}")
+    toc_ids_used = Column(ARRAY(Integer), nullable=False, server_default="{}")
 
     # Access
     access_code = Column(String(20), unique=True)
