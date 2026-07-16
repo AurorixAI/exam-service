@@ -1,0 +1,68 @@
+name: Deploy
+
+# Push to main -> test -> deploy to the staging server (algolab.me).
+# Deploy only runs if the test job passes, so a broken push never reaches prod.
+
+on:
+  push:
+    branches: [main]
+
+env:
+  SERVER_HOST: 91.99.183.252
+  SERVER_USER: algo
+  REPO_DIR: exam-service
+  COMPOSE_SERVICE: exam-service
+  CONTAINER_NAME: algo-staging-exam
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Compile check
+        run: python -m py_compile $(find src -name "*.py")
+
+      - name: Run tests
+        run: pytest tests/ -q --tb=short
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up deploy key
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Pull + rebuild on server
+        run: |
+          ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" "
+            set -e
+            cd ~/algo/$REPO_DIR && git pull origin main
+            cd ~/algo && make staging-redeploy SERVICE=$COMPOSE_SERVICE
+          "
+
+      - name: Verify container is healthy
+        run: |
+          ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" "
+            for i in \$(seq 1 20); do
+              STATUS=\$(docker inspect --format='{{.State.Health.Status}}' $CONTAINER_NAME 2>/dev/null || echo unknown)
+              if [ \"\$STATUS\" = healthy ]; then echo 'Container is healthy'; exit 0; fi
+              sleep 5
+            done
+            echo 'Container did not become healthy in time' >&2
+            docker logs $CONTAINER_NAME --tail 80
+            exit 1
+          "
