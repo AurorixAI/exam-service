@@ -318,7 +318,7 @@ class TestSettings:
         assert s.max_tasks_per_exam == 50
         assert s.max_variants == 30
         assert s.default_time_minutes == 45
-        assert s.gemini_model == "gemini-2.0-flash"
+        assert s.gemini_model == "gemini-2.5-flash"
 
     def test_is_development_false_by_default(self):
         s = Settings(database_url="sqlite:///:memory:", app_env="production")

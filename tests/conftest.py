@@ -27,6 +27,20 @@ from src.core.config import Settings, get_settings
 from src.models.shared import Base
 from src.models.exam_models import GeneratedExam, ExamSession  # noqa: register tables
 
+# ── SQLite compatibility shim (test-only) ──────────────────────────────────
+# Production runs Postgres; the models use the Postgres ARRAY type
+# (skills_covered / toc_ids_used). SQLite can neither create ARRAY columns nor
+# bind a Python list to them. Swap ARRAY columns to a JSON-backed type on the
+# in-memory test metadata BEFORE create_all — this fixes both DDL and
+# bind/result (lists round-trip as JSON). Production metadata is untouched.
+from sqlalchemy import JSON as _JSON
+from sqlalchemy.dialects.postgresql import ARRAY as _PG_ARRAY
+
+for _table in Base.metadata.tables.values():
+    for _col in _table.columns:
+        if isinstance(_col.type, _PG_ARRAY):
+            _col.type = _JSON()
+
 
 # ─── In-memory SQLite engine ────────────────────────────────────────────────
 

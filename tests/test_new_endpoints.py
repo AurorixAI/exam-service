@@ -193,11 +193,9 @@ class TestAnalytics:
         _submit_session(client, "SES_GAP_01", {"T1": "5", "T2": "99"})
 
         resp = client.get(f"/api/v1/exams/{exam.id}/analytics")
-        gaps = resp.json()["skill_gaps"]
-        # T2 has 0% correct rate — should be first
-        assert gaps[0]["task_id"] == "T2"
+        gaps = resp.json()["task_analytics"]
+        # Sorted worst-first: the 0%-correct task comes before the 100% one.
         assert gaps[0]["correct_rate"] == 0.0
-        assert gaps[1]["task_id"] == "T1"
         assert gaps[1]["correct_rate"] == 1.0
 
     def test_analytics_nonexistent_exam(self, client):

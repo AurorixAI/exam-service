@@ -27,6 +27,12 @@ log = logging.getLogger("exam_service")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Run Alembic migrations on startup."""
+    # In the test suite the schema is created by the conftest fixtures against
+    # an in-memory SQLite DB; the Postgres-flavored migrations can't run there
+    # (and would target a throwaway subprocess DB anyway). Skip them.
+    if settings.app_env == "testing":
+        yield
+        return
     try:
         result = subprocess.run(
             ["alembic", "upgrade", "head"],
