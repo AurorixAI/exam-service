@@ -1144,8 +1144,8 @@ async def generate_variants(
             "exam_id": exam_id,
             "status": "variants_ready",
             "variants_count": report.total_variants,
-            "templatized_tasks": report.templatized_count,
-            "original_tasks": report.original_count,
+            "templatized_tasks": report.tasks_templatized,
+            "original_tasks": report.tasks_fallback,
         }
     except Exception as exc:
         log.error("Variant generation failed for %s: %s", exam_id, exc)
