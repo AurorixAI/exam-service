@@ -1,18 +1,21 @@
 name: Deploy
 
-# Push to main -> test -> deploy to the staging server (algolab.me).
-# Deploy only runs if the test job passes, so a broken push never reaches prod.
+# develop -> stage.algolab.me   (algo-preview stack, built from ~/algo/preview-src)
+# main    -> algolab.me         (algo-staging stack — despite the name, production)
+#
+# Deploy only runs if the test job passes.
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
 
 env:
   SERVER_HOST: 91.99.183.252
   SERVER_USER: algo
   REPO_DIR: exam-service
   COMPOSE_SERVICE: exam-service
-  CONTAINER_NAME: algo-staging-exam
+  PROD_CONTAINER: algo-staging-exam
+  PREVIEW_CONTAINER: algo-preview-exam
 
 jobs:
   test:
@@ -46,23 +49,74 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
+      - name: Resolve target environment
+        id: t
+        run: |
+          if [ "${{ github.ref_name }}" = "develop" ]; then
+            {
+              echo "project=algo-preview"
+              echo "compose=algo-infrastructure/compose/docker-compose.preview.yml"
+              echo "envfile=.env.preview"
+              echo "srcdir=preview-src/$REPO_DIR"
+              echo "container=$PREVIEW_CONTAINER"
+              echo "site=https://stage.algolab.me"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "project=algo-staging"
+              echo "compose=algo-infrastructure/compose/docker-compose.staging.yml"
+              echo "envfile=.env.staging"
+              echo "srcdir=$REPO_DIR"
+              echo "container=$PROD_CONTAINER"
+              echo "site=https://algolab.me"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Pull + rebuild on server
         run: |
           ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" "
             set -e
-            cd ~/algo/$REPO_DIR && git pull origin main
-            cd ~/algo && make staging-redeploy SERVICE=$COMPOSE_SERVICE
+            cd ~/algo/${{ steps.t.outputs.srcdir }}
+            git fetch --quiet origin ${{ github.ref_name }}
+            git checkout --quiet ${{ github.ref_name }}
+            git reset --hard --quiet origin/${{ github.ref_name }}
+            cd ~/algo
+            docker compose -f ${{ steps.t.outputs.compose }} \
+              -p ${{ steps.t.outputs.project }} \
+              --env-file ${{ steps.t.outputs.envfile }} \
+              up -d --build $COMPOSE_SERVICE
+            # nginx caches upstream DNS; a recreated container gets a new IP
+            docker compose -f algo-infrastructure/compose/docker-compose.staging.yml \
+              -p algo-staging --env-file .env.staging restart nginx
           "
 
       - name: Verify container is healthy
         run: |
           ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" "
-            for i in \$(seq 1 20); do
-              STATUS=\$(docker inspect --format='{{.State.Health.Status}}' $CONTAINER_NAME 2>/dev/null || echo unknown)
-              if [ \"\$STATUS\" = healthy ]; then echo 'Container is healthy'; exit 0; fi
+            C=${{ steps.t.outputs.container }}
+            for i in \$(seq 1 24); do
+              # A container with no healthcheck makes '{{.State.Health.Status}}'
+              # print an empty line AND exit 1, so the '|| echo' fallback yields
+              # a leading newline and never matches. Guard on .State.Health.
+              STATUS=\$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \$C 2>/dev/null || echo missing)
+              RUNNING=\$(docker inspect --format='{{.State.Running}}' \$C 2>/dev/null || echo false)
+              case \$STATUS in
+                healthy) echo \"\$C is healthy\"; exit 0 ;;
+                none)    [ \"\$RUNNING\" = true ] && { echo \"\$C is running (no healthcheck defined)\"; exit 0; } ;;
+              esac
               sleep 5
             done
-            echo 'Container did not become healthy in time' >&2
-            docker logs $CONTAINER_NAME --tail 80
+            echo \"\$C did not become healthy in time\" >&2
+            docker logs \$C --tail 80
             exit 1
           "
+
+      - name: Verify site responds
+        run: |
+          for i in $(seq 1 12); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "${{ steps.t.outputs.site }}/" || echo 000)
+            [ "$CODE" = "200" ] && { echo "${{ steps.t.outputs.site }} -> 200"; exit 0; }
+            sleep 5
+          done
+          echo "${{ steps.t.outputs.site }} never returned 200" >&2
+          exit 1
