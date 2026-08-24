@@ -14,6 +14,7 @@ Covers:
 from __future__ import annotations
 
 import sys, os
+import asyncio
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 os.environ.setdefault("APP_ENV", "testing")
@@ -37,6 +38,26 @@ from src.core.exceptions import (
     InvalidExamConfigError,
 )
 from src.core.config import get_settings, Settings
+from src.core.auth import ExamActor, require_group_access
+from fastapi import HTTPException
+
+
+class TestGroupAccessGuards:
+    def test_legacy_non_uuid_group_is_treated_as_missing(self):
+        """A stale legacy row must not make a teacher's whole library fail."""
+        actor = ExamActor(
+            user_id="teacher-1",
+            org_id="org-1",
+            role="teacher",
+            auth_headers={},
+        )
+
+        async def check() -> None:
+            with pytest.raises(HTTPException) as error:
+                await require_group_access(actor, "GRP_test")
+            assert error.value.status_code == 404
+
+        asyncio.run(check())
 
 
 # ═══════════════════════════════════════════════════════════════════════════

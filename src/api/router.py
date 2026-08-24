@@ -4,37 +4,47 @@ Merges exam_router.py + textbook_exam.py from monolith into one module.
 
 Endpoints:
   TEACHER
-    POST /exams/generate            — create draft exam (topics or textbook mode)
-    POST /exams/{id}/publish        — publish → access_code
-    GET  /exams/{id}                — exam detail (teacher view)
-    GET  /exams                     — list teacher's exams
-    GET  /exams/{id}/analytics      — live class analytics (no LLM, instant)
-    POST /exams/{id}/report         — generate on-demand LLM narrative report
-    GET  /exams/{id}/report         — retrieve cached report
+    POST /exams/generate              — create draft exam (topics or textbook mode)
+    POST /exams/{id}/publish          — publish → access_code
+    GET  /exams/{id}                  — exam detail (teacher view)
+    GET  /exams                       — list teacher's exams (library)
+    POST /exams/{id}/pin              — toggle is_pinned flag
+    POST /exams/{id}/clone            — duplicate a template for a new group
+    POST /exams/{id}/assign           — assign group_id + optional publish
+    GET  /exams/{id}/analytics        — live class analytics (no LLM, instant)
+    POST /exams/{id}/report           — generate on-demand LLM narrative report
+    GET  /exams/{id}/report           — retrieve cached report
   STUDENT (public, by access_code)
-    GET  /exams/by-code/{code}      — exam info
-    POST /exams/by-code/{code}/start — start session
-    POST /exam-sessions/{id}/submit  — submit answers
-    GET  /exam-sessions/{id}/results — results
+    GET  /exams/by-code/{code}        — exam info
+    POST /exams/by-code/{code}/start  — start session
+    POST /exam-sessions/{id}/submit   — submit answers
+    GET  /exam-sessions/{id}/results  — results
   TEXTBOOK (catalog)
-    GET  /textbooks                 — list textbooks
-    GET  /textbooks/{id}/toc        — table of contents
-    GET  /textbooks/{id}/coverage   — digitization coverage
-    GET  /toc/{id}/skills           — skills for a paragraph
+    GET  /textbooks                   — list textbooks
+    GET  /textbooks/{id}/toc          — table of contents
+    GET  /textbooks/{id}/coverage     — digitization coverage
+    GET  /toc/{id}/skills             — skills for a paragraph
 """
 from __future__ import annotations
 
 import logging
 import random
+import secrets
 import string
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Union
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+import httpx
 from pydantic import BaseModel, Field
+from sqlalchemy import and_, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from src.core.auth import ExamActor, require_exam_access, require_exam_staff, require_group_access
+from src.core.config import get_settings
 from src.core.database import get_db
 from src.core.exceptions import (
     ExamNotFoundError,
@@ -43,7 +53,7 @@ from src.core.exceptions import (
     SessionAlreadySubmittedError,
     NoTasksAvailableError,
 )
-from src.models import GeneratedExam, ExamSession
+from src.models import ExamLifecycleEvent, ExamReport, GeneratedExam, ExamSession
 from src.repositories.task_repo import TaskRepository, TextbookRepository
 from src.repositories.exam_repo import ExamRepository, SessionRepository, ExamReportRepository
 
@@ -69,6 +79,10 @@ class GenerateExamRequest(BaseModel):
     # Mode B: by textbook (toc_ids)
     paragraph_ids: List[int] = []
     textbook_id: Optional[str] = None
+    # Group binding
+    group_id: Optional[str] = None
+    group_name: Optional[str] = None
+    class_level: Optional[int] = None
     # Common
     tasks_count: int = Field(10, ge=1, le=50)
     difficulty_distribution: Optional[Dict[str, float]] = None  # easy/medium/hard → %
@@ -77,11 +91,17 @@ class GenerateExamRequest(BaseModel):
     generate_variants: bool = False
     shuffle_tasks: bool = True
     mc_mode: str = "auto"
+    teacher_name: Optional[str] = None
 
 
 class PublishExamRequest(BaseModel):
     teacher_name: Optional[str] = None
     subject: Optional[str] = None
+    group_id: Optional[str] = None
+    group_name: Optional[str] = None
+    class_level: Optional[int] = None
+    lesson_id: str = Field(..., min_length=1, max_length=100)
+    lesson_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
 
 
 class ExamSummaryResponse(BaseModel):
@@ -91,7 +111,46 @@ class ExamSummaryResponse(BaseModel):
     access_code: Optional[str] = None
     tasks_per_variant: int
     variants_count: int
+    group_id: Optional[str] = None
+    group_name: Optional[str] = None
+    class_level: Optional[int] = None
+    # Snapshot of the teacher responsible for the exam's group. It is exposed
+    # for read-only administration only and confers no control privileges.
+    teacher_name: Optional[str] = None
+    scheduled_lesson_id: Optional[str] = None
+    scheduled_lesson_date: Optional[str] = None
+    is_pinned: bool = False
+    source_exam_id: Optional[str] = None
+    total_sessions: int = 0
+    skills_covered: List[str] = []
+    # A compact, immutable-to-users audit trail for operational monitoring.
+    # The full task snapshot never depends on these entries.
+    recent_events: List[Dict[str, Any]] = Field(default_factory=list)
+    total_time_minutes: int = 45
     created_at: datetime
+
+
+class LiveExamDashboardResponse(BaseModel):
+    """Small, authoritative live-exam payload for the teacher dashboard.
+
+    This deliberately contains operational information only. Results, scores
+    and error analysis belong to the analytics surface, not to the live
+    dashboard.
+    """
+
+    exam_id: str
+    title: str
+    status: str
+    group_id: Optional[str] = None
+    group_name: Optional[str] = None
+    scheduled_lesson_id: Optional[str] = None
+    scheduled_lesson_date: Optional[str] = None
+    total_time_seconds: int
+    time_remaining_seconds: int
+    connected_count: int
+    solving_count: int
+    submitted_count: int
+    started_at: Optional[datetime] = None
 
 
 class ExamTaskPublic(BaseModel):
@@ -113,22 +172,58 @@ class ExamInfoResponse(BaseModel):
     title: str
     subject: str
     teacher_name: Optional[str] = None
+    group_id: Optional[str] = None
+    group_name: Optional[str] = None
+    class_level: Optional[int] = None
     total_time_minutes: int
     tasks_per_variant: int
     variants_count: int
     status: str
+    time_remaining_seconds: Optional[int] = None
+    started_at: Optional[str] = None
+
+
+class CheckStudentExamRequest(BaseModel):
+    identifier: Optional[str] = None
+    student_id: Optional[str] = None
+    student_name: Optional[str] = None
+
+
+class CheckStudentExamResponse(BaseModel):
+    enrolled: bool
+    group_required: bool = False
+    group_name: Optional[str] = None
+    student: Optional[Dict[str, Any]] = None
+    message: Optional[str] = None
+    already_submitted: bool = False
+    session_id: Optional[str] = None
 
 
 class StartExamRequest(BaseModel):
     student_name: str = Field(..., min_length=1)
     class_level: Optional[int] = None
+    student_id: Optional[str] = None
+    display_id: Optional[str] = None
 
 
 class StartExamResponse(BaseModel):
     session_id: str
     variant_number: int
     time_minutes: int
-    tasks: List[ExamTaskPublic]
+    time_remaining_seconds: Optional[int] = None
+    tasks: List[ExamTaskPublic] = []
+    status: str = "in_progress"
+    already_submitted: bool = False
+    saved_answers: Optional[Dict[str, str]] = None
+    message: Optional[str] = None
+    # Opaque capability required for every request that reads or mutates this
+    # concrete attempt. It is never exposed in teacher endpoints.
+    session_token: Optional[str] = None
+
+
+class SaveProgressRequest(BaseModel):
+    answers: Dict[str, str] = Field(default_factory=dict)
+    time_spent_seconds: Optional[int] = None
 
 
 class SubmitExamRequest(BaseModel):
@@ -206,26 +301,43 @@ class TextbookDetail(TextbookInfo):
 class TocNode(BaseModel):
     id: int
     parent_id: Optional[int] = None
-    level: str
+    level: Union[str, int] = 1
     number: Optional[str] = None
-    title: str
+    title: str = ""
+    display_name: Optional[str] = None
+    display_number: Optional[str] = None
     page_start: Optional[int] = None
+    page_end: Optional[int] = None
     sort_order: int = 0
     tasks_count: int = 0
     children: List["TocNode"] = []
 
+    def model_post_init(self, __context: Any) -> None:
+        if not self.display_name:
+            self.display_name = self.title
+        if not self.display_number and self.number:
+            self.display_number = self.number
+
 
 class SkillTreeNode(BaseModel):
     id: str
-    level: str
-    name: str
-    name_ru: str
+    level: Union[str, int] = "L4"
+    name: Optional[str] = None
+    name_ru: Optional[str] = ""
+    name_uz: Optional[str] = None
     parent_id: Optional[str] = None
     class_level_start: Optional[int] = None
     class_level_end: Optional[int] = None
     importance: int = 5
+    sequence_order: Optional[int] = 0
     tasks_count: int = 0
     children: List["SkillTreeNode"] = []
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.name:
+            self.name = self.name_ru or self.id
+        if not self.name_ru:
+            self.name_ru = self.name or self.id
 
 
 class TextbookTaskInfo(BaseModel):
@@ -250,12 +362,12 @@ class SkillInParagraph(BaseModel):
 
 class CoverageItem(BaseModel):
     toc_id: int
-    level: str
+    level: Union[str, int] = 1
     number: Optional[str] = None
-    title: str
-    skills_mapped: int
-    tasks_available: int
-    is_digitized: bool
+    title: str = ""
+    skills_mapped: int = 0
+    tasks_available: int = 0
+    is_digitized: bool = True
 
 
 class PublishExamResponse(BaseModel):
@@ -265,6 +377,9 @@ class PublishExamResponse(BaseModel):
     access_code: str
     tasks_per_variant: int
     variants_count: int
+    group_id: Optional[str] = None
+    group_name: Optional[str] = None
+    class_level: Optional[int] = None
     created_at: datetime
     url: str
 
@@ -296,18 +411,101 @@ class DraftExamResponse(BaseModel):
     exam_id: str
     title: str
     status: str
+    access_code: Optional[str] = None
     total_time_minutes: int
     variants_count: int
     tasks_per_variant: int
+    group_id: Optional[str] = None
+    group_name: Optional[str] = None
+    class_level: Optional[int] = None
+    scheduled_lesson_id: Optional[str] = None
+    scheduled_lesson_date: Optional[str] = None
     settings: Dict[str, Any]
     skills_covered: List[str]
     created_at: datetime
     variants: List[DraftVariant]
 
 
+class AdminExamTask(BaseModel):
+    """Read-only task snapshot for an organisation administrator.
+
+    Correct answers and pedagogical distractor analysis are deliberately
+    omitted while a public exam is in lobby/active state.  The task itself is
+    still visible, so administration can verify the paper without gaining a
+    way to leak an answer key during a run.
+    """
+
+    task_id: str
+    skill_id: str = ""
+    skill_name: str = ""
+    difficulty: str = "B"
+    question_text: str
+    question_latex: Optional[str] = None
+    question_image_url: Optional[str] = None
+    answer_type: str = "exact_number"
+    answer_options: Optional[List[str]] = None
+    correct_answer: Optional[str] = None
+    correct_answer_latex: Optional[str] = None
+    distractor_meta: Optional[List[dict]] = None
+
+
+class AdminExamVariant(BaseModel):
+    variant_id: str
+    variant_number: int
+    total_points: int
+    tasks: List[AdminExamTask]
+
+
+class AdminExamViewResponse(ExamSummaryResponse):
+    """Administrator-visible exam profile; never contains a student code."""
+
+    answer_key_available: bool = False
+    variants: List[AdminExamVariant]
+    lifecycle_events: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class AdminExamMonitorResponse(BaseModel):
+    """One page of the organisation's historical exam monitor."""
+
+    items: List[ExamSummaryResponse]
+    total: int
+    limit: int
+    offset: int
+    period_from: Optional[str] = None
+    period_to: Optional[str] = None
+    counts: Dict[str, int] = Field(default_factory=dict)
+
+
 class ReplaceTaskRequest(BaseModel):
     variant_number: int = 1
     task_id: str
+    old_task_id: Optional[str] = None
+    new_task_id: Optional[str] = None
+
+
+class LessonBindingRequest(BaseModel):
+    """The stable identity of one resolved schedule occurrence."""
+
+    lesson_id: str = Field(..., min_length=1, max_length=100)
+    lesson_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+
+class LessonCancellationSyncRequest(LessonBindingRequest):
+    org_id: str = Field(..., min_length=1, max_length=36)
+    group_id: str = Field(..., min_length=1, max_length=36)
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class LessonRescheduleSyncRequest(LessonBindingRequest):
+    """Internal immutable audit payload for a one-off lesson transfer."""
+
+    org_id: str = Field(..., min_length=1, max_length=36)
+    group_id: str = Field(..., min_length=1, max_length=36)
+    group_name: Optional[str] = Field(default=None, max_length=200)
+    actor_id: Optional[str] = Field(default=None, max_length=100)
+    reason: Optional[str] = Field(default=None, max_length=500)
+    previous: Dict[str, Any] = Field(default_factory=dict)
+    current: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -318,6 +516,422 @@ class ReplaceTaskRequest(BaseModel):
 def _generate_access_code() -> str:
     chars = string.ascii_uppercase + string.digits
     return "EX" + "".join(random.choices(chars, k=8))
+
+
+def _generate_session_token() -> str:
+    """Return a high-entropy capability, not an enumerable session id."""
+    return secrets.token_urlsafe(32)
+
+
+async def _get_exam_for_actor(db: Session, exam_id: str, actor: ExamActor) -> GeneratedExam:
+    exam = ExamRepository(db).get_by_id(exam_id)
+    if not exam:
+        raise HTTPException(404, "Экзамен не найден")
+    await require_exam_access(exam, actor)
+    return exam
+
+
+def _require_teacher_exam_operator(actor: ExamActor) -> None:
+    """Keep the staff roles intentionally separate.
+
+    Administrators need organisation-wide *visibility* into an exam, but the
+    lifecycle of a classroom run belongs to the teacher responsible for that
+    group.  Hiding a button in the web UI is not a permission boundary, so the
+    API applies the same rule to every state-changing operation.
+    """
+    if actor.role != "teacher":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Управлять проведением экзамена может только преподаватель группы",
+        )
+
+
+def _require_exam_admin_observer(actor: ExamActor) -> None:
+    """Administrative monitoring is organisation-wide and strictly read-only."""
+    if not actor.is_org_admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Просмотр мониторинга экзаменов доступен только администратору")
+
+
+async def _get_exam_for_teacher_operator(
+    db: Session,
+    exam_id: str,
+    actor: ExamActor,
+) -> GeneratedExam:
+    _require_teacher_exam_operator(actor)
+    return await _get_exam_for_actor(db, exam_id, actor)
+
+
+_BUSINESS_TIMEZONE = ZoneInfo("Asia/Tashkent")
+
+
+def _business_today() -> date:
+    return datetime.now(_BUSINESS_TIMEZONE).date()
+
+
+def _has_any_sessions(db: Session, exam_id: str) -> bool:
+    """A started/waiting attempt makes the run historically immutable."""
+    return db.query(ExamSession.id).filter(ExamSession.exam_id == exam_id).first() is not None
+
+
+def _event_payload(event: ExamLifecycleEvent) -> dict:
+    """Serialize one append-only event for staff-facing monitoring."""
+    details = event.details if isinstance(event.details, dict) else {}
+    return {
+        "type": event.event_type,
+        "at": event.occurred_at.isoformat() if event.occurred_at else None,
+        "lesson_id": event.lesson_id,
+        "lesson_date": event.lesson_date,
+        "previous_lesson_id": event.previous_lesson_id,
+        "previous_lesson_date": event.previous_lesson_date,
+        "group_id": event.group_id,
+        "group_name": event.group_name,
+        "reason": event.reason,
+        "details": details,
+    }
+
+
+def _recent_exam_lifecycle_events(db: Session, exam: GeneratedExam, *, limit: int = 12) -> list[dict]:
+    """Prefer immutable database history; retain legacy JSON as a safe fallback.
+
+    The fallback makes rolling deployment backward-compatible for existing
+    rows. New operational events are always written to ``exam_lifecycle_events``.
+    """
+    persisted = (
+        db.query(ExamLifecycleEvent)
+        .filter(ExamLifecycleEvent.exam_id == exam.id)
+        .order_by(ExamLifecycleEvent.occurred_at.desc(), ExamLifecycleEvent.id.desc())
+        .limit(limit)
+        .all()
+    )
+    if persisted:
+        return [_event_payload(event) for event in reversed(persisted)]
+    raw = (exam.settings or {}).get("lifecycle_events", [])
+    if not isinstance(raw, list):
+        return []
+    return [event for event in raw[-limit:] if isinstance(event, dict)]
+
+
+def _record_exam_lifecycle_event(
+    db: Session,
+    exam: GeneratedExam,
+    event: dict,
+    *,
+    actor_id: Optional[str] = None,
+) -> None:
+    """Append an immutable operational event without changing task content."""
+    occurred_at = datetime.utcnow()
+    details = event.get("details") if isinstance(event.get("details"), dict) else {}
+    persisted = ExamLifecycleEvent(
+        id=str(uuid4()),
+        exam_id=exam.id,
+        org_id=str(exam.org_id or event.get("org_id") or ""),
+        event_type=str(event.get("type") or "updated"),
+        occurred_at=occurred_at,
+        actor_id=actor_id,
+        group_id=str(event.get("group_id") or exam.group_id or "") or None,
+        group_name=event.get("group_name") or exam.group_name,
+        lesson_id=event.get("lesson_id"),
+        lesson_date=event.get("lesson_date"),
+        previous_lesson_id=event.get("previous_lesson_id"),
+        previous_lesson_date=event.get("previous_lesson_date"),
+        reason=(str(event.get("reason")).strip()[:500] if event.get("reason") else None),
+        details=details,
+    )
+    db.add(persisted)
+
+    # A bounded copy is kept only for a short rolling-deployment transition.
+    # It is never used as the authoritative source for historical filtering.
+    settings = dict(exam.settings or {})
+    history = settings.get("lifecycle_events", [])
+    if not isinstance(history, list):
+        history = []
+    safe_event = {
+        "type": persisted.event_type,
+        "at": occurred_at.isoformat(),
+        "lesson_id": persisted.lesson_id,
+        "lesson_date": persisted.lesson_date,
+        "previous_lesson_id": persisted.previous_lesson_id,
+        "previous_lesson_date": persisted.previous_lesson_date,
+        "group_id": persisted.group_id,
+        "group_name": persisted.group_name,
+        "reason": persisted.reason,
+        "details": details,
+    }
+    settings["lifecycle_events"] = [*history[-19:], safe_event]
+    exam.settings = settings
+
+
+def _reset_lobby_to_draft(
+    db: Session,
+    exam: GeneratedExam,
+    *,
+    lifecycle_event: Optional[dict] = None,
+    actor_id: Optional[str] = None,
+) -> None:
+    """Revoke public access without touching the immutable task snapshot.
+
+    The group remains selected so a teacher can move the same draft to the
+    next lesson.  Only the concrete occurrence and access code are cleared.
+    """
+    if lifecycle_event:
+        _record_exam_lifecycle_event(db, exam, lifecycle_event, actor_id=actor_id)
+    exam.status = "variants_ready" if (exam.variants and len(exam.variants) > 0) else "draft"
+    exam.access_code = None
+    exam.scheduled_lesson_id = None
+    exam.scheduled_lesson_date = None
+    settings = dict(exam.settings or {})
+    settings.pop("started_at", None)
+    exam.settings = settings
+
+
+def _require_bound_exam(exam: GeneratedExam) -> None:
+    if not exam.group_id or not exam.scheduled_lesson_id or not exam.scheduled_lesson_date:
+        raise HTTPException(
+            409,
+            "Экзамен не привязан к конкретному занятию. Выберите урок в расписании перед открытием лобби.",
+        )
+
+
+def _invalidate_unbound_open_exam(db: Session, exam: GeneratedExam) -> bool:
+    """Quarantine only invalid legacy open states, never student attempts."""
+    if exam.status in {"lobby", "active"} and (
+        not exam.group_id or not exam.scheduled_lesson_id or not exam.scheduled_lesson_date
+    ):
+        # A legacy active run with attempts cannot be silently rewritten. It
+        # remains visible to staff for a deliberate close, but never remains a
+        # public entry point without an occurrence binding.
+        if _has_any_sessions(db, exam.id):
+            return False
+        _reset_lobby_to_draft(db, exam)
+        db.commit()
+        db.refresh(exam)
+        return True
+    return False
+
+
+async def _resolve_lesson_occurrence(
+    actor: ExamActor,
+    *,
+    group_id: str,
+    lesson_id: str,
+    lesson_date: str,
+    require_current_or_future: bool = True,
+) -> tuple[dict, dict]:
+    """Return a canonical, accessible occurrence from auth-service.
+
+    The browser may choose an item, but it cannot invent its group, date or
+    schedule id.  A transferred lesson keeps the same id/date pair, so this
+    lookup naturally follows its new time, room and topic.
+    """
+    try:
+        parsed_date = date.fromisoformat(lesson_date)
+    except ValueError as exc:
+        raise HTTPException(422, "Дата урока должна иметь формат YYYY-MM-DD") from exc
+    if require_current_or_future and parsed_date < _business_today():
+        raise HTTPException(409, "Нельзя назначить экзамен на прошедший урок")
+
+    group = await require_group_access(actor, group_id)
+    url = f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/schedule/occurrences"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                url,
+                params={"date_from": lesson_date, "date_to": lesson_date},
+                headers=dict(actor.auth_headers),
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, "Не удалось проверить занятие в расписании. Повторите попытку.") from exc
+
+    if response.status_code in {401, 403}:
+        raise HTTPException(403, "Нет доступа к выбранному занятию")
+    if response.status_code != 200:
+        raise HTTPException(503, "Не удалось проверить занятие в расписании")
+
+    occurrence = next(
+        (
+            item
+            for item in response.json()
+            if str(item.get("id")) == lesson_id
+            and str(item.get("groupId")) == str(group["id"])
+            and item.get("occurrenceDate") == lesson_date
+        ),
+        None,
+    )
+    if not occurrence:
+        raise HTTPException(400, "Выбранного занятия нет в расписании этой группы")
+    return group, occurrence
+
+
+def _ensure_lesson_slot_is_available(
+    db: Session,
+    exam: GeneratedExam,
+    *,
+    org_id: str,
+    lesson_id: str,
+    lesson_date: str,
+) -> None:
+    existing = (
+        db.query(GeneratedExam)
+        .filter(
+            GeneratedExam.org_id == org_id,
+            GeneratedExam.scheduled_lesson_id == lesson_id,
+            GeneratedExam.scheduled_lesson_date == lesson_date,
+            GeneratedExam.status.in_(["lobby", "active"]),
+            GeneratedExam.id != exam.id,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            409,
+            f"На это занятие уже назначен экзамен «{existing.title}». Сначала перенесите или завершите его.",
+        )
+
+
+async def _require_lesson_in_progress(exam: GeneratedExam, actor: ExamActor) -> None:
+    """An exam starts only after its exact lesson has been started."""
+    _require_bound_exam(exam)
+    assert exam.group_id and exam.scheduled_lesson_id and exam.scheduled_lesson_date
+    if exam.scheduled_lesson_date != _business_today().isoformat():
+        raise HTTPException(409, "Экзамен можно начать только в день назначенного занятия")
+
+    await _resolve_lesson_occurrence(
+        actor,
+        group_id=str(exam.group_id),
+        lesson_id=exam.scheduled_lesson_id,
+        lesson_date=exam.scheduled_lesson_date,
+        require_current_or_future=False,
+    )
+    url = (
+        f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/groups/"
+        f"{exam.group_id}/attendance"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                url,
+                params={
+                    "date_from": exam.scheduled_lesson_date,
+                    "date_to": exam.scheduled_lesson_date,
+                },
+                headers=dict(actor.auth_headers),
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, "Не удалось проверить статус урока. Повторите попытку.") from exc
+    if response.status_code != 200:
+        raise HTTPException(503, "Не удалось проверить статус урока")
+    attendance = response.json()
+    lesson_key = f"{exam.scheduled_lesson_date}_{exam.scheduled_lesson_id}"
+    if (attendance.get("statuses") or {}).get(lesson_key) != "in_progress":
+        raise HTTPException(409, "Сначала начните назначенный урок, затем запускайте экзамен")
+
+
+def _require_internal_service_token(token: Optional[str]) -> None:
+    expected = get_settings().internal_service_token
+    if not expected:
+        log.critical("Internal lesson lifecycle call rejected: INTERNAL_SERVICE_TOKEN is not configured")
+        raise HTTPException(503, "Внутренняя связка сервисов не настроена")
+    if not token or not secrets.compare_digest(token, expected):
+        raise HTTPException(403, "Недействительный внутренний токен сервиса")
+
+
+def _lesson_cancellation_blocker(
+    db: Session,
+    *,
+    org_id: str,
+    group_id: str,
+    lesson_id: str,
+    lesson_date: str,
+    lock: bool = False,
+) -> tuple[list[GeneratedExam], list[GeneratedExam]]:
+    query = db.query(GeneratedExam).filter(
+        GeneratedExam.org_id == org_id,
+        GeneratedExam.group_id == group_id,
+        GeneratedExam.scheduled_lesson_id == lesson_id,
+        GeneratedExam.scheduled_lesson_date == lesson_date,
+        GeneratedExam.status.in_(["lobby", "active"]),
+    )
+    if lock:
+        query = query.with_for_update()
+    exams = query.all()
+    blocked = [exam for exam in exams if exam.status == "active" or _has_any_sessions(db, exam.id)]
+    return exams, blocked
+
+
+async def _canonical_student_for_exam(
+    exam: GeneratedExam,
+    *,
+    student_id: Optional[str],
+    student_name: Optional[str],
+    identifier: Optional[str] = None,
+) -> dict:
+    """Resolve one roster member for a public exam entry, failing closed.
+
+    The browser pre-check is a convenience only.  ``start`` calls this helper
+    again and uses its canonical ID/name, so a caller cannot bypass the group
+    boundary or forge another student's identity with a direct API request.
+    """
+    if not exam.group_id:
+        raise HTTPException(409, "Экзамен не привязан к группе и не может быть начат")
+
+    params: dict[str, str] = {}
+    if student_id:
+        params["student_id"] = student_id.strip()
+    if student_name:
+        params["student_name"] = student_name.strip()
+    if identifier:
+        params["q"] = identifier.strip()
+    if not params:
+        raise HTTPException(400, "Укажите идентификатор или ФИО ученика")
+
+    url = (
+        f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/public/groups/"
+        f"{exam.group_id}/verify-student"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                url,
+                params=params,
+                headers={"X-Internal-Service-Token": get_settings().internal_service_token},
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            503,
+            "Не удалось проверить принадлежность к группе. Повторите попытку.",
+        ) from exc
+
+    if response.status_code != 200:
+        raise HTTPException(503, "Не удалось проверить принадлежность к группе")
+    data = response.json()
+    student = data.get("student")
+    if not data.get("enrolled") or not isinstance(student, dict) or not student.get("id"):
+        raise HTTPException(403, data.get("message") or "Ученик не состоит в группе этого экзамена")
+    return student
+
+
+def _require_session_capability(session: ExamSession, session_token: Optional[str]) -> None:
+    """Validate the attempt capability without leaking whether it exists."""
+    if not session_token or not session.session_token:
+        raise HTTPException(403, "Нет доступа к попытке экзамена")
+    if not secrets.compare_digest(session.session_token, session_token):
+        raise HTTPException(403, "Нет доступа к попытке экзамена")
+
+
+def _tasks_for_session(exam: GeneratedExam, session: ExamSession) -> list[dict]:
+    variants = exam.variants or []
+    variant = next(
+        (item for item in variants if item.get("variant_number") == session.variant_number),
+        variants[0] if variants else {},
+    )
+    return list((variant or {}).get("tasks", []))
+
+
+def _validate_answer_keys(exam: GeneratedExam, session: ExamSession, answers: Dict[str, str]) -> None:
+    known_task_ids = {str(task.get("task_id")) for task in _tasks_for_session(exam, session)}
+    unknown_task_ids = set(answers) - known_task_ids
+    if unknown_task_ids:
+        raise HTTPException(422, "Передан ответ для задания, которого нет в варианте")
 
 
 def _difficulty_counts(tasks_count: int, dist: Dict[str, float]) -> Dict[str, int]:
@@ -333,18 +947,14 @@ def _should_show_mc(task: dict, mc_mode: str = "auto") -> bool:
     if mc_mode == "all_open":
         return False
     has_options = bool(task.get("answer_options") or task.get("distractor_meta"))
-    if mc_mode == "all_mc":
-        return has_options
-    answer_type = task.get("answer_type", "exact_number")
-    difficulty = (task.get("difficulty") or "B").upper()
-    mc_types = {"exact_number", "decimal", "multiple_choice", "true_false", "fraction"}
-    mc_diffs = {"A", "B"}
-    return answer_type in mc_types and difficulty in mc_diffs and has_options
+    return has_options
+
 
 
 def _build_mc_options(task: dict) -> List[str]:
     correct = task.get("correct_answer", "")
-    options: list = task.get("answer_options") or []
+    raw_options: list = task.get("answer_options") or []
+    options = normalize_answer_options(raw_options) or []
     if options:
         if correct and correct not in options:
             options = [correct] + list(options)
@@ -353,7 +963,7 @@ def _build_mc_options(task: dict) -> List[str]:
         return options
     distractors = task.get("distractor_meta") or []
     if distractors and correct:
-        opts = [correct] + [str(d.get("value", "")) for d in distractors[:3]]
+        opts = [correct] + [str(d.get("value", "")) for d in distractors[:3] if isinstance(d, dict)]
         random.shuffle(opts)
         return opts
     return []
@@ -382,6 +992,7 @@ from src.domain.distractor_utils import (
     build_analytics_hit,
     match_distractor as _match_distractor,
     normalize_distractor_meta,
+    normalize_answer_options,
     resolve_analytics_explanation,
 )
 
@@ -450,8 +1061,166 @@ def _normalize_content_task(task: dict) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+@router.get("/exams/lesson-binding", summary="Связанный экзамен конкретного занятия")
+async def get_lesson_exam_binding(
+    group_id: str = Query(..., min_length=1),
+    lesson_id: str = Query(..., min_length=1),
+    lesson_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    """Return cancellation-safe operational state for a schedule modal."""
+    await require_group_access(actor, group_id)
+    exams, blocked = _lesson_cancellation_blocker(
+        db,
+        org_id=actor.org_id,
+        group_id=group_id,
+        lesson_id=lesson_id,
+        lesson_date=lesson_date,
+    )
+    exam = exams[0] if exams else None
+    if not exam:
+        return {"attached": False, "can_cancel": True, "exam": None, "message": None}
+    if blocked:
+        return {
+            "attached": True,
+            "can_cancel": False,
+            "exam": {"id": exam.id, "title": exam.title, "status": exam.status},
+            "message": "Сначала завершите активный экзамен или дождитесь окончания попыток учеников.",
+        }
+    return {
+        "attached": True,
+        "can_cancel": True,
+        "exam": {"id": exam.id, "title": exam.title, "status": exam.status},
+        "message": "Экзамен вернётся в черновик, а код доступа будет закрыт.",
+    }
+
+
+@router.post("/internal/lesson-bindings/cancellation-check", summary="Internal: проверить отмену урока")
+async def check_lesson_cancellation(
+    req: LessonCancellationSyncRequest,
+    x_internal_service_token: Optional[str] = Header(None, alias="X-Internal-Service-Token"),
+    db: Session = Depends(get_db),
+):
+    """Fail closed before auth-service persists a lesson cancellation."""
+    _require_internal_service_token(x_internal_service_token)
+    _, blocked = _lesson_cancellation_blocker(
+        db,
+        org_id=req.org_id,
+        group_id=req.group_id,
+        lesson_id=req.lesson_id,
+        lesson_date=req.lesson_date,
+    )
+    if blocked:
+        names = ", ".join(f"«{exam.title}»" for exam in blocked[:2])
+        raise HTTPException(
+            409,
+            f"Нельзя отменить урок: экзамен {names} уже запущен или имеет попытки учеников.",
+        )
+    return {"ok": True, "can_cancel": True}
+
+
+@router.post("/internal/lesson-bindings/release", summary="Internal: освободить экзамен при отмене урока")
+async def release_lesson_exam_binding(
+    req: LessonCancellationSyncRequest,
+    x_internal_service_token: Optional[str] = Header(None, alias="X-Internal-Service-Token"),
+    db: Session = Depends(get_db),
+):
+    """Return an untouched lobby to draft after its lesson is cancelled.
+
+    The row lock plus the same predicate as the public unique index makes this
+    idempotent and protects against a student joining between preflight and
+    cancellation.  Active or attempted exams are deliberately refused.
+    """
+    _require_internal_service_token(x_internal_service_token)
+    exams, blocked = _lesson_cancellation_blocker(
+        db,
+        org_id=req.org_id,
+        group_id=req.group_id,
+        lesson_id=req.lesson_id,
+        lesson_date=req.lesson_date,
+        lock=True,
+    )
+    if blocked:
+        db.rollback()
+        names = ", ".join(f"«{exam.title}»" for exam in blocked[:2])
+        raise HTTPException(409, f"Экзамен {names} уже нельзя безопасно вернуть в черновик")
+
+    released: list[str] = []
+    for exam in exams:
+        _reset_lobby_to_draft(
+            db,
+            exam,
+            lifecycle_event={
+                "type": "lesson_cancelled",
+                "lesson_id": req.lesson_id,
+                "lesson_date": req.lesson_date,
+                "group_id": req.group_id,
+                "group_name": exam.group_name,
+                "reason": req.reason,
+            },
+        )
+        released.append(exam.id)
+    db.commit()
+    return {"ok": True, "released_exam_ids": released}
+
+
+@router.post("/internal/lesson-bindings/rescheduled", summary="Internal: зафиксировать перенос занятия")
+async def record_lesson_reschedule(
+    req: LessonRescheduleSyncRequest,
+    x_internal_service_token: Optional[str] = Header(None, alias="X-Internal-Service-Token"),
+    db: Session = Depends(get_db),
+):
+    """Record a one-off reschedule without changing the exam binding.
+
+    An exam binds to the stable occurrence identity (lesson id + date), so a
+    transfer naturally follows the lesson.  This endpoint records the old and
+    new schedule snapshots for later administrator history; it never opens,
+    starts, closes or reassigns an exam.
+    """
+    _require_internal_service_token(x_internal_service_token)
+    exams = (
+        db.query(GeneratedExam)
+        .filter(
+            GeneratedExam.org_id == req.org_id,
+            GeneratedExam.group_id == req.group_id,
+            GeneratedExam.scheduled_lesson_id == req.lesson_id,
+            GeneratedExam.scheduled_lesson_date == req.lesson_date,
+            GeneratedExam.status.in_(["lobby", "active"]),
+        )
+        .with_for_update()
+        .all()
+    )
+    for exam in exams:
+        _record_exam_lifecycle_event(
+            db,
+            exam,
+            {
+                "type": "lesson_rescheduled",
+                "group_id": req.group_id,
+                "group_name": req.group_name or exam.group_name,
+                "lesson_id": req.lesson_id,
+                "lesson_date": req.lesson_date,
+                "reason": req.reason,
+                "details": {
+                    "previous": req.previous,
+                    "current": req.current,
+                    "source": "schedule_occurrence",
+                },
+            },
+            actor_id=req.actor_id,
+        )
+    db.commit()
+    return {"ok": True, "recorded_exam_ids": [exam.id for exam in exams]}
+
+
 @router.post("/exams/generate", summary="Создать черновик экзамена")
-async def generate_exam(req: GenerateExamRequest, db: Session = Depends(get_db)):
+async def generate_exam(
+    req: GenerateExamRequest,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    _require_teacher_exam_operator(actor)
     if not req.skill_ids and not req.paragraph_ids:
         raise HTTPException(400, "Укажите skill_ids или paragraph_ids")
 
@@ -472,9 +1241,16 @@ async def generate_exam(req: GenerateExamRequest, db: Session = Depends(get_db))
     exam_id = f"EXAM_{uuid4().hex[:8]}"
     skills_set = {t["skill_id"] for t in tasks if t["skill_id"]}
 
+    group = await require_group_access(actor, req.group_id) if req.group_id else None
     exam = GeneratedExam(
         id=exam_id,
         title=req.title,
+        teacher_name=req.teacher_name,
+        org_id=actor.org_id,
+        created_by=actor.user_id,
+        group_id=str(group["id"]) if group else None,
+        group_name=group.get("name") if group else None,
+        class_level=group.get("class_level") if group else req.class_level,
         source_mode=source,
         variants=[{"variant_number": 1, "tasks": tasks}],
         settings={
@@ -504,39 +1280,879 @@ async def generate_exam(req: GenerateExamRequest, db: Session = Depends(get_db))
         except Exception as exc:
             log.warning("Variant generation failed, keeping single variant: %s", exc)
 
-    exam_repo.create(exam)
-    log.info("Exam created: %s, %d tasks, source=%s", exam_id, len(tasks), source)
+    db.add(exam)
+    _record_exam_lifecycle_event(
+        db,
+        exam,
+        {
+            "type": "exam_created",
+            "group_id": exam.group_id,
+            "group_name": exam.group_name,
+            "details": {"initial_status": exam.status, "source_mode": source},
+        },
+        actor_id=actor.user_id,
+    )
+    db.commit()
+    db.refresh(exam)
+    log.info("Exam created: %s, %d tasks, group=%s, source=%s", exam_id, len(tasks), req.group_name, source)
 
     return {
         "exam_id": exam_id,
         "status": exam.status,
         "tasks_count": len(tasks),
         "variants_count": exam.variants_count,
+        "group_id": exam.group_id,
+        "group_name": exam.group_name,
+        "class_level": exam.class_level,
         "skills_covered": list(skills_set),
     }
 
 
-@router.get("/exams", response_model=List[ExamSummaryResponse],
-            summary="Список экзаменов")
-async def list_exams(db: Session = Depends(get_db)):
-    exams = (
+def _to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if not dt:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _grade_and_submit_session(
+    db: Session,
+    session: ExamSession,
+    exam: GeneratedExam,
+    answers: dict,
+    time_spent_seconds: int = 0,
+    *,
+    commit: bool = True,
+) -> dict:
+    """Helper to grade answers, compute distractor analytics, and record submission."""
+    variants = exam.variants or []
+    variant = next(
+        (v for v in variants if v.get("variant_number") == session.variant_number),
+        variants[0] if variants else None,
+    )
+    tasks_raw = variant.get("tasks", []) if variant else []
+
+    correct_count = 0
+    distractor_analytics: dict = {}
+    for t in tasks_raw:
+        task_id = t.get("task_id", "")
+        student_ans = answers.get(task_id, "")
+        is_correct = _check_answer(student_ans, t.get("correct_answer", ""))
+        if is_correct:
+            correct_count += 1
+        else:
+            hit = _match_distractor(student_ans, t.get("distractor_meta") or [])
+            if hit:
+                distractor_analytics[task_id] = build_analytics_hit(hit)
+
+    total_tasks = len(tasks_raw)
+    score = correct_count * 10
+    max_score = total_tasks * 10
+
+    SessionRepository(db).submit(
+        session,
+        answers,
+        score,
+        max_score,
+        correct_count,
+        total_tasks,
+        time_spent_seconds,
+        distractor_analytics=distractor_analytics or None,
+        commit=commit,
+    )
+    return {
+        "score": score,
+        "max_score": max_score,
+        "correct_count": correct_count,
+        "total_tasks": total_tasks,
+        "percentage": round(score / max_score * 100, 1) if max_score else 0.0,
+    }
+
+
+def _exam_started_at(db: Session, exam: GeneratedExam) -> Optional[datetime]:
+    """Return the authoritative common start timestamp for one live exam."""
+    raw_started_at = (exam.settings or {}).get("started_at")
+    if raw_started_at:
+        try:
+            return _to_naive_utc(datetime.fromisoformat(raw_started_at))
+        except (TypeError, ValueError):
+            log.warning("Invalid started_at for exam %s", exam.id)
+
+    first_session = (
+        db.query(ExamSession.started_at)
+        .filter(ExamSession.exam_id == exam.id, ExamSession.started_at.is_not(None))
+        .order_by(ExamSession.started_at.asc())
+        .first()
+    )
+    return _to_naive_utc(first_session[0]) if first_session else None
+
+
+def _live_exam_dashboard_payload(
+    db: Session,
+    exam: GeneratedExam,
+) -> LiveExamDashboardResponse:
+    """Build one compact live-exam snapshot from authoritative DB state."""
+    started_at = _exam_started_at(db, exam)
+    total_time_seconds = (exam.total_time_minutes or 45) * 60
+
+    if exam.status == "active" and started_at:
+        elapsed_seconds = max(0, int((datetime.utcnow() - started_at).total_seconds()))
+        time_remaining_seconds = max(0, total_time_seconds - elapsed_seconds)
+    elif exam.status == "closed":
+        time_remaining_seconds = 0
+    else:
+        # Lobby has not started. The duration shown to the teacher is the
+        # configured duration, not a browser-side countdown.
+        time_remaining_seconds = total_time_seconds
+
+    statuses = [
+        status
+        for (status,) in (
+            db.query(ExamSession.status)
+            .filter(ExamSession.exam_id == exam.id)
+            .all()
+        )
+    ]
+    connected_statuses = {"waiting", "in_progress", "submitted"}
+
+    return LiveExamDashboardResponse(
+        exam_id=exam.id,
+        title=exam.title,
+        status=exam.status,
+        group_id=exam.group_id,
+        group_name=exam.group_name,
+        scheduled_lesson_id=exam.scheduled_lesson_id,
+        scheduled_lesson_date=exam.scheduled_lesson_date,
+        total_time_seconds=total_time_seconds,
+        time_remaining_seconds=time_remaining_seconds,
+        connected_count=sum(status in connected_statuses for status in statuses),
+        solving_count=sum(status == "in_progress" for status in statuses),
+        submitted_count=sum(status == "submitted" for status in statuses),
+        started_at=started_at,
+    )
+
+
+def _finalize_exam(db: Session, exam: GeneratedExam) -> int:
+    """Atomically close an exam and preserve every started student's work."""
+    if exam.status in {"closed", "archived"}:
+        return 0
+    if exam.status not in {"active", "lobby"}:
+        raise HTTPException(409, "Завершить можно только активный экзамен или лобби")
+
+    total_seconds = (exam.total_time_minutes or 45) * 60
+    finalized_count = 0
+    if exam.status == "active":
+        sessions = (
+            db.query(ExamSession)
+            .filter(ExamSession.exam_id == exam.id)
+            .with_for_update()
+            .all()
+        )
+        for session in sessions:
+            if session.status in {"in_progress", "waiting"}:
+                _grade_and_submit_session(
+                    db,
+                    session,
+                    exam,
+                    session.answers or {},
+                    min(max(session.time_spent_seconds or 0, 0), total_seconds),
+                    commit=False,
+                )
+                finalized_count += 1
+
+    previous_status = exam.status
+    exam.status = "closed"
+    _record_exam_lifecycle_event(
+        db,
+        exam,
+        {
+            "type": "exam_closed",
+            "group_id": exam.group_id,
+            "group_name": exam.group_name,
+            "lesson_id": exam.scheduled_lesson_id,
+            "lesson_date": exam.scheduled_lesson_date,
+            "details": {"previous_status": previous_status, "finalized_sessions": finalized_count},
+        },
+    )
+    # An early interim report is no longer authoritative after finalization.
+    db.query(ExamReport).filter(ExamReport.exam_id == exam.id).delete()
+    db.commit()
+    db.refresh(exam)
+    return finalized_count
+
+
+def _check_and_auto_close_exam(db: Session, exam: Optional[GeneratedExam]) -> bool:
+    """
+    Checks if an active exam's total duration has expired.
+    If expired, marks exam as closed, grades/auto-submits all in_progress/waiting sessions,
+    and commits to DB.
+    Returns True if exam was closed.
+    """
+    if not exam or exam.status != "active":
+        return exam.status == "closed" if exam else False
+    # Serialize timeout finalization against a manual close or a concurrent
+    # submit.  PostgreSQL row locks make the state transition deterministic.
+    locked_exam = (
         db.query(GeneratedExam)
-        .order_by(GeneratedExam.created_at.desc())
-        .limit(100)
+        .filter(GeneratedExam.id == exam.id)
+        .with_for_update()
+        .first()
+    )
+    if not locked_exam or locked_exam.status != "active":
+        return bool(locked_exam and locked_exam.status == "closed")
+
+    exam_started_at = _exam_started_at(db, locked_exam)
+    if not exam_started_at:
+        return False
+
+    now_utc = datetime.utcnow()
+    total_seconds = (locked_exam.total_time_minutes or 45) * 60
+    elapsed_seconds = int((now_utc - exam_started_at).total_seconds())
+
+    if elapsed_seconds >= total_seconds:
+        _finalize_exam(db, locked_exam)
+        return True
+
+    return False
+
+
+@router.get("/exams",
+            summary="Список экзаменов (Библиотека учителя)")
+async def list_exams(
+    group_id: Optional[str] = None,
+    unassigned: Optional[bool] = None,   # True = only library templates (group_id IS NULL)
+    status: Optional[str] = None,        # draft | active | closed | archived
+    include_archived: bool = True,       # return archived along with other statuses for tab counts
+    limit: int = Query(100, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    include_meta: bool = Query(False),
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    """List exams with optional filters. Includes session counts."""
+    query = db.query(GeneratedExam).filter(GeneratedExam.org_id == actor.org_id)
+    if group_id:
+        query = query.filter(GeneratedExam.group_id == group_id)
+    if unassigned is True:
+        query = query.filter(GeneratedExam.group_id.is_(None))
+    if status:
+        if status == "draft":
+            query = query.filter(GeneratedExam.status.in_(["draft", "variants_ready"]))
+        elif status == "active":
+            query = query.filter(GeneratedExam.status.in_(["active", "lobby"]))
+        else:
+            query = query.filter(GeneratedExam.status == status)
+    elif not include_archived:
+        query = query.filter(GeneratedExam.status != "archived")
+
+    if include_meta and not actor.is_org_admin:
+        raise HTTPException(403, "Постраничный каталог доступен только администратору")
+
+    total = query.count() if include_meta else None
+    exams = (
+        query
+        .order_by(
+            GeneratedExam.is_pinned.desc(),   # pinned first
+            GeneratedExam.created_at.desc()
+        )
+        .offset(offset if include_meta else 0)
+        .limit(limit if include_meta else 100)
         .all()
     )
-    return [
+    # An owner/admin can see the whole organisation.  A teacher can see their
+    # own templates and the runs assigned to a group they teach.
+    if not actor.is_org_admin:
+        visible: list[GeneratedExam] = []
+        group_access: dict[str, bool] = {}
+        for exam in exams:
+            group_id = str(exam.group_id) if exam.group_id else None
+            if group_id in group_access:
+                if group_access[group_id]:
+                    visible.append(exam)
+                continue
+            try:
+                await require_exam_access(exam, actor)
+                visible.append(exam)
+                if group_id:
+                    group_access[group_id] = True
+            except HTTPException as exc:
+                # A deleted group may still be referenced by an old archived
+                # exam. It is not visible to this teacher, but must not make
+                # the complete library unavailable.
+                if exc.status_code not in {403, 404}:
+                    raise
+                if group_id:
+                    group_access[group_id] = False
+        exams = visible
+
+    # An open exam is valid only when it has a concrete schedule occurrence.
+    # Legacy rows with attempts are intentionally never rewritten here.
+    for e in exams:
+        if e.status in ("active", "lobby") and (
+            not e.group_id or not e.scheduled_lesson_id or not e.scheduled_lesson_date
+        ):
+            _invalidate_unbound_open_exam(db, e)
+        elif e.status == "active":
+            _check_and_auto_close_exam(db, e)
+
+    # Count submitted sessions per exam in one query
+    from sqlalchemy import func as sqlfunc
+    exam_ids = [e.id for e in exams]
+    session_counts: dict[str, int] = {}
+    if exam_ids:
+        rows = (
+            db.query(ExamSession.exam_id, sqlfunc.count(ExamSession.id))
+            .filter(ExamSession.exam_id.in_(exam_ids), ExamSession.status == "submitted")
+            .group_by(ExamSession.exam_id)
+            .all()
+        )
+        session_counts = {r[0]: r[1] for r in rows}
+
+    summaries = [
         ExamSummaryResponse(
             exam_id=e.id,
             title=e.title,
             status=e.status,
-            access_code=e.access_code,
+            # Access code is a student capability.  Organisation-wide
+            # monitoring deliberately does not grant an administrator the
+            # ability to distribute or reopen a classroom run.
+            access_code=e.access_code if actor.role == "teacher" else None,
             tasks_per_variant=e.tasks_per_variant,
             variants_count=e.variants_count,
+            total_time_minutes=e.total_time_minutes or 45,
+            group_id=e.group_id,
+            group_name=e.group_name,
+            class_level=e.class_level,
+            teacher_name=e.teacher_name,
+            scheduled_lesson_id=e.scheduled_lesson_id,
+            scheduled_lesson_date=e.scheduled_lesson_date,
+            is_pinned=bool(e.is_pinned),
+            source_exam_id=e.source_exam_id,
+            total_sessions=session_counts.get(e.id, 0),
+            skills_covered=list(e.skills_covered or []),
+            recent_events=_recent_exam_lifecycle_events(db, e),
             created_at=e.created_at,
         )
         for e in exams
     ]
+    if include_meta:
+        return {
+            "items": summaries,
+            "total": total or 0,
+            "limit": limit,
+            "offset": offset,
+        }
+    return summaries
+
+
+def _monitor_event_ids(
+    *,
+    org_id: str,
+    date_from: Optional[date],
+    date_to: Optional[date],
+    event_types: Optional[list[str]] = None,
+):
+    """Build a scalar subquery of exams with matching immutable events."""
+    query = select(ExamLifecycleEvent.exam_id).where(ExamLifecycleEvent.org_id == org_id)
+    if event_types:
+        query = query.where(ExamLifecycleEvent.event_type.in_(event_types))
+    if date_from:
+        local_start = datetime(date_from.year, date_from.month, date_from.day, tzinfo=_BUSINESS_TIMEZONE)
+        query = query.where(ExamLifecycleEvent.occurred_at >= local_start.astimezone(timezone.utc).replace(tzinfo=None))
+    if date_to:
+        next_day = date_to + timedelta(days=1)
+        local_end = datetime(next_day.year, next_day.month, next_day.day, tzinfo=_BUSINESS_TIMEZONE)
+        query = query.where(ExamLifecycleEvent.occurred_at < local_end.astimezone(timezone.utc).replace(tzinfo=None))
+    return query
+
+
+def _monitor_period_clause(
+    *,
+    org_id: str,
+    date_from: Optional[date],
+    date_to: Optional[date],
+):
+    """Select a run if any verifiable lifecycle fact falls in the period."""
+    if not date_from and not date_to:
+        return None
+    conditions = []
+    if date_from:
+        local_start = datetime(date_from.year, date_from.month, date_from.day, tzinfo=_BUSINESS_TIMEZONE)
+        conditions.append(GeneratedExam.created_at >= local_start.astimezone(timezone.utc).replace(tzinfo=None))
+        conditions.append(GeneratedExam.scheduled_lesson_date >= date_from.isoformat())
+    if date_to:
+        next_day = date_to + timedelta(days=1)
+        local_end = datetime(next_day.year, next_day.month, next_day.day, tzinfo=_BUSINESS_TIMEZONE)
+        conditions.append(GeneratedExam.created_at < local_end.astimezone(timezone.utc).replace(tzinfo=None))
+        conditions.append(GeneratedExam.scheduled_lesson_date <= date_to.isoformat())
+    # When both endpoints are present, dates must be inside the interval, not
+    # merely above one boundary or below the other.
+    date_conditions = []
+    if date_from and date_to:
+        local_start = datetime(date_from.year, date_from.month, date_from.day, tzinfo=_BUSINESS_TIMEZONE)
+        next_day = date_to + timedelta(days=1)
+        local_end = datetime(next_day.year, next_day.month, next_day.day, tzinfo=_BUSINESS_TIMEZONE)
+        date_conditions.extend([
+            and_(
+                GeneratedExam.created_at >= local_start.astimezone(timezone.utc).replace(tzinfo=None),
+                GeneratedExam.created_at < local_end.astimezone(timezone.utc).replace(tzinfo=None),
+            ),
+            and_(
+                GeneratedExam.scheduled_lesson_date >= date_from.isoformat(),
+                GeneratedExam.scheduled_lesson_date <= date_to.isoformat(),
+            ),
+        ])
+    else:
+        date_conditions = conditions
+    date_conditions.append(GeneratedExam.id.in_(_monitor_event_ids(org_id=org_id, date_from=date_from, date_to=date_to)))
+    return or_(*date_conditions)
+
+
+def _monitor_summary(db: Session, exam: GeneratedExam, submitted_count: int) -> ExamSummaryResponse:
+    return ExamSummaryResponse(
+        exam_id=exam.id,
+        title=exam.title,
+        status=exam.status,
+        access_code=None,
+        tasks_per_variant=exam.tasks_per_variant,
+        variants_count=exam.variants_count,
+        total_time_minutes=exam.total_time_minutes or 45,
+        group_id=exam.group_id,
+        group_name=exam.group_name,
+        class_level=exam.class_level,
+        teacher_name=exam.teacher_name,
+        scheduled_lesson_id=exam.scheduled_lesson_id,
+        scheduled_lesson_date=exam.scheduled_lesson_date,
+        is_pinned=bool(exam.is_pinned),
+        source_exam_id=exam.source_exam_id,
+        total_sessions=submitted_count,
+        skills_covered=list(exam.skills_covered or []),
+        recent_events=_recent_exam_lifecycle_events(db, exam),
+        created_at=exam.created_at,
+    )
+
+
+@router.get(
+    "/admin/exams/monitor",
+    response_model=AdminExamMonitorResponse,
+    summary="Постраничный исторический мониторинг экзаменов организации",
+)
+async def get_admin_exam_monitor(
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
+    state: str = Query("all", pattern="^(all|active|lobby|closed|changes)$"),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    """Read-only monitor with one status dimension and one time dimension.
+
+    ``active`` and ``lobby`` deliberately mean the current operational state;
+    the web app resets the visible period to today before requesting either.
+    ``closed`` and ``changes`` are historical filters backed by immutable
+    events, with a scheduled-date fallback for legacy closed runs.
+    """
+    _require_exam_admin_observer(actor)
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422, "Начало периода не может быть позже его окончания")
+
+    period_clause = _monitor_period_clause(org_id=actor.org_id, date_from=date_from, date_to=date_to)
+    base = db.query(GeneratedExam).filter(GeneratedExam.org_id == actor.org_id)
+    scoped = base.filter(period_clause) if period_clause is not None else base
+
+    changes_ids = _monitor_event_ids(
+        org_id=actor.org_id,
+        date_from=date_from,
+        date_to=date_to,
+        event_types=["lesson_rescheduled", "lesson_cancelled", "exam_rescheduled"],
+    )
+    closed_ids = _monitor_event_ids(
+        org_id=actor.org_id,
+        date_from=date_from,
+        date_to=date_to,
+        event_types=["exam_closed"],
+    )
+
+    if state == "active":
+        scoped = scoped.filter(GeneratedExam.status == "active")
+    elif state == "lobby":
+        scoped = scoped.filter(GeneratedExam.status == "lobby")
+    elif state == "closed":
+        legacy_closed = GeneratedExam.status == "closed"
+        if date_from or date_to:
+            scoped = base.filter(
+                or_(
+                    GeneratedExam.id.in_(closed_ids),
+                    and_(legacy_closed, period_clause),
+                )
+            )
+        else:
+            scoped = scoped.filter(legacy_closed)
+    elif state == "changes":
+        scoped = base.filter(GeneratedExam.id.in_(changes_ids))
+
+    # Auto-finalisation remains server authoritative even if no teacher page
+    # is open. Re-evaluate the matching page after these transitions.
+    candidate_rows = scoped.order_by(GeneratedExam.updated_at.desc()).all()
+    for exam in candidate_rows:
+        if exam.status == "active":
+            _check_and_auto_close_exam(db, exam)
+
+    # The query may have changed due to an auto-close, so rebuild it exactly
+    # once for consistent list rows and KPI counts.
+    if state == "active":
+        scoped = (base.filter(period_clause) if period_clause is not None else base).filter(GeneratedExam.status == "active")
+    elif state == "closed" and (date_from or date_to):
+        scoped = base.filter(or_(GeneratedExam.id.in_(closed_ids), and_(GeneratedExam.status == "closed", period_clause)))
+    elif state == "closed":
+        scoped = (base.filter(period_clause) if period_clause is not None else base).filter(GeneratedExam.status == "closed")
+
+    total = scoped.count()
+    rows = (
+        scoped.order_by(GeneratedExam.updated_at.desc(), GeneratedExam.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    exam_ids = [exam.id for exam in rows]
+    submitted_counts: dict[str, int] = {}
+    if exam_ids:
+        from sqlalchemy import func as sqlfunc
+        submitted_counts = {
+            row[0]: row[1]
+            for row in (
+                db.query(ExamSession.exam_id, sqlfunc.count(ExamSession.id))
+                .filter(ExamSession.exam_id.in_(exam_ids), ExamSession.status == "submitted")
+                .group_by(ExamSession.exam_id)
+                .all()
+            )
+        }
+
+    metric_base = base.filter(period_clause) if period_clause is not None else base
+    counts = {
+        "all": metric_base.count(),
+        "active": metric_base.filter(GeneratedExam.status == "active").count(),
+        "lobby": metric_base.filter(GeneratedExam.status == "lobby").count(),
+        "closed": metric_base.filter(GeneratedExam.status == "closed").count(),
+        "changes": base.filter(GeneratedExam.id.in_(changes_ids)).count(),
+    }
+    return AdminExamMonitorResponse(
+        items=[_monitor_summary(db, exam, submitted_counts.get(exam.id, 0)) for exam in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+        period_from=date_from.isoformat() if date_from else None,
+        period_to=date_to.isoformat() if date_to else None,
+        counts=counts,
+    )
+
+
+@router.get(
+    "/exams/live-summary",
+    response_model=List[LiveExamDashboardResponse],
+    summary="Оперативная сводка экзаменов для панели преподавателя",
+)
+async def get_live_exam_dashboard_summary(
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    """Return only live exams plus recently completed live runs.
+
+    The endpoint is intentionally separate from the library list: the
+    dashboard needs a short operational snapshot, while the library may hold
+    an arbitrary number of drafts and archived templates.  A recently closed
+    run remains visible for six hours so the teacher sees the definitive
+    ``exam finished`` state instead of a card abruptly disappearing at zero.
+    """
+    recent_cutoff = datetime.utcnow() - timedelta(hours=6)
+    candidates = (
+        db.query(GeneratedExam)
+        .filter(
+            GeneratedExam.org_id == actor.org_id,
+            or_(
+            GeneratedExam.status.in_(["lobby", "active"]),
+                and_(
+                    GeneratedExam.status == "closed",
+                    GeneratedExam.updated_at >= recent_cutoff,
+                ),
+            ),
+        )
+        .order_by(GeneratedExam.updated_at.desc())
+        .limit(100)
+        .all()
+    )
+
+    result: list[LiveExamDashboardResponse] = []
+    group_access: dict[str, bool] = {}
+
+    for exam in candidates:
+        if exam.status in {"lobby", "active"} and (
+            not exam.group_id or not exam.scheduled_lesson_id or not exam.scheduled_lesson_date
+        ):
+            invalidated = _invalidate_unbound_open_exam(db, exam)
+            # A historic active run with real attempts is never rewritten or
+            # hidden from its teacher.  It cannot accept new public entries
+            # without a lesson binding, but it stays observable until closed.
+            if invalidated or exam.status != "active" or not _has_any_sessions(db, exam.id):
+                continue
+        group_id = str(exam.group_id) if exam.group_id else None
+        needs_group_lookup = bool(
+            not actor.is_org_admin
+            and exam.created_by != actor.user_id
+            and group_id
+        )
+        if needs_group_lookup and group_id in group_access:
+            if not group_access[group_id]:
+                continue
+        else:
+            try:
+                await require_exam_access(exam, actor)
+                if needs_group_lookup and group_id:
+                    group_access[group_id] = True
+            except HTTPException as exc:
+                # A deleted group on a historical exam must never make the
+                # complete operational dashboard unavailable.
+                if exc.status_code not in {403, 404}:
+                    raise
+                if needs_group_lookup and group_id:
+                    group_access[group_id] = False
+                continue
+
+        _check_and_auto_close_exam(db, exam)
+        if exam.status not in {"lobby", "active", "closed"}:
+            continue
+
+        started_at = _exam_started_at(db, exam)
+        if exam.status == "closed" and (not started_at or started_at < recent_cutoff):
+            continue
+
+        result.append(_live_exam_dashboard_payload(db, exam))
+
+    # Active work is always the highest-priority item.  Recently completed
+    # cards follow it and are read-only.
+    order = {"active": 0, "lobby": 1, "closed": 2}
+    return sorted(result, key=lambda item: (order.get(item.status, 9), item.title.lower()))
+
+
+@router.post("/exams/{exam_id}/pin",
+             summary="Переключить закрепление (избранное)")
+async def toggle_pin_exam(
+    exam_id: str,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    """Toggle is_pinned on a teacher's exam."""
+    exam_repo = ExamRepository(db)
+    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam.is_pinned = not bool(exam.is_pinned)
+    db.commit()
+    return {"exam_id": exam_id, "is_pinned": exam.is_pinned}
+
+
+class CloneExamRequest(BaseModel):
+    title: Optional[str] = None         # override title; if None, use original + " (копия)"
+    group_id: Optional[str] = None      # optionally assign to a group immediately
+    group_name: Optional[str] = None
+    class_level: Optional[int] = None
+
+
+@router.post("/exams/{exam_id}/clone",
+             summary="Клонировать экзамен (шаблон)")
+async def clone_exam(
+    exam_id: str,
+    req: CloneExamRequest,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    """
+    Duplicate an exam template:
+    - copies variants + settings
+    - resets status to 'draft', clears access_code
+    - optionally binds to a new group
+    """
+    exam_repo = ExamRepository(db)
+    src = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    group = await require_group_access(actor, req.group_id) if req.group_id else None
+
+    new_id = f"EXAM_{uuid4().hex[:8]}"
+    clone = GeneratedExam(
+        id=new_id,
+        title=req.title or f"{src.title} (копия)",
+        teacher_name=src.teacher_name,
+        org_id=actor.org_id,
+        created_by=actor.user_id,
+        group_id=str(group["id"]) if group else None,
+        group_name=group.get("name") if group else None,
+        class_level=group.get("class_level") if group else (req.class_level or src.class_level),
+        source_mode=src.source_mode,
+        variants=src.variants,
+        settings=src.settings,
+        skills_covered=src.skills_covered,
+        toc_ids_used=src.toc_ids_used,
+        status="variants_ready" if src.variants and len(src.variants) > 0 else "draft",
+        total_time_minutes=src.total_time_minutes,
+        variants_count=src.variants_count,
+        tasks_per_variant=src.tasks_per_variant,
+        subject=src.subject,
+        source_exam_id=exam_id,   # track lineage
+        is_pinned=False,
+    )
+    db.add(clone)
+    _record_exam_lifecycle_event(
+        db,
+        clone,
+        {
+            "type": "exam_created",
+            "group_id": clone.group_id,
+            "group_name": clone.group_name,
+            "details": {"initial_status": clone.status, "source_exam_id": exam_id, "operation": "clone"},
+        },
+        actor_id=actor.user_id,
+    )
+    db.commit()
+    db.refresh(clone)
+    log.info("Exam cloned: %s → %s, group=%s", exam_id, new_id, req.group_id)
+    return {
+        "exam_id": clone.id,
+        "title": clone.title,
+        "status": clone.status,
+        "source_exam_id": exam_id,
+        "group_id": clone.group_id,
+        "group_name": clone.group_name,
+    }
+
+
+class AssignExamRequest(BaseModel):
+    group_id: str
+    group_name: Optional[str] = None
+    class_level: Optional[int] = None
+    teacher_name: Optional[str] = None
+    subject: Optional[str] = None
+    # ``publish`` opens the student lobby.  It is valid only together with a
+    # real resolved lesson occurrence; a group by itself is never enough.
+    publish: bool = False
+    lesson_id: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    lesson_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+
+@router.post("/exams/{exam_id}/assign",
+             summary="Назначить экзамен группе")
+async def assign_exam(
+    exam_id: str,
+    req: AssignExamRequest,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    """
+    Bind a draft to a group and, when requested, to a concrete lesson.
+
+    Rebinding a lobby is permitted only before any student has entered it.
+    Once a session exists, a copy is required so an earlier run is never
+    silently repurposed for another lesson or group.
+    """
+    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    group = await require_group_access(actor, req.group_id)
+    if _has_any_sessions(db, exam_id):
+        raise HTTPException(
+            409,
+            f"Экзамен уже имеет попытки группы '{exam.group_name}'. "
+            "Создайте копию (клон), чтобы провести для другой группы."
+        )
+    if exam.status not in ("draft", "variants_ready", "lobby"):
+        raise HTTPException(409, "Назначить или перенести можно только экзамен до его запуска")
+    if exam.status == "lobby" and not req.publish:
+        raise HTTPException(409, "Для экзамена в лобби выберите новое занятие и подтвердите перенос")
+    if req.publish and (not req.lesson_id or not req.lesson_date):
+        raise HTTPException(422, "Для лобби выберите конкретное занятие в расписании")
+
+    previous_status = exam.status
+    previous_lesson_id = exam.scheduled_lesson_id
+    previous_lesson_date = exam.scheduled_lesson_date
+    exam.group_id = str(group["id"])
+    exam.group_name = group.get("name")
+    exam.class_level = group.get("class_level")
+    # The group service is authoritative for the responsible teacher. Do not
+    # trust a name supplied by the browser for an administrative audit trail.
+    exam.teacher_name = group.get("teacher_name") or req.teacher_name or exam.teacher_name
+    if req.subject:
+        exam.subject = req.subject
+
+    access_code = None
+    if req.publish:
+        canonical_group, _ = await _resolve_lesson_occurrence(
+            actor,
+            group_id=str(group["id"]),
+            lesson_id=req.lesson_id,
+            lesson_date=req.lesson_date,
+        )
+        _ensure_lesson_slot_is_available(
+            db,
+            exam,
+            org_id=actor.org_id,
+            lesson_id=req.lesson_id,
+            lesson_date=req.lesson_date,
+        )
+        exam.group_id = str(canonical_group["id"])
+        exam.group_name = canonical_group.get("name")
+        exam.class_level = canonical_group.get("class_level")
+        exam.teacher_name = canonical_group.get("teacher_name") or exam.teacher_name
+        exam.scheduled_lesson_id = req.lesson_id
+        exam.scheduled_lesson_date = req.lesson_date
+        access_code = exam.access_code or _generate_access_code()
+        exam.access_code = access_code
+        exam.status = "lobby"
+        _record_exam_lifecycle_event(
+            db,
+            exam,
+            {
+                "type": "exam_rescheduled" if previous_lesson_id else "exam_lobby_opened",
+                "group_id": exam.group_id,
+                "group_name": exam.group_name,
+                "lesson_id": exam.scheduled_lesson_id,
+                "lesson_date": exam.scheduled_lesson_date,
+                "previous_lesson_id": previous_lesson_id,
+                "previous_lesson_date": previous_lesson_date,
+                "details": {"previous_status": previous_status, "operation": "assign"},
+            },
+            actor_id=actor.user_id,
+        )
+    else:
+        # A draft may be prepared for a group, but it is not a scheduled
+        # public run until the teacher explicitly selects a lesson.
+        _reset_lobby_to_draft(
+            db,
+            exam,
+            actor_id=actor.user_id,
+            lifecycle_event={
+                "type": "exam_unbound",
+                "group_id": exam.group_id,
+                "group_name": exam.group_name,
+                "lesson_id": previous_lesson_id,
+                "lesson_date": previous_lesson_date,
+                "details": {"previous_status": previous_status, "operation": "assign"},
+            } if previous_lesson_id else None,
+        )
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "На это занятие уже назначен другой открытый экзамен") from exc
+    db.refresh(exam)
+
+    log.info("Exam %s assigned to group %s, publish=%s", exam_id, req.group_id, req.publish)
+    return {
+        "exam_id": exam_id,
+        "status": exam.status,
+        "group_id": exam.group_id,
+        "group_name": exam.group_name,
+        "access_code": access_code,
+        "scheduled_lesson_id": exam.scheduled_lesson_id,
+        "scheduled_lesson_date": exam.scheduled_lesson_date,
+        "url": f"/e/{access_code}" if access_code else None,
+    }
 
 
 @router.post("/exams/{exam_id}/publish", response_model=PublishExamResponse,
@@ -545,20 +2161,74 @@ async def publish_exam(
     exam_id: str,
     req: PublishExamRequest,
     db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
 ):
     exam_repo = ExamRepository(db)
-    exam = exam_repo.get_by_id(exam_id)
-    if not exam:
-        raise HTTPException(404, "Экзамен не найден")
-    if exam.status == "active":
-        raise HTTPException(400, "Экзамен уже опубликован")
+    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    if exam.status not in ("draft", "variants_ready", "lobby"):
+        raise HTTPException(409, "В лобби можно вывести только экзамен до его запуска")
 
-    code = _generate_access_code()
-    if req.teacher_name:
-        exam.teacher_name = req.teacher_name
+    target_group_id = req.group_id or exam.group_id
+    if not target_group_id:
+        raise HTTPException(
+            400,
+            "Нельзя активировать экзамен без привязки к группе. Сначала привяжите экзамен к классу."
+        )
+
+    if not req.lesson_id or not req.lesson_date:
+        raise HTTPException(422, "Для лобби выберите конкретное занятие в расписании")
+    if _has_any_sessions(db, exam_id):
+        raise HTTPException(409, "Экзамен уже имеет попытки. Для нового урока создайте его копию")
+    group, _ = await _resolve_lesson_occurrence(
+        actor,
+        group_id=target_group_id,
+        lesson_id=req.lesson_id,
+        lesson_date=req.lesson_date,
+    )
+    _ensure_lesson_slot_is_available(
+        db,
+        exam,
+        org_id=actor.org_id,
+        lesson_id=req.lesson_id,
+        lesson_date=req.lesson_date,
+    )
+    previous_status = exam.status
+    previous_lesson_id = exam.scheduled_lesson_id
+    previous_lesson_date = exam.scheduled_lesson_date
+    code = exam.access_code or _generate_access_code()
     if req.subject:
         exam.subject = req.subject
-    exam_repo.publish(exam, code)
+    exam.group_id = str(group["id"])
+    exam.group_name = group.get("name")
+    exam.class_level = group.get("class_level")
+    # The responsible teacher comes from the canonical group, never from a
+    # potentially stale client-side label.
+    exam.teacher_name = group.get("teacher_name") or req.teacher_name or exam.teacher_name
+    exam.scheduled_lesson_id = req.lesson_id
+    exam.scheduled_lesson_date = req.lesson_date
+    exam.access_code = code
+    exam.status = "lobby"
+    _record_exam_lifecycle_event(
+        db,
+        exam,
+        {
+            "type": "exam_rescheduled" if previous_lesson_id else "exam_lobby_opened",
+            "group_id": exam.group_id,
+            "group_name": exam.group_name,
+            "lesson_id": exam.scheduled_lesson_id,
+            "lesson_date": exam.scheduled_lesson_date,
+            "previous_lesson_id": previous_lesson_id,
+            "previous_lesson_date": previous_lesson_date,
+            "details": {"previous_status": previous_status, "operation": "publish"},
+        },
+        actor_id=actor.user_id,
+    )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "На это занятие уже назначен другой открытый экзамен") from exc
+    db.refresh(exam)
 
     return PublishExamResponse(
         exam_id=exam.id,
@@ -567,17 +2237,290 @@ async def publish_exam(
         access_code=exam.access_code,
         tasks_per_variant=exam.tasks_per_variant,
         variants_count=exam.variants_count,
+        total_time_minutes=exam.total_time_minutes or 45,
+        group_id=exam.group_id,
+        group_name=exam.group_name,
+        class_level=exam.class_level,
         created_at=exam.created_at,
         url=f"/e/{exam.access_code}",
     )
 
 
+@router.post("/exams/{exam_id}/open-lobby", summary="Запланировать экзамен и открыть лобби")
+async def open_exam_lobby(
+    exam_id: str,
+    req: LessonBindingRequest,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+
+    if not exam.group_id:
+        raise HTTPException(
+            400,
+            "Нельзя открыть лобби для экзамена без группы. Сначала привяжите экзамен к группе."
+        )
+
+    if exam.status not in ("draft", "variants_ready", "lobby"):
+        raise HTTPException(409, "Открыть лобби можно только до начала экзамена")
+    if _has_any_sessions(db, exam_id):
+        raise HTTPException(409, "В лобби уже есть участники. Для другого занятия создайте копию экзамена")
+    previous_status = exam.status
+    previous_lesson_id = exam.scheduled_lesson_id
+    previous_lesson_date = exam.scheduled_lesson_date
+    group, _ = await _resolve_lesson_occurrence(
+        actor,
+        group_id=str(exam.group_id),
+        lesson_id=req.lesson_id,
+        lesson_date=req.lesson_date,
+    )
+    _ensure_lesson_slot_is_available(
+        db,
+        exam,
+        org_id=actor.org_id,
+        lesson_id=req.lesson_id,
+        lesson_date=req.lesson_date,
+    )
+    exam.group_id = str(group["id"])
+    exam.group_name = group.get("name")
+    exam.class_level = group.get("class_level")
+    exam.teacher_name = group.get("teacher_name") or exam.teacher_name
+    exam.scheduled_lesson_id = req.lesson_id
+    exam.scheduled_lesson_date = req.lesson_date
+    if not exam.access_code:
+        exam.access_code = _generate_access_code()
+    exam.status = "lobby"
+    _record_exam_lifecycle_event(
+        db,
+        exam,
+        {
+            "type": "exam_rescheduled" if previous_lesson_id else "exam_lobby_opened",
+            "group_id": exam.group_id,
+            "group_name": exam.group_name,
+            "lesson_id": exam.scheduled_lesson_id,
+            "lesson_date": exam.scheduled_lesson_date,
+            "previous_lesson_id": previous_lesson_id,
+            "previous_lesson_date": previous_lesson_date,
+            "details": {"previous_status": previous_status, "operation": "open_lobby"},
+        },
+        actor_id=actor.user_id,
+    )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "На это занятие уже назначен другой открытый экзамен") from exc
+    db.refresh(exam)
+    return {
+        "status": "lobby",
+        "access_code": exam.access_code if actor.role == "teacher" else None,
+        "url": f"/e/{exam.access_code}",
+    }
+
+
+@router.post("/exams/{exam_id}/start-live", summary="Синхронный старт экзамена из лобби")
+async def start_exam_live(
+    exam_id: str,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+
+    if exam.status != "lobby":
+        raise HTTPException(409, "Начать можно только экзамен, открытый в лобби")
+    await _require_lesson_in_progress(exam, actor)
+    exam.status = "active"
+    sessions = SessionRepository(db).list_by_exam(exam_id)
+    started_count = 0
+    now = datetime.utcnow()
+    st = dict(exam.settings or {})
+    st["started_at"] = now.isoformat()
+    exam.settings = st
+    for s in sessions:
+        if s.status == "waiting":
+            s.status = "in_progress"
+            s.started_at = now
+            started_count += 1
+
+    _record_exam_lifecycle_event(
+        db,
+        exam,
+        {
+            "type": "exam_started",
+            "group_id": exam.group_id,
+            "group_name": exam.group_name,
+            "lesson_id": exam.scheduled_lesson_id,
+            "lesson_date": exam.scheduled_lesson_date,
+            "details": {"waiting_students_started": started_count},
+        },
+        actor_id=actor.user_id,
+    )
+
+    db.commit()
+    db.refresh(exam)
+    return {"status": "active", "started_count": started_count}
+
+
+@router.get("/exams/{exam_id}/lobby-status", summary="Статус лобби и список подключенных учеников")
+async def get_exam_lobby_status(
+    exam_id: str,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    exam = await _get_exam_for_actor(db, exam_id, actor)
+
+    # Check and auto-close if exam duration expired
+    _check_and_auto_close_exam(db, exam)
+
+    _invalidate_unbound_open_exam(db, exam)
+
+    sessions = SessionRepository(db).list_by_exam(exam_id)
+    session_items = []
+    earliest_started_at = None
+
+    for s in sessions:
+        disp_id = s.display_id
+        if not disp_id and s.student_id and s.student_id.startswith("AL-"):
+            disp_id = s.student_id
+
+        if s.started_at:
+            s_naive = _to_naive_utc(s.started_at)
+            if s_naive and (not earliest_started_at or s_naive < earliest_started_at):
+                earliest_started_at = s_naive
+
+        session_items.append({
+            "session_id": s.id,
+            "student_id": s.student_id,
+            "display_id": disp_id,
+            "student_name": s.student_name,
+            "status": s.status,
+            "variant_number": s.variant_number,
+            "answered_count": len(s.answers or {}),
+            "total_tasks": s.total_tasks or exam.tasks_per_variant,
+            "score": s.score,
+            "max_score": s.max_score,
+            "started_at": s.started_at.isoformat() if s.started_at else None,
+            "submitted_at": s.submitted_at.isoformat() if s.submitted_at else None,
+        })
+
+    exam_started_at_str = (exam.settings or {}).get("started_at")
+    if exam_started_at_str:
+        try:
+            exam_started_at = _to_naive_utc(datetime.fromisoformat(exam_started_at_str))
+            if exam_started_at and (not earliest_started_at or exam_started_at < earliest_started_at):
+                earliest_started_at = exam_started_at
+        except Exception:
+            pass
+
+    total_time_seconds = exam.total_time_minutes * 60
+    time_remaining_seconds = total_time_seconds
+    time_elapsed_seconds = 0
+
+    if exam.status == "active" and earliest_started_at:
+        now_utc = datetime.utcnow()
+        time_elapsed_seconds = max(0, int((now_utc - earliest_started_at).total_seconds()))
+        time_remaining_seconds = max(0, total_time_seconds - time_elapsed_seconds)
+    elif exam.status == "closed":
+        time_remaining_seconds = 0
+        time_elapsed_seconds = total_time_seconds
+
+    return {
+        "exam_id": exam.id,
+        "title": exam.title,
+        "access_code": exam.access_code if actor.role == "teacher" else None,
+        "status": exam.status,
+        "group_id": exam.group_id,
+        "group_name": exam.group_name,
+        "total_time_minutes": exam.total_time_minutes,
+        "total_time_seconds": total_time_seconds,
+        "time_remaining_seconds": time_remaining_seconds,
+        "time_elapsed_seconds": time_elapsed_seconds,
+        "tasks_per_variant": exam.tasks_per_variant,
+        "connected_count": len([s for s in session_items if s["status"] in ("waiting", "in_progress", "submitted")]),
+        "students": session_items,
+    }
+
+
+@router.delete("/exams/{exam_id}/sessions/{session_id}", summary="Удалить ученика из сессии / лобби")
+async def kick_student_session(
+    exam_id: str,
+    session_id: str,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    await _get_exam_for_teacher_operator(db, exam_id, actor)
+    session = SessionRepository(db).get_by_id(session_id)
+    if not session or session.exam_id != exam_id:
+        raise HTTPException(404, "Сессия не найдена")
+
+    if session.status != "waiting":
+        raise HTTPException(409, "Удалить можно только ученика, ожидающего старта в лобби")
+    db.delete(session)
+    db.commit()
+    return {"ok": True, "kicked_session_id": session_id}
+
+
+@router.delete("/exams/{exam_id}", summary="Удалить экзамен (в архив или навсегда)")
+async def delete_exam(
+    exam_id: str,
+    permanent: bool = False,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    repo = ExamRepository(db)
+    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    if exam.status in ("active", "lobby"):
+        raise HTTPException(409, "Сначала завершите экзамен, затем его можно архивировать")
+    if permanent or exam.status == "archived":
+        repo.delete(exam)
+        return {"ok": True, "action": "deleted_permanently", "id": exam_id}
+    else:
+        exam.status = "archived"
+        exam.is_pinned = False
+        _record_exam_lifecycle_event(
+            db,
+            exam,
+            {"type": "exam_archived", "group_id": exam.group_id, "group_name": exam.group_name},
+            actor_id=actor.user_id,
+        )
+        db.commit()
+        return {"ok": True, "action": "archived", "id": exam_id}
+
+
+@router.post("/exams/{exam_id}/restore", summary="Восстановить экзамен из архива")
+async def restore_exam(
+    exam_id: str,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    repo = ExamRepository(db)
+    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    if not exam.group_id:
+        exam.status = "variants_ready" if (exam.variants and len(exam.variants) > 0) else "draft"
+    else:
+        sessions = SessionRepository(db).list_by_exam(exam_id)
+        exam.status = "closed" if sessions else "draft"
+    _record_exam_lifecycle_event(
+        db,
+        exam,
+        {"type": "exam_restored", "group_id": exam.group_id, "group_name": exam.group_name, "details": {"restored_status": exam.status}},
+        actor_id=actor.user_id,
+    )
+    db.commit()
+    db.refresh(exam)
+    return {"ok": True, "action": "restored", "id": exam_id, "status": exam.status}
+
+
 @router.get("/exams/{exam_id}/draft", response_model=DraftExamResponse,
             summary="Черновик экзамена с задачами (учитель)")
-async def get_exam_draft(exam_id: str, db: Session = Depends(get_db)):
-    exam = ExamRepository(db).get_by_id(exam_id)
-    if not exam:
-        raise HTTPException(404, "Экзамен не найден")
+async def get_exam_draft(
+    exam_id: str,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+
+    _invalidate_unbound_open_exam(db, exam)
     variants_out: List[DraftVariant] = []
     for v in (exam.variants or []):
         tasks_raw = v.get("tasks", [])
@@ -593,7 +2536,7 @@ async def get_exam_draft(exam_id: str, db: Session = Depends(get_db)):
                 answer_type=t.get("answer_type", "exact_number"),
                 correct_answer=t.get("correct_answer", ""),
                 correct_answer_latex=t.get("correct_answer_latex"),
-                answer_options=t.get("answer_options"),
+                answer_options=normalize_answer_options(t.get("answer_options")),
                 distractor_meta=normalize_distractor_meta(t.get("distractor_meta")),
                 is_template_generated=t.get("is_template_generated", False),
             )
@@ -609,13 +2552,86 @@ async def get_exam_draft(exam_id: str, db: Session = Depends(get_db)):
         exam_id=exam.id,
         title=exam.title,
         status=exam.status,
+        # The admin monitoring page is intentionally read-only and never
+        # receives a student-entry capability.
+        access_code=exam.access_code if actor.role == "teacher" else None,
         total_time_minutes=exam.total_time_minutes,
         variants_count=exam.variants_count,
         tasks_per_variant=exam.tasks_per_variant,
+        group_id=exam.group_id,
+        group_name=exam.group_name,
+        class_level=exam.class_level,
+        teacher_name=exam.teacher_name,
+        scheduled_lesson_id=exam.scheduled_lesson_id,
+        scheduled_lesson_date=exam.scheduled_lesson_date,
         settings=exam.settings or {},
         skills_covered=exam.skills_covered or [],
         created_at=exam.created_at,
         variants=variants_out,
+    )
+
+
+@router.get(
+    "/admin/exams/{exam_id}/view",
+    response_model=AdminExamViewResponse,
+    summary="Read-only профиль экзамена для администратора",
+)
+async def get_admin_exam_view(
+    exam_id: str,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    """Return the same academic snapshot as the teacher view, without controls.
+
+    This is intentionally a separate contract from ``/draft``.  A browser
+    cannot turn an administrator into an operator by changing a route, and a
+    live answer key is not returned before the run is closed.
+    """
+    _require_exam_admin_observer(actor)
+    exam = await _get_exam_for_actor(db, exam_id, actor)
+    _check_and_auto_close_exam(db, exam)
+
+    answer_key_available = exam.status in {"closed", "archived"}
+    variants: list[AdminExamVariant] = []
+    for variant in exam.variants or []:
+        task_rows: list[AdminExamTask] = []
+        for task in variant.get("tasks", []):
+            task_rows.append(
+                AdminExamTask(
+                    task_id=task.get("task_id", ""),
+                    skill_id=task.get("skill_id", ""),
+                    skill_name=task.get("skill_name", ""),
+                    difficulty=task.get("difficulty", "B"),
+                    question_text=task.get("question_text", task.get("text", "")),
+                    question_latex=task.get("question_latex"),
+                    question_image_url=task.get("question_image_url"),
+                    answer_type=task.get("answer_type", "exact_number"),
+                    answer_options=normalize_answer_options(task.get("answer_options")),
+                    correct_answer=task.get("correct_answer", "") if answer_key_available else None,
+                    correct_answer_latex=task.get("correct_answer_latex") if answer_key_available else None,
+                    distractor_meta=normalize_distractor_meta(task.get("distractor_meta")) if answer_key_available else None,
+                )
+            )
+        variants.append(
+            AdminExamVariant(
+                variant_id=str(variant.get("variant_number", 1)),
+                variant_number=variant.get("variant_number", 1),
+                total_points=len(task_rows) * 10,
+                tasks=task_rows,
+            )
+        )
+
+    submitted_count = (
+        db.query(ExamSession)
+        .filter(ExamSession.exam_id == exam.id, ExamSession.status == "submitted")
+        .count()
+    )
+    summary = _monitor_summary(db, exam, submitted_count)
+    return AdminExamViewResponse(
+        **summary.model_dump(),
+        answer_key_available=answer_key_available,
+        variants=variants,
+        lifecycle_events=_recent_exam_lifecycle_events(db, exam),
     )
 
 
@@ -626,10 +2642,9 @@ async def get_task_alternatives(
     variant_number: int = Query(1),
     task_id: str = Query(...),
     db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = ExamRepository(db).get_by_id(exam_id)
-    if not exam:
-        raise HTTPException(404, "Экзамен не найден")
+    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
     variant = next(
         (v for v in (exam.variants or []) if v.get("variant_number") == variant_number),
         None,
@@ -659,11 +2674,10 @@ async def replace_task(
     exam_id: str,
     req: ReplaceTaskRequest,
     db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
 ):
     import copy
-    exam = ExamRepository(db).get_by_id(exam_id)
-    if not exam:
-        raise HTTPException(404, "Экзамен не найден")
+    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
     if exam.status not in ("draft", "variants_ready"):
         raise HTTPException(400, "Замена задач возможна только в черновике")
 
@@ -674,31 +2688,50 @@ async def replace_task(
     )
     if not variant:
         raise HTTPException(404, "Вариант не найден")
+
+    target_old_id = req.old_task_id or req.task_id
     old_task = next(
-        (t for t in variant.get("tasks", []) if t.get("task_id") == req.task_id),
+        (t for t in variant.get("tasks", []) if t.get("task_id") == target_old_id),
         None,
     )
-    if not old_task:
-        raise HTTPException(404, "Задача не найдена")
+    if not old_task and req.new_task_id and target_old_id != req.task_id:
+        old_task = next(
+            (t for t in variant.get("tasks", []) if t.get("task_id") == req.task_id),
+            None,
+        )
+        if old_task:
+            target_old_id = req.task_id
 
-    used_ids = [t.get("task_id") for t in variant.get("tasks", [])]
-    skill_ids = [old_task["skill_id"]] if old_task.get("skill_id") else []
+    if not old_task:
+        raise HTTPException(404, "Задача для замены не найдена в варианте")
+
     task_repo = TaskRepository()
-    alternatives = (
-        task_repo.get_tasks_by_skills(skill_ids, old_task.get("difficulty"), 1, used_ids)
-        if skill_ids else []
-    )
-    if not alternatives:
+    if req.new_task_id:
+        new_task_raw = task_repo.get_task_by_id(req.new_task_id)
+        if not new_task_raw:
+            raise HTTPException(404, "Выбранная задача не найдена в базе")
+        new_task = _normalize_content_task(new_task_raw)
+    else:
+        used_ids = [t.get("task_id") for t in variant.get("tasks", [])]
+        skill_ids = [old_task["skill_id"]] if old_task.get("skill_id") else []
         alternatives = (
-            task_repo.get_tasks_by_skills(skill_ids, None, 1, used_ids)
+            task_repo.get_tasks_by_skills(skill_ids, old_task.get("difficulty"), 1, used_ids)
             if skill_ids else []
         )
-    if not alternatives:
-        raise HTTPException(400, "Нет доступных задач для замены")
+        if not alternatives and skill_ids:
+            alternatives = task_repo.get_tasks_by_skills(skill_ids, None, 1, used_ids)
+        if not alternatives and old_task.get("toc_id"):
+            alternatives = task_repo.get_tasks_by_toc_ids([old_task["toc_id"]], old_task.get("difficulty"), 1, used_ids)
+        if not alternatives and old_task.get("toc_id"):
+            alternatives = task_repo.get_tasks_by_toc_ids([old_task["toc_id"]], None, 1, used_ids)
+        if not alternatives and exam.toc_ids:
+            alternatives = task_repo.get_tasks_by_toc_ids(exam.toc_ids, None, 1, used_ids)
+        if not alternatives:
+            raise HTTPException(400, "Нет доступных задач для замены")
+        new_task = _normalize_content_task(alternatives[0])
 
-    new_task = alternatives[0]
     variant["tasks"] = [
-        new_task if t.get("task_id") == req.task_id else t
+        new_task if t.get("task_id") == target_old_id else t
         for t in variant.get("tasks", [])
     ]
     exam.variants = new_variants
@@ -710,17 +2743,31 @@ async def replace_task(
 
 @router.get("/exams/{exam_id}", response_model=ExamSummaryResponse,
             summary="Информация об экзамене (учитель)")
-async def get_exam(exam_id: str, db: Session = Depends(get_db)):
-    exam = ExamRepository(db).get_by_id(exam_id)
-    if not exam:
-        raise HTTPException(404, "Экзамен не найден")
+async def get_exam(
+    exam_id: str,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    exam = await _get_exam_for_actor(db, exam_id, actor)
+
+    # Check and auto-close if exam duration expired
+    _check_and_auto_close_exam(db, exam)
+
     return ExamSummaryResponse(
         exam_id=exam.id,
         title=exam.title,
         status=exam.status,
-        access_code=exam.access_code,
+        access_code=exam.access_code if actor.role == "teacher" else None,
         tasks_per_variant=exam.tasks_per_variant,
         variants_count=exam.variants_count,
+        group_id=exam.group_id,
+        group_name=exam.group_name,
+        class_level=exam.class_level,
+        teacher_name=exam.teacher_name,
+        scheduled_lesson_id=exam.scheduled_lesson_id,
+        scheduled_lesson_date=exam.scheduled_lesson_date,
+        recent_events=_recent_exam_lifecycle_events(db, exam),
+        total_time_minutes=exam.total_time_minutes or 45,
         created_at=exam.created_at,
     )
 
@@ -736,22 +2783,225 @@ async def get_exam_by_code(code: str, db: Session = Depends(get_db)):
     exam = ExamRepository(db).get_by_access_code(code)
     if not exam:
         raise HTTPException(404, "Экзамен не найден")
-    if exam.status != "active":
-        raise HTTPException(410, "Экзамен закрыт или ещё не опубликован")
+
+    # Check and auto-close if time expired
+    _check_and_auto_close_exam(db, exam)
+
+    # A historical completed exam may predate the lesson-binding workflow.
+    # Its old public URL must still communicate the meaningful terminal state,
+    # rather than incorrectly implying that a teacher needs to assign it now.
+    if exam.status not in ("active", "lobby"):
+        raise HTTPException(410, "Экзамен уже завершён. Повторное прохождение недоступно.")
+
+    try:
+        _require_bound_exam(exam)
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            raise HTTPException(410, "Экзамен ещё не назначен на занятие") from exc
+        raise
+
+    remaining_seconds = None
+    started_at_str = None
+    if exam.status == "active":
+        exam_start = None
+        s_str = (exam.settings or {}).get("started_at")
+        if s_str:
+            try:
+                exam_start = _to_naive_utc(datetime.fromisoformat(s_str))
+            except Exception:
+                pass
+        if not exam_start:
+            sessions = SessionRepository(db).list_by_exam(exam.id)
+            for s in sessions:
+                if s.started_at:
+                    s_naive = _to_naive_utc(s.started_at)
+                    if s_naive and (not exam_start or s_naive < exam_start):
+                        exam_start = s_naive
+
+        total_sec = (exam.total_time_minutes or 45) * 60
+        if exam_start:
+            started_at_str = exam_start.isoformat()
+            now_utc = datetime.utcnow()
+            elapsed = max(0, int((now_utc - exam_start).total_seconds()))
+            remaining_seconds = max(0, total_sec - elapsed)
+        else:
+            remaining_seconds = total_sec
+
     return ExamInfoResponse(
         exam_id=exam.id,
         title=exam.title,
         subject=exam.subject or "Математика",
         teacher_name=exam.teacher_name,
+        group_id=exam.group_id,
+        group_name=exam.group_name,
+        class_level=exam.class_level,
         total_time_minutes=exam.total_time_minutes,
         tasks_per_variant=exam.tasks_per_variant,
         variants_count=exam.variants_count,
         status=exam.status,
+        time_remaining_seconds=remaining_seconds,
+        started_at=started_at_str,
+    )
+
+
+def _grade_and_submit_session(
+    db: Session,
+    session: ExamSession,
+    exam: GeneratedExam,
+    answers: dict,
+    time_spent_seconds: int = 0,
+) -> dict:
+    """Helper to grade answers, compute distractor analytics, and record submission."""
+    variants = exam.variants or []
+    variant = next(
+        (v for v in variants if v.get("variant_number") == session.variant_number),
+        variants[0] if variants else None,
+    )
+    tasks_raw = variant.get("tasks", []) if variant else []
+
+    correct_count = 0
+    distractor_analytics: dict = {}
+    for t in tasks_raw:
+        task_id = t.get("task_id", "")
+        student_ans = answers.get(task_id, "")
+        is_correct = _check_answer(student_ans, t.get("correct_answer", ""))
+        if is_correct:
+            correct_count += 1
+        else:
+            hit = _match_distractor(student_ans, t.get("distractor_meta") or [])
+            if hit:
+                distractor_analytics[task_id] = build_analytics_hit(hit)
+
+    total_tasks = len(tasks_raw)
+    score = correct_count * 10
+    max_score = total_tasks * 10
+
+    SessionRepository(db).submit(
+        session,
+        answers,
+        score,
+        max_score,
+        correct_count,
+        total_tasks,
+        time_spent_seconds,
+        distractor_analytics=distractor_analytics or None,
+    )
+    return {
+        "score": score,
+        "max_score": max_score,
+        "correct_count": correct_count,
+        "total_tasks": total_tasks,
+        "percentage": round(score / max_score * 100, 1) if max_score else 0.0,
+    }
+
+
+def _find_submitted_session(sessions: list, student_id: Optional[str], student_name: Optional[str], identifier: Optional[str] = None):
+    """Find if a student already completed an exam session."""
+    s_id = (student_id or "").strip().lower()
+    s_name = (student_name or "").strip().lower()
+    ident = (identifier or "").strip().lower()
+
+    for s in sessions:
+        if s.status != "submitted":
+            continue
+        curr_id = (s.student_id or "").strip().lower()
+        curr_disp = (s.display_id or "").strip().lower()
+        curr_name = (s.student_name or "").strip().lower()
+
+        if s_id and (curr_id == s_id or curr_disp == s_id):
+            return s
+        if ident and (curr_id == ident or curr_disp == ident or curr_name == ident):
+            return s
+        if s_name and curr_name == s_name:
+            return s
+    return None
+
+
+def _find_active_session(sessions: list, student_id: Optional[str], student_name: Optional[str], identifier: Optional[str] = None):
+    """Find if a student currently has a waiting or in_progress session."""
+    s_id = (student_id or "").strip().lower()
+    s_name = (student_name or "").strip().lower()
+    ident = (identifier or "").strip().lower()
+
+    for s in sessions:
+        if s.status not in ("waiting", "in_progress"):
+            continue
+        curr_id = (s.student_id or "").strip().lower()
+        curr_disp = (s.display_id or "").strip().lower()
+        curr_name = (s.student_name or "").strip().lower()
+
+        if s_id and (curr_id == s_id or curr_disp == s_id):
+            return s
+        if ident and (curr_id == ident or curr_disp == ident or curr_name == ident):
+            return s
+        if s_name and curr_name == s_name:
+            return s
+    return None
+
+
+@router.post("/exams/by-code/{code}/check-student", response_model=CheckStudentExamResponse,
+             summary="Проверить принадлежность ученика к группе экзамена и статус попытки")
+async def check_student_for_exam(
+    code: str,
+    req: CheckStudentExamRequest,
+    db: Session = Depends(get_db),
+):
+    exam = ExamRepository(db).get_by_access_code(code)
+    if not exam:
+        raise HTTPException(404, "Экзамен не найден")
+    _check_and_auto_close_exam(db, exam)
+    if exam.status not in ("active", "lobby"):
+        raise HTTPException(410, "Экзамен уже завершён. Повторное прохождение недоступно.")
+    try:
+        _require_bound_exam(exam)
+    except HTTPException as exc:
+        raise HTTPException(410, "Экзамен ещё не назначен на занятие") from exc
+
+    all_sessions = SessionRepository(db).list_by_exam(exam.id)
+    try:
+        student = await _canonical_student_for_exam(
+            exam,
+            student_id=req.student_id,
+            student_name=req.student_name,
+            identifier=req.identifier,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            return CheckStudentExamResponse(
+                enrolled=False,
+                group_required=True,
+                group_name=exam.group_name,
+                student=None,
+                message=str(exc.detail),
+            )
+        raise
+
+    submitted_sess = _find_submitted_session(
+        all_sessions,
+        student.get("id"),
+        student.get("full_name"),
+        student.get("display_id"),
+    )
+    if submitted_sess:
+        return CheckStudentExamResponse(
+            enrolled=False,
+            group_required=True,
+            group_name=exam.group_name,
+            student=student,
+            already_submitted=True,
+            session_id=submitted_sess.id,
+            message="Вы уже завершили этот экзамен. Повторное прохождение недоступно.",
+        )
+    return CheckStudentExamResponse(
+        enrolled=True,
+        group_required=True,
+        group_name=exam.group_name,
+        student=student,
     )
 
 
 @router.post("/exams/by-code/{code}/start", response_model=StartExamResponse,
-             summary="Начать экзамен (студент)")
+             summary="Начать экзамен или войти в лобби (студент)")
 async def start_exam(
     code: str,
     req: StartExamRequest,
@@ -760,29 +3010,154 @@ async def start_exam(
     exam = ExamRepository(db).get_by_access_code(code)
     if not exam:
         raise HTTPException(404, "Экзамен не найден")
-    if exam.status != "active":
-        raise HTTPException(410, "Экзамен закрыт")
+
+    # 0. Check and auto-close if time expired
+    _check_and_auto_close_exam(db, exam)
+    if exam.status not in ("active", "lobby"):
+        raise HTTPException(410, "Экзамен уже завершён. Повторное прохождение недоступно.")
+    try:
+        _require_bound_exam(exam)
+    except HTTPException as exc:
+        raise HTTPException(410, "Экзамен ещё не назначен на занятие") from exc
 
     variants = exam.variants or []
     if not variants:
         raise HTTPException(500, "Экзамен не содержит вариантов")
 
-    variant = random.choice(variants)
+    canonical_student = await _canonical_student_for_exam(
+        exam,
+        student_id=req.student_id or req.display_id,
+        student_name=req.student_name,
+        identifier=req.display_id,
+    )
+    canonical_student_id = str(canonical_student["id"])
+    canonical_display_id = canonical_student.get("display_id")
+    canonical_student_name = canonical_student.get("full_name") or req.student_name
+    canonical_class_level = canonical_student.get("class_level") or req.class_level
+
+    all_sessions = SessionRepository(db).list_by_exam(exam.id)
+
+    # 1. Single attempt guard: Check if already submitted
+    submitted_sess = _find_submitted_session(
+        all_sessions, canonical_student_id, canonical_student_name, canonical_display_id
+    )
+    if submitted_sess:
+        return StartExamResponse(
+            session_id=submitted_sess.id,
+            variant_number=submitted_sess.variant_number,
+            time_minutes=exam.total_time_minutes,
+            time_remaining_seconds=0,
+            tasks=[],
+            status="submitted",
+            already_submitted=True,
+            message="Вы уже завершили этот экзамен. Повторное прохождение недоступно.",
+        )
+
+    # 2. Check if student already has a session in progress or waiting
+    existing_session = _find_active_session(
+        all_sessions, canonical_student_id, canonical_student_name, canonical_display_id
+    )
+
+    # Determine global exam start time
+    exam_start_time = None
+    exam_started_at_str = (exam.settings or {}).get("started_at")
+    if exam_started_at_str:
+        try:
+            exam_start_time = _to_naive_utc(datetime.fromisoformat(exam_started_at_str))
+        except Exception:
+            pass
+
+    now_utc = datetime.utcnow()
+
+    if existing_session:
+        session = existing_session
+        if not session.display_id and canonical_display_id:
+            session.display_id = canonical_display_id
+            db.commit()
+    else:
+        variant = random.choice(variants)
+        tasks_raw = variant.get("tasks", [])
+        session_id = f"SES_{uuid4().hex[:16]}"
+        initial_status = "waiting" if exam.status == "lobby" else "in_progress"
+        session = ExamSession(
+            id=session_id,
+            exam_id=exam.id,
+            student_id=canonical_student_id,
+            display_id=canonical_display_id,
+            student_name=canonical_student_name,
+            class_level=canonical_class_level,
+            session_token=_generate_session_token(),
+            variant_number=variant.get("variant_number", 1),
+            answers={},
+            max_score=len(tasks_raw) * 10,
+            status=initial_status,
+            started_at=(exam_start_time or now_utc) if initial_status == "in_progress" else None,
+        )
+        try:
+            SessionRepository(db).create(session)
+        except IntegrityError:
+            # The DB uniqueness rule wins a race between two browser tabs.
+            db.rollback()
+            session = (
+                db.query(ExamSession)
+                .filter(ExamSession.exam_id == exam.id, ExamSession.student_id == canonical_student_id)
+                .first()
+            )
+            if not session:
+                raise HTTPException(409, "Не удалось создать единственную попытку ученика")
+
+    if not session.session_token:
+        # Legacy active session: issue a capability only after its identity was
+        # checked again against the live roster above.
+        session.session_token = _generate_session_token()
+        db.commit()
+
+    # If session is waiting in lobby, do not return tasks yet
+    if exam.status == "lobby" or session.status == "waiting":
+        return StartExamResponse(
+            session_id=session.id,
+            variant_number=session.variant_number,
+            time_minutes=exam.total_time_minutes,
+            time_remaining_seconds=exam.total_time_minutes * 60,
+            tasks=[],
+            status="waiting",
+            saved_answers=session.answers or {},
+            session_token=session.session_token,
+        )
+
+    # If exam is active and session is in_progress, calculate remaining time based on exam start time
+    if not session.started_at:
+        session.started_at = exam_start_time or now_utc
+        db.commit()
+
+    total_seconds = (exam.total_time_minutes or 45) * 60
+    base_start = exam_start_time or _to_naive_utc(session.started_at) or now_utc
+    elapsed_seconds = max(0, int((now_utc - base_start).total_seconds()))
+    remaining_seconds = max(0, total_seconds - elapsed_seconds)
+
+    # If time has expired, auto-submit session and auto-close exam
+    if remaining_seconds <= 0:
+        _grade_and_submit_session(
+            db, session, exam, session.answers or {}, total_seconds
+        )
+        _check_and_auto_close_exam(db, exam)
+        return StartExamResponse(
+            session_id=session.id,
+            variant_number=session.variant_number,
+            time_minutes=exam.total_time_minutes,
+            time_remaining_seconds=0,
+            tasks=[],
+            status="submitted",
+            already_submitted=True,
+            saved_answers=session.answers or {},
+            message="Время экзамена истекло. Ваши сохранённые ответы отправлены на проверку.",
+        )
+
+    # Build tasks for the student's assigned variant
+    variant_idx = max(0, min(session.variant_number - 1, len(variants) - 1))
+    variant = variants[variant_idx]
     tasks_raw = variant.get("tasks", [])
     mc_mode = (exam.settings or {}).get("mc_mode", "auto")
-
-    session_id = f"SES_{uuid4().hex[:8]}"
-    session = ExamSession(
-        id=session_id,
-        exam_id=exam.id,
-        student_name=req.student_name,
-        class_level=req.class_level,
-        variant_number=variant.get("variant_number", 1),
-        answers={},
-        max_score=len(tasks_raw) * 10,
-        status="in_progress",
-    )
-    SessionRepository(db).create(session)
 
     tasks_public = []
     for t in tasks_raw:
@@ -809,11 +3184,182 @@ async def start_exam(
         ))
 
     return StartExamResponse(
-        session_id=session_id,
+        session_id=session.id,
         variant_number=session.variant_number,
         time_minutes=exam.total_time_minutes,
+        time_remaining_seconds=remaining_seconds,
         tasks=tasks_public,
+        status="in_progress",
+        saved_answers=session.answers or {},
+        session_token=session.session_token,
     )
+
+
+@router.get("/exams/by-code/{code}/session-status/{session_id}",
+            summary="Проверка статуса сессии / ожидание старта в лобби")
+async def get_session_status(
+    code: str,
+    session_id: str,
+    db: Session = Depends(get_db),
+    session_token: Optional[str] = Header(None, alias="X-Exam-Session-Token"),
+):
+    exam = ExamRepository(db).get_by_access_code(code)
+    if not exam:
+        raise HTTPException(404, "Экзамен не найден")
+    _check_and_auto_close_exam(db, exam)
+    session = SessionRepository(db).get_by_id(session_id)
+    if not session or session.exam_id != exam.id:
+        return {"status": "kicked", "message": "Сессия не найдена или удалена преподавателем"}
+    _require_session_capability(session, session_token)
+
+    # A caller must own the attempt before this endpoint can trigger any state
+    # transition (including timeout finalisation).
+    if exam.status == "closed":
+        # A session that was finalised by the common exam timer is a completed
+        # student attempt, not merely a closed waiting room.  Returning this
+        # distinction lets the public UI open the student's saved result.
+        if session.status == "submitted":
+            return {
+                "status": "submitted",
+                "already_submitted": True,
+                "message": "Экзамен завершён. Ваши сохранённые ответы отправлены на проверку.",
+            }
+        return {"status": "closed", "message": "Экзамен завершён преподавателем до начала вашей попытки"}
+
+    try:
+        _require_bound_exam(exam)
+    except HTTPException as exc:
+        raise HTTPException(410, "Экзамен ещё не назначен на занятие") from exc
+
+    if exam.status == "active":
+        now_utc = datetime.utcnow()
+        exam_start_time = None
+        exam_started_at_str = (exam.settings or {}).get("started_at")
+        if exam_started_at_str:
+            try:
+                exam_start_time = _to_naive_utc(datetime.fromisoformat(exam_started_at_str))
+            except Exception:
+                pass
+
+        if session.status == "waiting":
+            session.status = "in_progress"
+            session.started_at = exam_start_time or now_utc
+            db.commit()
+
+        # Check remaining time based on synchronized exam start time
+        base_start = exam_start_time or _to_naive_utc(session.started_at) or now_utc
+        elapsed_sec = max(0, int((now_utc - base_start).total_seconds()))
+        total_sec = (exam.total_time_minutes or 45) * 60
+        remaining_sec = max(0, total_sec - elapsed_sec)
+
+        # If time expired while waiting/reconnecting
+        if remaining_sec <= 0:
+            if session.status == "in_progress":
+                _grade_and_submit_session(db, session, exam, session.answers or {}, total_sec)
+            _check_and_auto_close_exam(db, exam)
+            return {
+                "status": "submitted",
+                "already_submitted": True,
+                "message": "Время экзамена истекло",
+            }
+
+        # Build public tasks
+        variant_idx = max(0, min(session.variant_number - 1, len(exam.variants or []) - 1))
+        variant = (exam.variants or [{}])[variant_idx]
+        tasks_raw = variant.get("tasks", [])
+        mc_mode = (exam.settings or {}).get("mc_mode", "auto")
+
+        tasks_public = []
+        for t in tasks_raw:
+            show_mc = _should_show_mc(t, mc_mode)
+            options = _build_mc_options(t) if show_mc else []
+            answer_type = t.get("answer_type", "exact_number")
+            if show_mc and options:
+                answer_type = "multiple_choice"
+            elif answer_type == "multiple_choice" and not options:
+                answer_type = "exact_number"
+
+            tasks_public.append(ExamTaskPublic(
+                task_id=t.get("task_id", ""),
+                skill_id=t.get("skill_id", ""),
+                skill_name=t.get("skill_name", ""),
+                difficulty=t.get("difficulty", "B"),
+                text=t.get("question_text", t.get("text", "")),
+                question_latex=t.get("question_latex"),
+                options=options,
+                options_latex=_build_mc_options_latex(t, options) if options else None,
+                image_url=t.get("question_image_url"),
+                answer_type=answer_type,
+                points=10,
+            ))
+
+        return {
+            "status": "in_progress",
+            "variant_number": session.variant_number,
+            "time_minutes": exam.total_time_minutes,
+            "time_remaining_seconds": remaining_sec,
+            "saved_answers": session.answers or {},
+            "tasks": [t.model_dump() for t in tasks_public],
+        }
+
+    return {
+        "status": session.status,
+        "exam_status": exam.status,
+    }
+
+
+@router.post("/exam-sessions/{session_id}/progress",
+             summary="Промежуточное автосохранение ответов (студент)")
+async def save_exam_progress(
+    session_id: str,
+    req: SaveProgressRequest,
+    db: Session = Depends(get_db),
+    session_token: Optional[str] = Header(None, alias="X-Exam-Session-Token"),
+):
+    session_ref = SessionRepository(db).get_by_id(session_id)
+    if not session_ref:
+        raise HTTPException(404, "Сессия не найдена")
+    # Lock order is always exam → sessions, the same order used by close.
+    exam = (
+        db.query(GeneratedExam)
+        .filter(GeneratedExam.id == session_ref.exam_id)
+        .with_for_update()
+        .first()
+    )
+    session = (
+        db.query(ExamSession)
+        .filter(ExamSession.id == session_id)
+        .with_for_update()
+        .first()
+    )
+    if not session:
+        raise HTTPException(404, "Сессия не найдена")
+    _require_session_capability(session, session_token)
+    if not exam:
+        raise HTTPException(404, "Экзамен не найден")
+    if _check_and_auto_close_exam(db, exam) or exam.status != "active":
+        raise HTTPException(410, "Экзамен уже завершён; ответы больше не изменяются")
+    if session.status != "in_progress":
+        return {"ok": False, "status": session.status, "message": "Сессия не активна"}
+
+    _validate_answer_keys(exam, session, req.answers)
+
+    # Merge answers into session
+    curr_answers = dict(session.answers or {})
+    if req.answers:
+        curr_answers.update(req.answers)
+    session.answers = curr_answers
+
+    started_at = _exam_started_at(db, exam) or _to_naive_utc(session.started_at)
+    if started_at:
+        total_seconds = (exam.total_time_minutes or 45) * 60
+        session.time_spent_seconds = min(
+            total_seconds,
+            max(0, int((datetime.utcnow() - started_at).total_seconds())),
+        )
+
+    db.commit()
+    return {"ok": True, "answered_count": len(curr_answers)}
 
 
 @router.post("/exam-sessions/{session_id}/submit", response_model=SubmitExamResponse,
@@ -822,67 +3368,69 @@ async def submit_exam(
     session_id: str,
     req: SubmitExamRequest,
     db: Session = Depends(get_db),
+    session_token: Optional[str] = Header(None, alias="X-Exam-Session-Token"),
 ):
-    sess_repo = SessionRepository(db)
-    session = sess_repo.get_by_id(session_id)
+    session_ref = SessionRepository(db).get_by_id(session_id)
+    if not session_ref:
+        raise HTTPException(404, "Сессия не найдена")
+    exam = (
+        db.query(GeneratedExam)
+        .filter(GeneratedExam.id == session_ref.exam_id)
+        .with_for_update()
+        .first()
+    )
+    session = (
+        db.query(ExamSession)
+        .filter(ExamSession.id == session_id)
+        .with_for_update()
+        .first()
+    )
     if not session:
         raise HTTPException(404, "Сессия не найдена")
+    _require_session_capability(session, session_token)
     if session.status == "submitted":
         raise HTTPException(400, "Экзамен уже сдан")
-
-    exam = ExamRepository(db).get_by_id(session.exam_id)
     if not exam:
         raise HTTPException(404, "Экзамен не найден")
+    if _check_and_auto_close_exam(db, exam) or exam.status != "active":
+        raise HTTPException(410, "Экзамен уже завершён; сохранённые ответы отправлены на проверку")
+    if exam.status == "lobby" or session.status == "waiting":
+        raise HTTPException(400, "Экзамен ещё не начат преподавателем")
 
-    # Find variant tasks
-    variants = exam.variants or []
-    variant = next(
-        (v for v in variants if v.get("variant_number") == session.variant_number),
-        variants[0] if variants else None,
+    _validate_answer_keys(exam, session, req.answers)
+    started_at = _exam_started_at(db, exam) or _to_naive_utc(session.started_at)
+    total_seconds = (exam.total_time_minutes or 45) * 60
+    server_time_spent = (
+        min(total_seconds, max(0, int((datetime.utcnow() - started_at).total_seconds())))
+        if started_at else 0
     )
-    tasks_raw = variant.get("tasks", []) if variant else []
 
-    # Grade + distractor analytics
-    correct_count = 0
-    distractor_analytics: dict = {}
-    for t in tasks_raw:
-        task_id = t.get("task_id", "")
-        student_ans = req.answers.get(task_id, "")
-        is_correct = _check_answer(student_ans, t.get("correct_answer", ""))
-        if is_correct:
-            correct_count += 1
-        else:
-            hit = _match_distractor(student_ans, t.get("distractor_meta") or [])
-            if hit:
-                distractor_analytics[task_id] = build_analytics_hit(hit)
-
-    total_tasks = len(tasks_raw)
-    score = correct_count * 10
-    max_score = total_tasks * 10
-
-    sess_repo.submit(
-        session, req.answers, score, max_score,
-        correct_count, total_tasks, req.time_spent_seconds,
-        distractor_analytics=distractor_analytics or None,
+    res = _grade_and_submit_session(
+        db, session, exam, req.answers, server_time_spent
     )
 
     return SubmitExamResponse(
         session_id=session_id,
-        score=score,
-        max_score=max_score,
+        score=res["score"],
+        max_score=res["max_score"],
         answered_count=len(req.answers),
-        correct_count=correct_count,
-        total_tasks=total_tasks,
-        percentage=round(score / max_score * 100, 1) if max_score else 0.0,
+        correct_count=res["correct_count"],
+        total_tasks=res["total_tasks"],
+        percentage=res["percentage"],
     )
 
 
 @router.get("/exam-sessions/{session_id}/results", response_model=SessionResultResponse,
             summary="Результаты экзамена")
-async def get_results(session_id: str, db: Session = Depends(get_db)):
+async def get_results(
+    session_id: str,
+    db: Session = Depends(get_db),
+    session_token: Optional[str] = Header(None, alias="X-Exam-Session-Token"),
+):
     session = SessionRepository(db).get_by_id(session_id)
     if not session:
         raise HTTPException(404, "Сессия не найдена")
+    _require_session_capability(session, session_token)
     if session.status != "submitted":
         raise HTTPException(400, "Экзамен ещё не сдан")
 
@@ -992,18 +3540,22 @@ async def get_skill_tree(
     class_level: Optional[int] = Query(None, ge=5, le=11),
 ):
     rows = TextbookRepository().get_skill_tree(class_level)
-    by_id: dict = {r["id"]: SkillTreeNode(**r) for r in rows}
+    by_id: dict = {}
+    for r in rows:
+        r_dict = dict(r)
+        if not r_dict.get("name"):
+            r_dict["name"] = r_dict.get("name_ru") or r_dict.get("id")
+        if not r_dict.get("name_ru"):
+            r_dict["name_ru"] = r_dict.get("name") or r_dict.get("id")
+        node = SkillTreeNode(**r_dict)
+        by_id[node.id] = node
+
     roots: List[SkillTreeNode] = []
     for node in by_id.values():
         if node.parent_id and node.parent_id in by_id:
             by_id[node.parent_id].children.append(node)
         else:
             roots.append(node)
-    if class_level:
-        prefix = f"G{class_level}_"
-        has_grade = any(r.level == "L1" and r.id.startswith(prefix) for r in roots)
-        if has_grade:
-            roots = [r for r in roots if r.level != "L1" or r.id.startswith(prefix)]
     return roots
 
 
@@ -1076,10 +3628,12 @@ class SessionSummary(BaseModel):
 
 @router.get("/exams/{exam_id}/sessions", response_model=List[SessionSummary],
             summary="Список сессий экзамена (учитель)")
-async def list_exam_sessions(exam_id: str, db: Session = Depends(get_db)):
-    exam = ExamRepository(db).get_by_id(exam_id)
-    if not exam:
-        raise HTTPException(404, "Экзамен не найден")
+async def list_exam_sessions(
+    exam_id: str,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    await _get_exam_for_actor(db, exam_id, actor)
     sessions = (
         db.query(ExamSession)
         .filter(ExamSession.exam_id == exam_id)
@@ -1107,12 +3661,26 @@ async def list_exam_sessions(exam_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/exams/{exam_id}/close", summary="Закрыть экзамен")
-async def close_exam(exam_id: str, db: Session = Depends(get_db)):
-    exam = ExamRepository(db).get_by_id(exam_id)
+async def close_exam(
+    exam_id: str,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = (
+        db.query(GeneratedExam)
+        .filter(GeneratedExam.id == exam_id)
+        .with_for_update()
+        .first()
+    )
     if not exam:
         raise HTTPException(404, "Экзамен не найден")
-    ExamRepository(db).close(exam)
-    return {"exam_id": exam_id, "status": "closed"}
+    finalized_count = _finalize_exam(db, exam)
+    return {
+        "exam_id": exam_id,
+        "status": "closed",
+        "finalized_sessions": finalized_count,
+    }
 
 
 @router.post("/exams/{exam_id}/generate-variants",
@@ -1121,10 +3689,9 @@ async def generate_variants(
     exam_id: str,
     variants_count: int = Query(5, ge=2, le=30),
     db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = ExamRepository(db).get_by_id(exam_id)
-    if not exam:
-        raise HTTPException(404, "Экзамен не найден")
+    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
     if exam.status not in ("draft", "variants_ready"):
         raise HTTPException(400, "Генерация вариантов возможна только для черновиков")
 
@@ -1169,10 +3736,12 @@ class ExamAnalyticsResponse(BaseModel):
 
 @router.get("/exams/{exam_id}/analytics", response_model=ExamAnalyticsResponse,
             summary="Аналитика экзамена (учитель)")
-async def get_exam_analytics(exam_id: str, db: Session = Depends(get_db)):
-    exam = ExamRepository(db).get_by_id(exam_id)
-    if not exam:
-        raise HTTPException(404, "Экзамен не найден")
+async def get_exam_analytics(
+    exam_id: str,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    exam = await _get_exam_for_actor(db, exam_id, actor)
 
     sessions = (
         db.query(ExamSession)
@@ -1287,6 +3856,7 @@ async def get_exam_analytics(exam_id: str, db: Session = Depends(get_db)):
         )
 
         task_analytics.append({
+            "task_id": task_id,
             "question_preview": question_preview,
             "skill_name": skill_name,
             "attempts": total_attempts,
@@ -1372,6 +3942,7 @@ async def generate_exam_report_endpoint(
     exam_id: str,
     force: bool = Query(False, description="Перегенерировать даже если отчёт уже есть"),
     db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
 ):
     """
     Генерирует нарратив с помощью Gemini на основе агрегированной аналитики.
@@ -1380,9 +3951,7 @@ async def generate_exam_report_endpoint(
     """
     from src.domain.report_generator import generate_exam_report
 
-    exam = ExamRepository(db).get_by_id(exam_id)
-    if not exam:
-        raise HTTPException(404, "Экзамен не найден")
+    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
 
     sessions = (
         db.query(ExamSession).filter(ExamSession.exam_id == exam_id).all()
@@ -1416,14 +3985,13 @@ async def generate_exam_report_endpoint(
 async def get_exam_report_endpoint(
     exam_id: str,
     db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
 ):
     """
     Возвращает ранее сгенерированный отчёт.
     Если отчёта ещё нет — 404, учитель должен сначала вызвать POST /exams/{id}/report.
     """
-    exam = ExamRepository(db).get_by_id(exam_id)
-    if not exam:
-        raise HTTPException(404, "Экзамен не найден")
+    exam = await _get_exam_for_actor(db, exam_id, actor)
 
     report = ExamReportRepository(db).get_by_exam(exam_id)
     if not report:

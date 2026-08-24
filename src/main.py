@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
+import asyncio
 from contextlib import asynccontextmanager
 
 import sqlalchemy
@@ -17,11 +18,70 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from src.core.config import get_settings
 from src.core.exceptions import ExamServiceError
 from src.core.middleware import RequestIDMiddleware, configure_logging
-from src.api.router import router
+from src.api.router import _check_and_auto_close_exam, router
+from src.core.database import SessionLocal
+from src.models.exam_models import GeneratedExam
 
 settings = get_settings()
 configure_logging(is_development=settings.is_development)
 log = logging.getLogger("exam_service")
+_MIGRATION_LOCK_KEY = 41_027_003
+
+
+def _apply_migrations_safely() -> None:
+    """Serialize Alembic across Uvicorn workers and rolling containers.
+
+    Every Uvicorn worker executes the lifespan hook.  Without a database lock
+    two workers can issue the same ``CREATE TABLE`` concurrently on startup.
+    PostgreSQL advisory locks are scoped to the whole database, unlike an
+    in-process mutex, so they also protect a rolling deployment.
+    """
+    migration_engine = sqlalchemy.create_engine(settings.database_url, pool_pre_ping=True)
+    try:
+        with migration_engine.connect() as connection:
+            is_postgres = connection.dialect.name == "postgresql"
+            if is_postgres:
+                connection.execute(sqlalchemy.text("SELECT pg_advisory_lock(:lock_key)"), {"lock_key": _MIGRATION_LOCK_KEY})
+            try:
+                result = subprocess.run(
+                    ["alembic", "upgrade", "head"],
+                    capture_output=True,
+                    text=True,
+                )
+            finally:
+                if is_postgres:
+                    connection.execute(sqlalchemy.text("SELECT pg_advisory_unlock(:lock_key)"), {"lock_key": _MIGRATION_LOCK_KEY})
+            if result.returncode == 0:
+                log.info("Alembic migrations applied:\n%s", result.stdout)
+                return
+            raise RuntimeError(result.stderr or "Alembic завершился с ошибкой")
+    finally:
+        migration_engine.dispose()
+
+
+def _close_expired_exams_once() -> None:
+    """Run the blocking database sweep in a short-lived, isolated session."""
+    db = SessionLocal()
+    try:
+        active_exams = (
+            db.query(GeneratedExam)
+            .filter(GeneratedExam.status == "active")
+            .all()
+        )
+        for exam in active_exams:
+            _check_and_auto_close_exam(db, exam)
+    except Exception:
+        db.rollback()
+        log.exception("Unable to sweep expired exams")
+    finally:
+        db.close()
+
+
+async def _close_expired_exams_loop() -> None:
+    """Close timed-out live exams even when no browser is polling their API."""
+    while True:
+        await asyncio.to_thread(_close_expired_exams_once)
+        await asyncio.sleep(30)
 
 
 @asynccontextmanager
@@ -34,19 +94,21 @@ async def lifespan(app: FastAPI):
         yield
         return
     try:
-        result = subprocess.run(
-            ["alembic", "upgrade", "head"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            log.info("Alembic migrations applied:\n%s", result.stdout)
-        else:
-            log.error("Alembic migration failed:\n%s", result.stderr)
-            sys.exit(1)
+        _apply_migrations_safely()
+    except RuntimeError as exc:
+        log.error("Alembic migration failed:\n%s", exc)
+        sys.exit(1)
     except FileNotFoundError:
         log.warning("alembic not found — skipping migrations")
-    yield
+    close_expired_exams_task = asyncio.create_task(_close_expired_exams_loop())
+    try:
+        yield
+    finally:
+        close_expired_exams_task.cancel()
+        try:
+            await close_expired_exams_task
+        except asyncio.CancelledError:
+            pass
 
 
 def create_app() -> FastAPI:

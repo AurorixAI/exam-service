@@ -10,7 +10,7 @@ from sqlalchemy import engine_from_config, pool
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.models.exam_models import Base, GeneratedExam, ExamSession  # noqa: F401
+from src.models.exam_models import Base, ExamLifecycleEvent, GeneratedExam, ExamSession  # noqa: F401
 
 config = context.config
 
@@ -25,7 +25,7 @@ if db_url:
 target_metadata = Base.metadata
 
 # Only manage exam service owned tables — never touch shared/monolith tables
-_MANAGED = {"generated_exams", "exam_sessions"}
+_MANAGED = {"generated_exams", "exam_sessions", "exam_lifecycle_events"}
 
 
 def include_object(obj, name, type_, reflected, compare_to):

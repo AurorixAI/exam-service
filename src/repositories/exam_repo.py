@@ -6,6 +6,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import List, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.models import GeneratedExam, ExamSession, ExamReport
@@ -25,15 +26,16 @@ class ExamRepository:
         return self.db.query(GeneratedExam).filter(GeneratedExam.id == exam_id).first()
 
     def get_by_access_code(self, code: str) -> Optional[GeneratedExam]:
+        clean = (code or "").strip().upper()
         return (
             self.db.query(GeneratedExam)
-            .filter(GeneratedExam.access_code == code)
+            .filter(func.upper(GeneratedExam.access_code) == clean)
             .first()
         )
 
     def publish(self, exam: GeneratedExam, access_code: str) -> GeneratedExam:
         exam.access_code = access_code
-        exam.status = "active"
+        exam.status = "lobby"
         self.db.commit()
         self.db.refresh(exam)
         return exam
@@ -48,6 +50,12 @@ class ExamRepository:
         exam.variants = variants
         exam.variants_count = count
         exam.status = "variants_ready"
+        self.db.commit()
+
+    def delete(self, exam: GeneratedExam) -> None:
+        self.db.query(ExamReport).filter(ExamReport.exam_id == exam.id).delete()
+        self.db.query(ExamSession).filter(ExamSession.exam_id == exam.id).delete()
+        self.db.delete(exam)
         self.db.commit()
 
 
@@ -138,6 +146,8 @@ class SessionRepository:
         total_tasks: int,
         time_spent: int,
         distractor_analytics: dict | None = None,
+        *,
+        commit: bool = True,
     ) -> ExamSession:
         session.answers = answers
         session.score = score
@@ -149,6 +159,15 @@ class SessionRepository:
         session.submitted_at = datetime.now(timezone.utc)
         if distractor_analytics is not None:
             session.distractor_analytics = distractor_analytics
-        self.db.commit()
-        self.db.refresh(session)
+        if commit:
+            self.db.commit()
+            self.db.refresh(session)
         return session
+
+    def list_by_exam(self, exam_id: str) -> List[ExamSession]:
+        return (
+            self.db.query(ExamSession)
+            .filter(ExamSession.exam_id == exam_id)
+            .order_by(ExamSession.started_at.desc())
+            .all()
+        )
