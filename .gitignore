@@ -24,6 +24,9 @@ htmlcov/
 # Logs
 *.log
 
+# Locally rendered QA artefacts
+/output/
+
 # IDE
 .vscode/
 .idea/

@@ -65,7 +65,13 @@ class GeneratedExam(Base):
     org_id = Column(String(36), nullable=True, index=True)
     access_code = Column(String(20), unique=True)
     status = Column(String(20), nullable=False, default="draft")
-    # draft | active | closed
+    # draft | variants_ready | lobby | print_ready | active | closed | archived
+
+    # A delivery mode is intentionally separate from the lifecycle status.
+    # ``online`` exposes a student capability and lobby; ``print`` produces an
+    # immutable, staff-only package tied to one lesson occurrence.  Hybrid is
+    # reserved for a later, explicitly implemented workflow.
+    delivery_mode = Column(String(20), nullable=False, default="online")
 
     # Display
     subject = Column(String(100), default="Математика")
@@ -140,6 +146,41 @@ class ExamLifecycleEvent(Base):
         Index("idx_exam_lifecycle_org_time", "org_id", "occurred_at"),
         Index("idx_exam_lifecycle_exam_time", "exam_id", "occurred_at"),
         Index("ix_exam_lifecycle_events_event_type", "event_type"),
+    )
+
+
+class ExamPrintPackage(Base):
+    """Immutable printable materials for one concrete exam run.
+
+    The snapshot contains both the student variants and the protected answer
+    key.  It is never returned as JSON to a student: staff receive only
+    rendered PDFs.  A package is deliberately one-to-one with an exam so a
+    teacher cannot silently alter a paper after it has been prepared.
+    """
+
+    __tablename__ = "exam_print_packages"
+
+    id = Column(String(36), primary_key=True)
+    exam_id = Column(
+        String(30),
+        ForeignKey("generated_exams.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    org_id = Column(String(36), nullable=False, index=True)
+    version = Column(Integer, nullable=False, default=1)
+    status = Column(String(20), nullable=False, default="ready")
+    # ``snapshot`` is canonical JSON. ``snapshot_sha256`` lets the service
+    # prove the rendered material still matches the prepared package.
+    snapshot = Column(JSONB, nullable=False, default=dict)
+    snapshot_sha256 = Column(String(64), nullable=False)
+    created_by = Column(String(100), nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+    released_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("idx_exam_print_packages_org_created", "org_id", "created_at"),
     )
 
 
