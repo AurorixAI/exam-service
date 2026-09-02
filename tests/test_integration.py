@@ -25,6 +25,7 @@ os.environ.setdefault("APP_ENV", "testing")
 import pytest
 from unittest.mock import patch, MagicMock
 from tests.conftest import make_task, make_exam_in_db, make_session_in_db
+from src.models.exam_models import ExamLifecycleEvent
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -66,6 +67,21 @@ class TestGenerateExam:
         assert data["status"] == "draft"
         assert data["tasks_count"] == 5
         assert "exam_id" in data
+
+    def test_generate_records_lifecycle_event_after_exam(self, client, db):
+        """Creation history must never be flushed before its parent exam."""
+        with patch("src.api.router.TaskRepository", return_value=mock_task_repo()):
+            response = client.post("/api/v1/exams/generate", json={
+                "title": "Экзамен с историей",
+                "skill_ids": ["SK_001"],
+                "tasks_count": 5,
+                "time_minutes": 45,
+            })
+
+        assert response.status_code == 200
+        exam_id = response.json()["exam_id"]
+        event = db.query(ExamLifecycleEvent).filter_by(exam_id=exam_id).one()
+        assert event.event_type == "exam_created"
 
     def test_generate_by_toc_ids_success(self, client):
         with patch("src.api.router.TaskRepository", return_value=mock_task_repo()):

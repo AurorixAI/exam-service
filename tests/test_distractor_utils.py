@@ -8,6 +8,14 @@ from src.domain.distractor_utils import (
 )
 
 
+def test_distractor_text_prefers_error_logic_latex():
+    assert distractor_text({
+        "error_logic_latex": "перепутал знак в $(-x)^3$",
+        "error_logic": "перепутал знак",
+        "explanation": "типичная ошибка",
+    }) == "перепутал знак в $(-x)^3$"
+
+
 def test_distractor_text_prefers_error_logic():
     assert distractor_text({
         "error_logic": "перепутал знак",
@@ -26,10 +34,15 @@ def test_distractor_text_empty():
     assert distractor_text(None) == ""
 
 
-def test_normalize_distractor_item_syncs_both_fields():
-    out = normalize_distractor_item({"value": "5", "error_logic": "добавил единицу"})
+def test_normalize_distractor_item_syncs_all_fields():
+    out = normalize_distractor_item({
+        "value": "5",
+        "error_logic_latex": "добавил единицу: $x+1$",
+        "error_logic": "добавил единицу",
+    })
     assert out["explanation"] == "добавил единицу"
     assert out["error_logic"] == "добавил единицу"
+    assert out["error_logic_latex"] == "добавил единицу: $x+1$"
 
 
 def test_normalize_distractor_meta():
@@ -38,6 +51,7 @@ def test_normalize_distractor_meta():
     ])
     assert meta[0]["explanation"] == "вычел вместо сложения"
     assert meta[0]["error_logic"] == "вычел вместо сложения"
+    assert meta[0]["error_logic_latex"] == "вычел вместо сложения"
 
 
 def test_build_analytics_hit():
@@ -45,12 +59,15 @@ def test_build_analytics_hit():
         "value": "9/4",
         "error_type": "ai_generated",
         "error_logic": "не привёл к общему знаменателю",
+        "error_logic_latex": "не привёл к общему знаменателю: $\\frac{9}{4}$",
     })
     assert hit == {
         "hit": True,
         "distractor_value": "9/4",
         "error_type": "ai_generated",
-        "explanation": "не привёл к общему знаменателю",
+        "explanation": "не привёл к общему знаменателю: $\\frac{9}{4}$",
+        "error_logic": "не привёл к общему знаменателю",
+        "error_logic_latex": "не привёл к общему знаменателю: $\\frac{9}{4}$",
     }
 
 

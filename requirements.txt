@@ -14,3 +14,9 @@ httpx==0.27.2
 tenacity==8.2.3
 structlog==24.4.0
 prometheus-fastapi-instrumentator==7.0.0
+reportlab==4.2.5
+# Server-side mathematical typesetting for printable exam papers.  The PDF
+# renderer keeps a deterministic text fallback, but this package gives
+# fractions, roots and multi-level expressions the same professional shape as
+# their verified LaTeX source instead of flattening them to a/b text.
+matplotlib==3.9.2

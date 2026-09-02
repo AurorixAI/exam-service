@@ -25,7 +25,7 @@ os.environ.setdefault("APP_ENV", "testing")
 
 from src.core.config import Settings, get_settings
 from src.models.shared import Base
-from src.models.exam_models import GeneratedExam, ExamSession  # noqa: register tables
+from src.models.exam_models import ExamLifecycleEvent, GeneratedExam, ExamSession  # noqa: register tables
 
 # ── SQLite compatibility shim (test-only) ──────────────────────────────────
 # Production runs Postgres; the models use the Postgres ARRAY type

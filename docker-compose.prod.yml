@@ -24,6 +24,7 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       CORS_ORIGINS: ${CORS_ORIGINS}
       AUTH_SERVICE_URL: ${AUTH_SERVICE_URL:-http://algo-auth:8000}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
       CONTENT_SERVICE_URL: ${CONTENT_SERVICE_URL:-http://content-api:8004}
     depends_on:
       postgres:

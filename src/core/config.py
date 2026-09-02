@@ -26,14 +26,25 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://algo:algo_password@localhost:5432/algo_v1"
     # Content Service — HTTP read API (replaces direct content-db connection)
     content_service_url: str = "http://content-service:8004"
+    # Auth Service — HTTP API for group/student verification
+    auth_service_url: str = "http://auth-service:8000"
+    # Shared only by first-party services.  It authenticates the cancellation
+    # notification from auth-service; browser credentials are never accepted
+    # on that internal route.
+    internal_service_token: str = ""
 
     # Redis — template cache
     redis_url: str = "redis://localhost:6379"
     redis_template_cache_ttl: int = 3600  # 1 hour
 
-    # Gemini AI — variant templatization
+    # Gemini AI — variant templatization / fallback
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
+
+    # Azure OpenAI / DeepSeek API (Primary AI Engine)
+    azure_deepseek_api_key: str = ""
+    azure_deepseek_endpoint: str = ""
+    azure_deepseek_model: str = "deepseek-v4-flash"
 
     # Exam parameters
     max_tasks_per_exam: int = 50

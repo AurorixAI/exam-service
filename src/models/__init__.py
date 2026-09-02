@@ -7,7 +7,7 @@ from src.models.shared import (
     TextbookToc,
     TextbookSkillMap,
 )
-from src.models.exam_models import GeneratedExam, ExamSession, ExamReport
+from src.models.exam_models import ExamLifecycleEvent, ExamPrintPackage, ExamReport, ExamSession, GeneratedExam
 
 __all__ = [
     "Base",
@@ -18,6 +18,8 @@ __all__ = [
     "TextbookToc",
     "TextbookSkillMap",
     "GeneratedExam",
+    "ExamLifecycleEvent",
+    "ExamPrintPackage",
     "ExamSession",
     "ExamReport",
 ]

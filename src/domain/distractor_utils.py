@@ -31,24 +31,41 @@ def match_distractor(student: str, distractor_meta: list) -> Optional[Dict[str, 
 
 
 def distractor_text(item: Optional[Dict[str, Any]]) -> str:
-    """Canonical student-mistake description (error_logic preferred, same as content gate)."""
+    """Canonical student-mistake description (error_logic_latex preferred, then error_logic, then explanation)."""
     if not item or not isinstance(item, dict):
         return ""
+    latex = str(item.get("error_logic_latex") or "").strip()
     logic = str(item.get("error_logic") or "").strip()
     explanation = str(item.get("explanation") or "").strip()
-    return logic or explanation
+    return latex or logic or explanation
+
+
+def distractor_latex_text(item: Optional[Dict[str, Any]]) -> str:
+    """Canonical LaTeX student-mistake description."""
+    if not item or not isinstance(item, dict):
+        return ""
+    latex = str(item.get("error_logic_latex") or "").strip()
+    return latex or distractor_text(item)
 
 
 def normalize_distractor_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure both API fields are populated for teacher draft / task payloads."""
+    """Ensure error_logic_latex, error_logic, and explanation are all populated."""
     if not isinstance(item, dict):
         return item
     out = dict(item)
-    text = distractor_text(out)
-    if text:
-        out["explanation"] = text
+    latex_text = distractor_latex_text(out)
+    plain_text = (
+        str(out.get("error_logic") or "").strip()
+        or str(out.get("explanation") or "").strip()
+        or latex_text
+    )
+    if latex_text:
+        out["error_logic_latex"] = latex_text
+    if plain_text:
         if not str(out.get("error_logic") or "").strip():
-            out["error_logic"] = text
+            out["error_logic"] = plain_text
+        if not str(out.get("explanation") or "").strip():
+            out["explanation"] = plain_text
     return out
 
 
@@ -60,6 +77,23 @@ def normalize_distractor_meta(
     return [normalize_distractor_item(d) for d in meta if isinstance(d, dict)]
 
 
+def normalize_answer_options(
+    options: Optional[List[Any]],
+) -> Optional[List[str]]:
+    if not options or not isinstance(options, list):
+        return None
+    res = []
+    for opt in options:
+        if isinstance(opt, str):
+            res.append(opt)
+        elif isinstance(opt, dict):
+            val = opt.get("text") or opt.get("value") or opt
+            res.append(str(val))
+        else:
+            res.append(str(opt))
+    return res
+
+
 def build_analytics_hit(distractor: Dict[str, Any]) -> Dict[str, Any]:
     """Payload stored in session.distractor_analytics after submit."""
     return {
@@ -67,6 +101,8 @@ def build_analytics_hit(distractor: Dict[str, Any]) -> Dict[str, Any]:
         "distractor_value": str(distractor.get("value", "")),
         "error_type": distractor.get("error_type", ""),
         "explanation": distractor_text(distractor),
+        "error_logic": str(distractor.get("error_logic") or "").strip() or distractor_text(distractor),
+        "error_logic_latex": str(distractor.get("error_logic_latex") or "").strip() or distractor_latex_text(distractor),
     }
 
 
