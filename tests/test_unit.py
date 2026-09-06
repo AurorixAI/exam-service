@@ -186,8 +186,9 @@ class TestShouldShowMC:
     def test_auto_mc_type_with_options(self):
         assert _should_show_mc(self._task("exact_number", "B"), "auto") is True
 
-    def test_auto_mc_hard_no_mc(self):
-        assert _should_show_mc(self._task("exact_number", "C"), "auto") is False
+    def test_auto_ignores_difficulty(self):
+        """Difficulty no longer gates MC: a hard task with options still shows them."""
+        assert _should_show_mc(self._task("exact_number", "C"), "auto") is True
 
     def test_auto_no_options(self):
         assert _should_show_mc(self._task(has_options=False), "auto") is False
@@ -204,8 +205,9 @@ class TestShouldShowMC:
     def test_auto_true_false_type(self):
         assert _should_show_mc(self._task("true_false", "A"), "auto") is True
 
-    def test_auto_text_type_never_mc(self):
-        assert _should_show_mc(self._task("text", "A"), "auto") is False
+    def test_auto_ignores_answer_type(self):
+        """Only the presence of options (and mc_mode) decides, not answer_type."""
+        assert _should_show_mc(self._task("text", "A"), "auto") is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -219,7 +221,7 @@ class TestBuildMCOptions:
             "answer_options": ["1", "2", "3", "4"],
             "distractor_meta": None,
         }
-        options = _build_mc_options(task)
+        options = _build_mc_options(task, shuffle=False)
         assert set(options) == {"1", "2", "3", "4"}
         assert len(options) == 4
 
@@ -229,7 +231,7 @@ class TestBuildMCOptions:
             "answer_options": ["1", "2", "3"],
             "distractor_meta": None,
         }
-        options = _build_mc_options(task)
+        options = _build_mc_options(task, shuffle=False)
         assert "5" in options
 
     def test_uses_distractor_meta_as_fallback(self):
@@ -240,26 +242,45 @@ class TestBuildMCOptions:
                 {"value": "40"}, {"value": "44"}, {"value": "48"}
             ],
         }
-        options = _build_mc_options(task)
+        options = _build_mc_options(task, shuffle=False)
         assert "42" in options
         assert len(options) == 4  # correct + 3 distractors
 
     def test_empty_task_returns_empty_list(self):
         task = {"correct_answer": "", "answer_options": None, "distractor_meta": None}
-        assert _build_mc_options(task) == []
+        assert _build_mc_options(task, shuffle=False) == []
 
-    def test_options_are_shuffled(self):
-        """Run 10 times — if order is always same, something is wrong."""
+    def test_shuffle_is_seeded_and_stable_within_an_attempt(self):
+        """One seed must always give one order; different seeds may differ.
+
+        A student can re-fetch an active exam after a reconnect, so the option
+        letters must not move within their attempt.
+        """
         task = {
             "correct_answer": "1",
             "answer_options": ["1", "2", "3", "4"],
             "distractor_meta": None,
         }
-        orders = set()
-        for _ in range(10):
-            orders.add(tuple(_build_mc_options(task)))
-        # Not all 10 shuffles should be identical (astronomically unlikely)
-        assert len(orders) >= 1  # at minimum doesn't crash
+        same_seed = {
+            tuple(_build_mc_options(task, shuffle=True, seed="SES_1"))
+            for _ in range(10)
+        }
+        assert len(same_seed) == 1
+
+        across_seeds = {
+            tuple(_build_mc_options(task, shuffle=True, seed=f"SES_{i}"))
+            for i in range(25)
+        }
+        assert len(across_seeds) > 1
+        assert all(set(order) == {"1", "2", "3", "4"} for order in across_seeds)
+
+    def test_no_shuffle_keeps_source_order(self):
+        task = {
+            "correct_answer": "1",
+            "answer_options": ["1", "2", "3", "4"],
+            "distractor_meta": None,
+        }
+        assert _build_mc_options(task, shuffle=False) == ["1", "2", "3", "4"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

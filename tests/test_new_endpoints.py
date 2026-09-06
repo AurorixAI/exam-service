@@ -14,16 +14,23 @@ os.environ.setdefault("APP_ENV", "testing")
 
 import pytest
 from unittest.mock import patch, MagicMock
-from tests.conftest import make_task, make_exam_in_db, make_session_in_db
+from tests.conftest import (
+    make_task,
+    make_exam_in_db,
+    make_session_in_db,
+    session_headers,
+    session_token_for,
+)
 from src.models.exam_models import ExamSession
 from datetime import datetime, timezone
 
 
-def _submit_session(client, session_id, answers: dict):
-    return client.post(f"/api/v1/exam-sessions/{session_id}/submit", json={
-        "answers": answers,
-        "time_spent_seconds": 120,
-    })
+def _submit_session(client, session_id, answers: dict, *, headers=None):
+    return client.post(
+        f"/api/v1/exam-sessions/{session_id}/submit",
+        json={"answers": answers, "time_spent_seconds": 120},
+        headers=headers,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -37,11 +44,11 @@ class TestCloseExam:
         assert resp.status_code == 200
         assert resp.json()["status"] == "closed"
 
-    def test_close_draft_exam(self, client, db):
+    def test_close_draft_exam_is_rejected(self, client, db):
+        """Only a started run can be finalised; a draft was never opened."""
         exam = make_exam_in_db(db, status="draft")
         resp = client.post(f"/api/v1/exams/{exam.id}/close")
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "closed"
+        assert resp.status_code == 409
 
     def test_close_nonexistent(self, client):
         resp = client.post("/api/v1/exams/NOPE/close")
@@ -140,16 +147,20 @@ class TestAnalytics:
         # Session 1: all correct (100%)
         s1 = ExamSession(id="SES_ANA_01", exam_id=exam.id,
                          student_name="Студент 1", variant_number=1,
-                         answers={}, max_score=20, status="in_progress")
+                         answers={}, max_score=20, status="in_progress",
+                         session_token=session_token_for("SES_ANA_01"))
         # Session 2: all wrong (0%)
         s2 = ExamSession(id="SES_ANA_02", exam_id=exam.id,
                          student_name="Студент 2", variant_number=1,
-                         answers={}, max_score=20, status="in_progress")
+                         answers={}, max_score=20, status="in_progress",
+                         session_token=session_token_for("SES_ANA_02"))
         db.add_all([s1, s2])
         db.commit()
 
-        _submit_session(client, "SES_ANA_01", {"T1": "5", "T2": "10"})
-        _submit_session(client, "SES_ANA_02", {"T1": "99", "T2": "99"})
+        _submit_session(client, "SES_ANA_01", {"T1": "5", "T2": "10"},
+                        headers=session_headers("SES_ANA_01"))
+        _submit_session(client, "SES_ANA_02", {"T1": "99", "T2": "99"},
+                        headers=session_headers("SES_ANA_02"))
 
         resp = client.get(f"/api/v1/exams/{exam.id}/analytics")
         data = resp.json()
@@ -164,12 +175,14 @@ class TestAnalytics:
         for i, ans in enumerate(["5", "5", "99"]):
             s = ExamSession(id=f"SES_PR_{i:02d}", exam_id=exam.id,
                             student_name=f"С{i}", variant_number=1,
-                            answers={}, max_score=10, status="in_progress")
+                            answers={}, max_score=10, status="in_progress",
+                            session_token=session_token_for(f"SES_PR_{i:02d}"))
             db.add(s)
         db.commit()
 
         for i, ans in enumerate(["5", "5", "99"]):
-            _submit_session(client, f"SES_PR_{i:02d}", {"T1": ans})
+            _submit_session(client, f"SES_PR_{i:02d}", {"T1": ans},
+                            headers=session_headers(f"SES_PR_{i:02d}"))
 
         resp = client.get(f"/api/v1/exams/{exam.id}/analytics")
         data = resp.json()
@@ -185,12 +198,14 @@ class TestAnalytics:
 
         s1 = ExamSession(id="SES_GAP_01", exam_id=exam.id,
                          student_name="С1", variant_number=1,
-                         answers={}, max_score=20, status="in_progress")
+                         answers={}, max_score=20, status="in_progress",
+                         session_token=session_token_for("SES_GAP_01"))
         db.add(s1)
         db.commit()
 
         # T1 correct, T2 wrong
-        _submit_session(client, "SES_GAP_01", {"T1": "5", "T2": "99"})
+        _submit_session(client, "SES_GAP_01", {"T1": "5", "T2": "99"},
+                        headers=session_headers("SES_GAP_01"))
 
         resp = client.get(f"/api/v1/exams/{exam.id}/analytics")
         gaps = resp.json()["task_analytics"]

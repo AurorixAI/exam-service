@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 import os
+from datetime import date as _date
 
 # Must be first — adds src/ to path before any src.* imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -84,17 +85,137 @@ def db():
         connection.close()
 
 
+# ─── Test actor ──────────────────────────────────────────────────────────────
+# Every non-public exam endpoint depends on ``require_exam_staff``, which calls
+# auth-service over HTTP (auth-service is the single source of truth for token
+# validity and org role).  Tests must never do that, so the dependency is
+# overridden with a fixed org owner.  Rows created by the factories below use
+# the same org/user so ``require_exam_access`` lets them through.
+
+TEST_USER_ID = "USR_TEST01"
+TEST_ORG_ID = "ORG_TEST01"
+# ``require_group_access`` rejects a non-UUID group id outright, so the factory
+# group must look like a real auth-service group.
+TEST_GROUP_ID = "11111111-2222-3333-4444-555555555555"
+TEST_LESSON_ID = "LSN_TEST01"
+# Per-attempt capability required by the public student endpoints.
+TEST_SESSION_TOKEN = "test-session-capability-token"
+
+
+def session_token_for(session_id: str) -> str:
+    """Deterministic stand-in for the capability ``start`` issues.
+
+    ``session_token`` is unique-indexed, so a test that creates several
+    sessions must give each its own token and send the matching header.
+    """
+    return f"{TEST_SESSION_TOKEN}:{session_id}"
+
+
+def session_headers(session_id: str) -> dict:
+    return {"X-Exam-Session-Token": session_token_for(session_id)}
+
+
+def make_actor(role: str = "teacher"):
+    from src.core.auth import ExamActor
+
+    return ExamActor(
+        user_id=TEST_USER_ID,
+        org_id=TEST_ORG_ID,
+        role=role,
+        auth_headers={"authorization": "Bearer test-token"},
+    )
+
+
 @pytest.fixture
-def client(db):
-    """TestClient with DB dependency overridden."""
+def actor():
+    """The staff actor every ``client`` request is authenticated as."""
+    return make_actor()
+
+
+TEST_GROUP = {
+    "id": TEST_GROUP_ID,
+    "name": "8А",
+    "class_level": 8,
+    "teacher_id": TEST_USER_ID,
+    "teacher_name": "Айгуль Серикова",
+}
+
+
+@pytest.fixture
+def stub_auth_service(monkeypatch):
+    """Neutralise every outbound auth-service call.
+
+    exam-service deliberately keeps no copy of the auth state: group access,
+    schedule occurrences and the student roster are all resolved over HTTP
+    against auth-service.  Tests must never make those calls (they would fail
+    closed with 503), so each helper answers from a canonical in-memory group.
+    """
+    from fastapi import HTTPException
+    from src.api import router
+    from src.core import auth as core_auth
+
+    async def fake_require_group_access(actor, group_id):
+        if str(group_id) != TEST_GROUP_ID:
+            raise HTTPException(404, "Группа не найдена")
+        return dict(TEST_GROUP)
+
+    async def fake_resolve_lesson_occurrence(
+        actor, *, group_id, lesson_id, lesson_date, require_current_or_future=True
+    ):
+        group = await fake_require_group_access(actor, group_id)
+        return group, {
+            "id": lesson_id,
+            "groupId": group_id,
+            "occurrenceDate": lesson_date,
+            "subject": "Математика",
+        }
+
+    async def fake_require_public_lobby_available(exam):
+        return None
+
+    async def fake_require_lesson_in_progress(exam, actor):
+        return None
+
+    async def fake_canonical_student(exam, *, student_id, student_name, identifier=None):
+        name = student_name or identifier or student_id or "Ученик"
+        return {
+            "id": student_id or f"STU_{abs(hash(name)) % 10**8}",
+            "display_id": identifier,
+            "full_name": name,
+            "class_level": TEST_GROUP["class_level"],
+        }
+
+    monkeypatch.setattr(core_auth, "require_group_access", fake_require_group_access)
+    monkeypatch.setattr(router, "require_group_access", fake_require_group_access)
+    monkeypatch.setattr(router, "_resolve_lesson_occurrence", fake_resolve_lesson_occurrence)
+    monkeypatch.setattr(
+        router, "_require_public_lobby_available", fake_require_public_lobby_available
+    )
+    monkeypatch.setattr(router, "_require_lesson_in_progress", fake_require_lesson_in_progress)
+    monkeypatch.setattr(router, "_canonical_student_for_exam", fake_canonical_student)
+
+
+@pytest.fixture
+def client(db, stub_auth_service):
+    """TestClient with DB, staff-auth and auth-service calls stubbed out."""
     from src.main import app
     from src.core.database import get_db
+    from src.core.auth import require_exam_staff
 
     def override_get_db():
         yield db
 
     app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app, raise_server_exceptions=True) as c:
+    app.dependency_overrides[require_exam_staff] = make_actor
+    # Student endpoints require the per-attempt capability issued by ``start``.
+    # Factory sessions all carry ``TEST_SESSION_TOKEN``, so sending it by
+    # default keeps every request authorised; a test that wants to exercise the
+    # guard overrides the header explicitly.
+    with TestClient(
+        app,
+        raise_server_exceptions=True,
+        headers={"X-Exam-Session-Token": TEST_SESSION_TOKEN},
+    ) as c:
         yield c
     app.dependency_overrides.clear()
 
@@ -142,6 +263,16 @@ def make_exam_in_db(db, tasks: list = None, status: str = "active") -> Generated
         total_time_minutes=45,
         variants_count=1,
         tasks_per_variant=len(tasks),
+        org_id=TEST_ORG_ID,
+        created_by=TEST_USER_ID,
+        # An online exam is only publicly reachable once it is bound to one
+        # concrete lesson occurrence (see ``_require_bound_exam``); without
+        # this binding every by-code request answers 410.
+        group_id=TEST_GROUP_ID,
+        group_name="8А",
+        class_level=8,
+        scheduled_lesson_id=TEST_LESSON_ID,
+        scheduled_lesson_date=_date.today().isoformat(),
     )
     db.add(exam)
     db.commit()
@@ -158,6 +289,7 @@ def make_session_in_db(db, exam: GeneratedExam, status: str = "in_progress") -> 
         answers={},
         max_score=len(exam.variants[0]["tasks"]) * 10,
         status=status,
+        session_token=TEST_SESSION_TOKEN,
     )
     db.add(sess)
     db.commit()

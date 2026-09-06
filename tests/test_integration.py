@@ -24,7 +24,15 @@ os.environ.setdefault("APP_ENV", "testing")
 
 import pytest
 from unittest.mock import patch, MagicMock
-from tests.conftest import make_task, make_exam_in_db, make_session_in_db
+from datetime import date as _date
+
+from tests.conftest import (
+    TEST_GROUP_ID,
+    TEST_LESSON_ID,
+    make_task,
+    make_exam_in_db,
+    make_session_in_db,
+)
 from src.models.exam_models import ExamLifecycleEvent
 
 
@@ -127,25 +135,42 @@ class TestGenerateExam:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestPublishExam:
+    """Publishing binds an exam to one concrete lesson and opens its lobby.
+
+    A published exam does not become ``active`` on its own any more: the
+    teacher still has to start the lesson occurrence.
+    """
+
+    def _lesson(self, **extra):
+        payload = {"lesson_id": TEST_LESSON_ID, "lesson_date": _date.today().isoformat()}
+        payload.update(extra)
+        return payload
+
     def test_publish_draft_success(self, client, db):
         exam = make_exam_in_db(db, status="draft")
-        resp = client.post(f"/api/v1/exams/{exam.id}/publish", json={
-            "teacher_name": "Айгуль Серикова",
-        })
+        resp = client.post(
+            f"/api/v1/exams/{exam.id}/publish",
+            json=self._lesson(teacher_name="Айгуль Серикова"),
+        )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "active"
+        assert data["status"] == "lobby"
         assert data["access_code"].startswith("EX")
         assert len(data["access_code"]) == 10
 
+    def test_publish_requires_a_lesson_occurrence(self, client, db):
+        exam = make_exam_in_db(db, status="draft")
+        resp = client.post(f"/api/v1/exams/{exam.id}/publish", json={})
+        assert resp.status_code == 422
+
     def test_publish_not_found(self, client):
-        resp = client.post("/api/v1/exams/NONEXISTENT/publish", json={})
+        resp = client.post("/api/v1/exams/NONEXISTENT/publish", json=self._lesson())
         assert resp.status_code == 404
 
     def test_publish_already_active(self, client, db):
         exam = make_exam_in_db(db, status="active")
-        resp = client.post(f"/api/v1/exams/{exam.id}/publish", json={})
-        assert resp.status_code == 400
+        resp = client.post(f"/api/v1/exams/{exam.id}/publish", json=self._lesson())
+        assert resp.status_code == 409
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -316,6 +341,20 @@ class TestSubmitExam:
         })
         assert resp.status_code == 400
 
+    def test_submit_requires_the_attempt_capability(self, client, db):
+        """A session id alone must never be enough to submit for a student."""
+        tasks = [make_task("TASK_001", answer="42")]
+        exam = make_exam_in_db(db, tasks=tasks)
+        session = make_session_in_db(db, exam)
+
+        for token in ("", "someone-elses-token"):
+            resp = client.post(
+                f"/api/v1/exam-sessions/{session.id}/submit",
+                json={"answers": {"TASK_001": "42"}},
+                headers={"X-Exam-Session-Token": token},
+            )
+            assert resp.status_code == 403
+
     def test_submit_unknown_session_returns_404(self, client):
         resp = client.post("/api/v1/exam-sessions/UNKNOWN/submit", json={"answers": {}})
         assert resp.status_code == 404
@@ -444,49 +483,62 @@ class TestFullStudentJourney:
         assert gen.status_code == 200
         exam_id = gen.json()["exam_id"]
 
-        # 2. Teacher publishes
+        # 2. Teacher publishes it onto a concrete lesson — this opens the lobby
         pub = client.post(f"/api/v1/exams/{exam_id}/publish", json={
             "teacher_name": "Мария Петровна",
+            "group_id": TEST_GROUP_ID,
+            "lesson_id": TEST_LESSON_ID,
+            "lesson_date": _date.today().isoformat(),
         })
         assert pub.status_code == 200
+        assert pub.json()["status"] == "lobby"
         code = pub.json()["access_code"]
         assert code.startswith("EX")
 
-        # 3. Student sees exam info
+        # 3. Teacher starts the lesson run — only now is the exam active
+        live = client.post(f"/api/v1/exams/{exam_id}/start-live")
+        assert live.status_code == 200
+
+        # 4. Student sees exam info
         info = client.get(f"/api/v1/exams/by-code/{code}")
         assert info.status_code == 200
         assert info.json()["status"] == "active"
 
-        # 4. Student starts
+        # 5. Student starts
         start = client.post(f"/api/v1/exams/by-code/{code}/start", json={
             "student_name": "Болат Ахметов",
             "class_level": 9,
         })
         assert start.status_code == 200
         session_id = start.json()["session_id"]
+        # Every later request for this attempt is authorised by its capability.
+        session_token = start.json()["session_token"]
+        assert session_token
+        headers = {"X-Exam-Session-Token": session_token}
         tasks = start.json()["tasks"]
         assert len(tasks) == 3
         # No correct_answer exposed
         for t in tasks:
             assert "correct_answer" not in t
 
-        # 5. Student submits — answer all correctly from TASKS_POOL
+        # 6. Student submits — answer all correctly from TASKS_POOL
         # We know the correct answers from our fixture
         answers = {}
         for t in TASKS_POOL[:3]:
             answers[t["task_id"]] = t["correct_answer"]
 
-        sub = client.post(f"/api/v1/exam-sessions/{session_id}/submit", json={
-            "answers": answers,
-            "time_spent_seconds": 300,
-        })
+        sub = client.post(
+            f"/api/v1/exam-sessions/{session_id}/submit",
+            json={"answers": answers, "time_spent_seconds": 300},
+            headers=headers,
+        )
         assert sub.status_code == 200
         sub_data = sub.json()
         assert sub_data["correct_count"] == 3
         assert sub_data["percentage"] == 100.0
 
-        # 6. Student views results
-        res = client.get(f"/api/v1/exam-sessions/{session_id}/results")
+        # 7. Student views results
+        res = client.get(f"/api/v1/exam-sessions/{session_id}/results", headers=headers)
         assert res.status_code == 200
         res_data = res.json()
         assert res_data["student_name"] == "Болат Ахметов"

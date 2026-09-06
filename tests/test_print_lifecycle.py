@@ -12,6 +12,8 @@ from src.api.router import AssignExamRequest
 from src.core.auth import ExamActor
 from src.models.exam_models import GeneratedExam
 
+from tests.conftest import TEST_ORG_ID, TEST_USER_ID
+
 
 def test_legacy_assignment_can_never_open_a_lobby_for_print_delivery(monkeypatch) -> None:
     """Paper exams may only be bound by the immutable print-package flow.
@@ -63,6 +65,8 @@ class TestCloneAndRenameLifecycle:
             id="rename-draft",
             title="Исходное название",
             status="variants_ready",
+            org_id=TEST_ORG_ID,
+            created_by=TEST_USER_ID,
             variants=[{"variant_number": 1, "tasks": []}],
             settings={},
         )
@@ -87,6 +91,8 @@ class TestCloneAndRenameLifecycle:
             id="clone-source",
             title="Контрольная по функциям",
             status="closed",
+            org_id=TEST_ORG_ID,
+            created_by=TEST_USER_ID,
             delivery_mode="print",
             group_id="group-old",
             group_name="Старая группа",
@@ -123,6 +129,8 @@ class TestCloneAndRenameLifecycle:
             id="clone-archived",
             title="Архивный экзамен",
             status="archived",
+            org_id=TEST_ORG_ID,
+            created_by=TEST_USER_ID,
             variants=[],
             settings={},
         )

@@ -6,6 +6,7 @@ from copy import deepcopy
 from io import BytesIO
 
 import pytest
+from reportlab.lib.units import mm
 
 from src.domain.print_package import build_default_print_layout, build_print_snapshot
 from src.domain.print_pdf import (
