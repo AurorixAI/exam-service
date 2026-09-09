@@ -1218,7 +1218,13 @@ def _task_text(task: dict[str, Any]) -> str:
     # printing the entire condition twice. A short formula remains
     # supplemental to the human-readable wording.
     letter_count = len(re.findall(r"[А-Яа-яA-Za-z]", readable_latex))
-    if latex and text and letter_count >= 12:
+    # The letter count alone mistakes a formula for a statement: a fragment
+    # like ``y = ax^2 + bx + c, \quad a = 1, \quad \text{вершина } (2; -3)``
+    # clears twelve letters while carrying none of the instruction, so the
+    # printed paper lost its "Найдите"/"Решите" wording. A LaTeX field far
+    # shorter than the statement is supplemental, never a replacement for it.
+    is_fragment = bool(text) and len(latex) < len(text) * 0.6
+    if latex and text and letter_count >= 12 and not is_fragment:
         return latex
     if latex and readable_latex not in _latex_to_print_text(text):
         return f"{text}\n{latex}".strip()
