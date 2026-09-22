@@ -185,8 +185,21 @@ def stub_auth_service(monkeypatch):
             "class_level": TEST_GROUP["class_level"],
         }
 
+    async def fake_require_student_history_access(actor, student_id):
+        return {"id": str(student_id), "org_id": TEST_ORG_ID}
+
     monkeypatch.setattr(core_auth, "require_group_access", fake_require_group_access)
     monkeypatch.setattr(router, "require_group_access", fake_require_group_access)
+    monkeypatch.setattr(
+        core_auth,
+        "require_student_history_access",
+        fake_require_student_history_access,
+    )
+    monkeypatch.setattr(
+        router,
+        "require_student_history_access",
+        fake_require_student_history_access,
+    )
     monkeypatch.setattr(router, "_resolve_lesson_occurrence", fake_resolve_lesson_occurrence)
     monkeypatch.setattr(
         router, "_require_public_lobby_available", fake_require_public_lobby_available

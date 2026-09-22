@@ -47,7 +47,13 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.core.auth import ExamActor, require_exam_access, require_exam_staff, require_group_access
+from src.core.auth import (
+    ExamActor,
+    require_exam_access,
+    require_exam_staff,
+    require_group_access,
+    require_student_history_access,
+)
 from src.core.config import get_settings
 from src.core.database import get_db
 from src.core.exceptions import (
@@ -3939,57 +3945,6 @@ async def get_exam_by_code(code: str, db: Session = Depends(get_db)):
     )
 
 
-def _grade_and_submit_session(
-    db: Session,
-    session: ExamSession,
-    exam: GeneratedExam,
-    answers: dict,
-    time_spent_seconds: int = 0,
-) -> dict:
-    """Helper to grade answers, compute distractor analytics, and record submission."""
-    variants = exam.variants or []
-    variant = next(
-        (v for v in variants if v.get("variant_number") == session.variant_number),
-        variants[0] if variants else None,
-    )
-    tasks_raw = variant.get("tasks", []) if variant else []
-
-    correct_count = 0
-    distractor_analytics: dict = {}
-    for t in tasks_raw:
-        task_id = t.get("task_id", "")
-        student_ans = answers.get(task_id, "")
-        is_correct = _check_answer(student_ans, t.get("correct_answer", ""))
-        if is_correct:
-            correct_count += 1
-        else:
-            hit = _match_distractor(student_ans, t.get("distractor_meta") or [])
-            if hit:
-                distractor_analytics[task_id] = build_analytics_hit(hit)
-
-    total_tasks = len(tasks_raw)
-    score = correct_count * 10
-    max_score = total_tasks * 10
-
-    SessionRepository(db).submit(
-        session,
-        answers,
-        score,
-        max_score,
-        correct_count,
-        total_tasks,
-        time_spent_seconds,
-        distractor_analytics=distractor_analytics or None,
-    )
-    return {
-        "score": score,
-        "max_score": max_score,
-        "correct_count": correct_count,
-        "total_tasks": total_tasks,
-        "percentage": round(score / max_score * 100, 1) if max_score else 0.0,
-    }
-
-
 def _find_submitted_session(sessions: list, student_id: Optional[str], student_name: Optional[str], identifier: Optional[str] = None):
     """Find if a student already completed an exam session."""
     s_id = (student_id or "").strip().lower()
@@ -4733,6 +4688,69 @@ class SessionSummary(BaseModel):
     time_spent_seconds: int
     started_at: Optional[datetime] = None
     submitted_at: Optional[datetime] = None
+
+
+class StudentExamHistoryItem(BaseModel):
+    """A completed student attempt without answers or answer-key material."""
+
+    id: str
+    exam_id: str
+    exam_title: str
+    score: int
+    max_score: int
+    correct_count: int
+    total_tasks: int
+    time_spent_seconds: int
+    status: Literal["submitted"]
+    started_at: Optional[datetime] = None
+    submitted_at: Optional[datetime] = None
+
+
+@router.get(
+    "/students/{student_id}/exam-history",
+    response_model=List[StudentExamHistoryItem],
+    summary="История завершённых экзаменов ученика",
+)
+async def list_student_exam_history(
+    student_id: str,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    """Return only completed attempts visible to the current staff member.
+
+    The profile should never imply that a lobby/waiting attempt is a result.
+    Printed exams are intentionally absent until a future marking workflow
+    stores per-student results in ``exam_sessions``.
+    """
+    await require_student_history_access(actor, student_id)
+    rows = (
+        db.query(ExamSession, GeneratedExam)
+        .join(GeneratedExam, GeneratedExam.id == ExamSession.exam_id)
+        .filter(
+            ExamSession.student_id == str(student_id),
+            ExamSession.status == "submitted",
+            GeneratedExam.org_id == actor.org_id,
+        )
+        .order_by(ExamSession.submitted_at.desc(), ExamSession.id.desc())
+        .limit(100)
+        .all()
+    )
+    return [
+        StudentExamHistoryItem(
+            id=session.id,
+            exam_id=exam.id,
+            exam_title=exam.title,
+            score=session.score or 0,
+            max_score=session.max_score or 0,
+            correct_count=session.correct_count or 0,
+            total_tasks=session.total_tasks or 0,
+            time_spent_seconds=session.time_spent_seconds or 0,
+            status="submitted",
+            started_at=session.started_at,
+            submitted_at=session.submitted_at,
+        )
+        for session, exam in rows
+    ]
 
 
 @router.get("/exams/{exam_id}/sessions", response_model=List[SessionSummary],

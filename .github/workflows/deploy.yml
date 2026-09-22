@@ -74,6 +74,7 @@ jobs:
 
       - name: Pull + rebuild on server
         run: |
+          RELEASED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" "
             set -e
             cd ~/algo/${{ steps.t.outputs.srcdir }}
@@ -81,6 +82,9 @@ jobs:
             git checkout --quiet ${{ github.ref_name }}
             git reset --hard --quiet origin/${{ github.ref_name }}
             cd ~/algo
+            export RELEASE_SHA='${{ github.sha }}'
+            export RELEASE_REF='${{ github.ref_name }}'
+            export RELEASED_AT='$RELEASED_AT'
             docker compose -f ${{ steps.t.outputs.compose }} \
               -p ${{ steps.t.outputs.project }} \
               --env-file ${{ steps.t.outputs.envfile }} \
@@ -110,6 +114,43 @@ jobs:
             docker logs \$C --tail 80
             exit 1
           "
+
+      - name: Verify deployed revision
+        run: |
+          ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" "
+            C=${{ steps.t.outputs.container }}
+            DEPLOYED_SHA=\$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \$C | sed -n 's/^RELEASE_SHA=//p')
+            if [ \"\$DEPLOYED_SHA\" != \"${{ github.sha }}\" ]; then
+              echo \"Expected ${{ github.sha }}, container reports \$DEPLOYED_SHA\" >&2
+              exit 1
+            fi
+            echo \"\$C runs release \$DEPLOYED_SHA\"
+          "
+
+      - name: Export deployed release manifest
+        run: |
+          METADATA="$(ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" "docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' ${{ steps.t.outputs.container }}")"
+          IMAGE_ID="$(ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" "docker inspect --format '{{.Image}}' ${{ steps.t.outputs.container }}")"
+          DEPLOYED_SHA="$(printf '%s\n' "$METADATA" | sed -n 's/^RELEASE_SHA=//p')"
+          DEPLOYED_REF="$(printf '%s\n' "$METADATA" | sed -n 's/^RELEASE_REF=//p')"
+          DEPLOYED_AT="$(printf '%s\n' "$METADATA" | sed -n 's/^RELEASED_AT=//p')"
+          test "$DEPLOYED_SHA" = "${{ github.sha }}"
+          printf '%s\n' \
+            "service=${{ env.COMPOSE_SERVICE }}" \
+            "source_sha=${{ github.sha }}" \
+            "source_ref=${{ github.ref_name }}" \
+            "container=${{ steps.t.outputs.container }}" \
+            "image_id=$IMAGE_ID" \
+            "release_sha=$DEPLOYED_SHA" \
+            "release_ref=$DEPLOYED_REF" \
+            "released_at=$DEPLOYED_AT" > release-manifest.txt
+          sed 's/^/- /' release-manifest.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest-${{ github.sha }}
+          path: release-manifest.txt
+          if-no-files-found: error
 
       - name: Verify site responds
         run: |

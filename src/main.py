@@ -4,6 +4,7 @@ Exam Service — FastAPI application entry point.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 import asyncio
@@ -143,6 +144,17 @@ def create_app() -> FastAPI:
     def health_live():
         """Always 200 — no dependency checks."""
         return {"status": "alive"}
+
+    @app.get("/version", tags=["System"], summary="Deployed release metadata")
+    def release_version():
+        """Return non-secret metadata for the exact deployed exam release."""
+        return {
+            "service": "exam-service",
+            "app_version": settings.app_version,
+            "release_sha": os.getenv("RELEASE_SHA", "unknown"),
+            "release_ref": os.getenv("RELEASE_REF", "unknown"),
+            "released_at": os.getenv("RELEASED_AT", "unknown"),
+        }
 
     @app.get("/health/ready", tags=["System"], summary="Readiness probe")
     def health_ready():

@@ -23,6 +23,7 @@ from tests.conftest import (
 )
 from src.models.exam_models import ExamSession
 from datetime import datetime, timezone
+from uuid import uuid4
 
 
 def _submit_session(client, session_id, answers: dict, *, headers=None):
@@ -49,6 +50,30 @@ class TestCloseExam:
         exam = make_exam_in_db(db, status="draft")
         resp = client.post(f"/api/v1/exams/{exam.id}/close")
         assert resp.status_code == 409
+
+    def test_close_atomically_submits_active_student_work(self, client, db):
+        """Closing must preserve a live student's saved work in one commit."""
+        tasks = [make_task("T_CLOSE_1", answer="5")]
+        exam = make_exam_in_db(db, tasks=tasks, status="active")
+        session = make_session_in_db(
+            db,
+            exam,
+            status="in_progress",
+        )
+        session.answers = {"T_CLOSE_1": "5"}
+        db.commit()
+
+        response = client.post(f"/api/v1/exams/{exam.id}/close")
+
+        assert response.status_code == 200
+        assert response.json()["finalized_sessions"] == 1
+        db.expire_all()
+        stored_exam = db.query(type(exam)).filter(type(exam).id == exam.id).first()
+        stored_session = db.query(ExamSession).filter(ExamSession.id == session.id).first()
+        assert stored_exam.status == "closed"
+        assert stored_session.status == "submitted"
+        assert stored_session.score == 10
+        assert stored_session.correct_count == 1
 
     def test_close_nonexistent(self, client):
         resp = client.post("/api/v1/exams/NOPE/close")
@@ -124,6 +149,65 @@ class TestListSessions:
     def test_sessions_nonexistent_exam(self, client):
         resp = client.get("/api/v1/exams/NOEXIST/sessions")
         assert resp.status_code == 404
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Student exam history
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestStudentExamHistory:
+    def test_only_completed_attempts_from_the_current_organisation_are_exposed(self, client, db):
+        exam = make_exam_in_db(db)
+        student_id = str(uuid4())
+        submitted_at = datetime.now(timezone.utc)
+        completed = ExamSession(
+            id="SES_HISTORY_DONE",
+            exam_id=exam.id,
+            student_id=student_id,
+            student_name="Иван Иванов",
+            variant_number=1,
+            answers={},
+            score=10,
+            max_score=10,
+            correct_count=1,
+            total_tasks=1,
+            time_spent_seconds=90,
+            status="submitted",
+            submitted_at=submitted_at,
+        )
+        still_running = ExamSession(
+            id="SES_HISTORY_LIVE",
+            exam_id=exam.id,
+            student_id=student_id,
+            student_name="Иван Иванов",
+            variant_number=1,
+            answers={},
+            status="in_progress",
+        )
+        db.add_all([completed, still_running])
+        db.commit()
+
+        response = client.get(f"/api/v1/students/{student_id}/exam-history")
+
+        assert response.status_code == 200
+        assert len(response.json()) == 1
+        item = response.json()[0]
+        expected = {
+            "id": "SES_HISTORY_DONE",
+            "exam_id": exam.id,
+            "exam_title": exam.title,
+            "score": 10,
+            "max_score": 10,
+            "correct_count": 1,
+            "total_tasks": 1,
+            "time_spent_seconds": 90,
+            "status": "submitted",
+        }
+        for field, expected_value in expected.items():
+            assert item[field] == expected_value
+        assert item["started_at"] is not None
+        assert item["submitted_at"] is not None
+        assert "answers" not in item
 
 
 # ═══════════════════════════════════════════════════════════════════════════

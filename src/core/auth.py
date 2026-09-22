@@ -129,6 +129,42 @@ async def require_group_access(actor: ExamActor, group_id: str) -> dict:
     return group
 
 
+async def require_student_history_access(actor: ExamActor, student_id: str) -> dict:
+    """Verify current staff visibility of a student in auth-service.
+
+    Exam attempts are stored in this service, but student ownership and the
+    teacher's current group scope belong to auth-service. Reusing its student
+    route prevents a direct history endpoint from becoming an organisation or
+    former-group data leak.
+    """
+    try:
+        UUID(str(student_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Ученик не найден") from exc
+
+    auth_url = (
+        f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/students/{student_id}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(auth_url, headers=dict(actor.auth_headers))
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Не удалось проверить доступ к ученику. Повторите попытку.",
+        ) from exc
+
+    if response.status_code in {401, 403, 404}:
+        # Do not disclose whether a student exists outside the actor's scope.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Нет доступа к ученику")
+    if response.status_code != 200:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Не удалось проверить доступ к ученику",
+        )
+    return response.json()
+
+
 async def require_exam_access(exam: object, actor: ExamActor) -> None:
     """Enforce organisation and teacher ownership for one exam.
 
