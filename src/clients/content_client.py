@@ -36,7 +36,10 @@ def get_client() -> httpx.Client:
         _client = httpx.Client(
             base_url=s.content_service_url,
             timeout=10.0,
-            headers={"Accept": "application/json"},
+            headers={
+                "Accept": "application/json",
+                "X-Internal-Service-Token": s.internal_service_token,
+            },
         )
     return _client
 
