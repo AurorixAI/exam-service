@@ -66,6 +66,7 @@ from src.core.exceptions import (
 from src.models import ExamLifecycleEvent, ExamPrintPackage, ExamReport, GeneratedExam, ExamSession
 from src.repositories.task_repo import TaskRepository, TextbookRepository
 from src.repositories.exam_repo import ExamRepository, SessionRepository, ExamReportRepository
+from src.domain.choice_options import choice_pairs, ordered as order_choices
 from src.domain.print_package import (
     PrintLayoutValidationError,
     build_default_print_layout,
@@ -1323,25 +1324,23 @@ def _build_mc_options(
     A browser can re-fetch an active exam after a reconnect.  Using a global
     random shuffle there makes letters jump between requests.  A deterministic
     session seed gives every online student an independent order without ever
-    changing it within their attempt.
+    changing it within their attempt.  Options that are bare letters (they
+    point at choices printed in the question) keep their order.
     """
-    correct = task.get("correct_answer", "")
-    raw_options: list = task.get("answer_options") or []
-    options = normalize_answer_options(raw_options) or []
-    if options:
-        if correct and correct not in options:
-            options = [correct] + list(options)
-        options = list(options)
-        if shuffle:
-            random.Random(seed).shuffle(options)
-        return options
-    distractors = task.get("distractor_meta") or []
-    if distractors and correct:
-        opts = [correct] + [str(d.get("value", "")) for d in distractors[:3] if isinstance(d, dict)]
-        if shuffle:
-            random.Random(seed).shuffle(opts)
-        return opts
-    return []
+    pairs = _mc_choices(task)
+    if shuffle:
+        pairs = order_choices(pairs, seed if seed is not None else secrets.token_hex(8))
+    return [value for value, _ in pairs]
+
+
+def _mc_choices(task: dict) -> List[tuple[str, str]]:
+    """(value, display) choices; the key once, graded by this service's grader."""
+    correct = str(task.get("correct_answer") or "")
+    return choice_pairs(
+        task,
+        graded_as_key=lambda value: _check_answer(value, correct),
+        max_distractors=3,
+    )
 
 
 def _build_session_mc_options(exam: GeneratedExam, session: ExamSession, task: dict) -> List[str]:
@@ -1359,18 +1358,9 @@ def _build_mc_options_latex(task: dict, options: List[str]) -> List[str]:
     """Parallel LaTeX strings for MCQ options (same order as options)."""
     if not options:
         return []
-    correct = task.get("correct_answer", "")
-    correct_latex = (task.get("correct_answer_latex") or "").strip()
-    latex_by_value: dict[str, str] = {}
-    if correct:
-        latex_by_value[correct] = correct_latex
-    for d in task.get("distractor_meta") or []:
-        if not isinstance(d, dict):
-            continue
-        val = str(d.get("value", ""))
-        if val:
-            latex_by_value[val] = (d.get("value_latex") or "").strip()
-    return [latex_by_value.get(opt, "") for opt in options]
+    # Values are unique among the choices, so each display is found exactly.
+    display_by_value = dict(_mc_choices(task))
+    return [display_by_value.get(opt, "") for opt in options]
 
 
 from src.domain.answer_utils import normalise_answer as _normalise_answer, check_answer as _check_answer

@@ -9,8 +9,9 @@ from __future__ import annotations
 from copy import deepcopy
 from hashlib import sha256
 import json
-import random
 from typing import Any
+
+from src.domain.choice_options import choice_pairs, ordered as order_choices
 
 
 PRINT_LAYOUT_SCHEMA_VERSION = 1
@@ -47,14 +48,6 @@ def _section_name(task: dict[str, Any]) -> str:
     return _string(task.get("skill_name") or task.get("skill_id")) or "Без категории"
 
 
-def _distractor_value(item: Any) -> tuple[str, str]:
-    if not isinstance(item, dict):
-        return "", ""
-    value = _string(item.get("value") or item.get("text") or item.get("content"))
-    latex = _string(item.get("value_latex") or item.get("latex"))
-    return value, latex
-
-
 def choice_option_identity(value: str, latex: str = "") -> str:
     """Return a presentation-independent identity for one answer option.
 
@@ -82,51 +75,14 @@ def print_choice_options(task: dict[str, Any]) -> list[dict[str, str]]:
     stores only distractors, so without the shuffle the merged correct answer
     would land on letter A in every task of every variant.
     """
-    correct = _string(task.get("correct_answer"))
-    correct_latex = _string(task.get("correct_answer_latex"))
-    correct_identity = choice_option_identity(correct, correct_latex)
-    candidates: list[tuple[str, str]] = []
-
-    raw_options = task.get("answer_options")
-    if isinstance(raw_options, list):
-        raw_latex = task.get("answer_options_latex")
-        for index, option in enumerate(raw_options):
-            if isinstance(option, dict):
-                value = _string(option.get("value") or option.get("text") or option.get("content"))
-                latex = _string(option.get("value_latex") or option.get("latex"))
-            else:
-                value = _string(option)
-                latex = ""
-            if not latex and isinstance(raw_latex, list) and index < len(raw_latex):
-                latex = _string(raw_latex[index])
-            candidates.append((value, latex))
-
-    if not candidates:
-        candidates.extend(_distractor_value(item) for item in (task.get("distractor_meta") or []))
-
-    if correct:
-        # Keep the authored option order if the correct answer is already in
-        # it; otherwise put the answer first instead of quietly dropping it.
-        if not any(
-            choice_option_identity(value, latex) == correct_identity
-            for value, latex in candidates
-        ):
-            candidates.insert(0, (correct, correct_latex))
-
-    options: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for value, latex in candidates:
-        identity = choice_option_identity(value, latex)
-        if not value or not identity or identity in seen:
-            continue
-        seen.add(identity)
-        options.append({"value": value, "latex": latex or (correct_latex if value == correct else "")})
-
+    # The same choices as online delivery: the key once (its value is
+    # ``correct_answer``, which is how the teacher key finds its letter), in
+    # the author's notation, and never next to a look-alike of itself.
+    pairs = choice_pairs(task)
     # Same input -> same order (the snapshot hash stays stable), but different
     # tasks -> different orders, so the correct letter is not a pattern.
-    seed_source = _string(task.get("task_id") or task.get("id")) or _string(correct)
-    random.Random(seed_source).shuffle(options)
-    return options
+    seed_source = _string(task.get("task_id") or task.get("id")) or _string(task.get("correct_answer"))
+    return [{"value": value, "latex": latex} for value, latex in order_choices(pairs, seed_source)]
 
 
 def can_render_as_choice(task: dict[str, Any]) -> bool:

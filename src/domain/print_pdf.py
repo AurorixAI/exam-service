@@ -1301,13 +1301,7 @@ def _choice_table(
         return None
     rows: list[list[Any]] = []
     for option in options:
-        is_correct = key and (
-            choice_option_identity(
-                str(option.get("value") or ""),
-                str(option.get("latex") or ""),
-            )
-            == choice_option_identity(correct_answer, correct_answer_latex)
-        )
+        is_correct = key and _is_key_option(option, correct_answer, correct_answer_latex)
         # A printed student sheet does not disclose correctness and does not
         # duplicate the answer-sheet circles. It uses only a clean letter.
         label = str(option.get("label", "?")).strip().rstrip(".")
@@ -1697,21 +1691,32 @@ def _draw_answer_sheet(doc: _PdfDocument, variant: dict[str, Any]) -> None:
             _draw_math_grid(doc, DEFAULT_OPEN_ANSWER_LINES, indent=0)
 
 
+def _is_key_option(option: dict[str, Any], correct_answer: str, correct_answer_latex: str = "") -> bool:
+    """True for the option that carries the key.
+
+    A package prepared by ``print_choice_options`` gives exactly one option
+    the key itself as its value, while showing it in the author's notation
+    (``\\dfrac{11}{50}`` for the key ``0.22``), so the value decides.  Older
+    packages stored the authored value instead and are matched by notation.
+    """
+    value = str(option.get("value") or "").strip()
+    correct = str(correct_answer or "").strip()
+    if correct and value == correct:
+        return True
+    correct_identity = choice_option_identity(correct, correct_answer_latex)
+    return bool(correct_identity) and choice_option_identity(
+        value, str(option.get("latex") or "")
+    ) == correct_identity
+
+
 def _teacher_choice_label(task: dict[str, Any]) -> str:
     """Return the fixed printed letter for a correct multiple-choice option."""
-    correct_identity = choice_option_identity(
-        str(task.get("correct_answer") or ""),
-        str(task.get("correct_answer_latex") or ""),
-    )
-    if not correct_identity:
-        return ""
     for option in task.get("options") or []:
-        if not isinstance(option, dict):
-            continue
-        if choice_option_identity(
-            str(option.get("value") or ""),
-            str(option.get("latex") or ""),
-        ) == correct_identity:
+        if isinstance(option, dict) and _is_key_option(
+            option,
+            str(task.get("correct_answer") or ""),
+            str(task.get("correct_answer_latex") or ""),
+        ):
             return str(option.get("label") or "").strip().rstrip(".")
     return ""
 

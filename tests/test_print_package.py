@@ -88,10 +88,13 @@ def test_print_choices_deduplicate_equivalent_latex_without_losing_the_correct_a
     options = print_choice_options(task)
     # The list is deterministically shuffled per task, so equality is checked
     # as a set: the invariant here is de-duplication, not the printed order.
-    assert sorted(option["value"] for option in options) == sorted([
+    # The merged option prints the author's notation and carries the key as
+    # its value, which is how the teacher key finds its letter.
+    assert sorted(option["latex"] for option in options) == sorted([
         r"$\dfrac{1}{3m + 1}$",
         "$1$",
     ])
+    assert [option["value"] for option in options].count(task["correct_answer"]) == 1
 
 
 def test_open_answer_uses_the_fixed_answer_sheet_without_changing_source_task() -> None:
