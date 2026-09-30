@@ -1210,25 +1210,18 @@ def _header(doc: _PdfDocument, snapshot: dict[str, Any], variant_number: int, *,
 
 
 def _task_text(task: dict[str, Any]) -> str:
-    text = (task.get("question_text") or "").strip()
+    # question_latex is the canonical statement (complete wording, audited to
+    # match question_text in meaning); question_text only backs up empty rows.
     latex = (task.get("question_latex") or "").strip()
-    readable_latex = _latex_to_print_text(latex)
-    # Backfill may place the whole mixed-language statement in a LaTeX field.
-    # In that case prefer the normalized verified representation rather than
-    # printing the entire condition twice. A short formula remains
-    # supplemental to the human-readable wording.
-    letter_count = len(re.findall(r"[А-Яа-яA-Za-z]", readable_latex))
-    # The letter count alone mistakes a formula for a statement: a fragment
-    # like ``y = ax^2 + bx + c, \quad a = 1, \quad \text{вершина } (2; -3)``
-    # clears twelve letters while carrying none of the instruction, so the
-    # printed paper lost its "Найдите"/"Решите" wording. A LaTeX field far
-    # shorter than the statement is supplemental, never a replacement for it.
-    is_fragment = bool(text) and len(latex) < len(text) * 0.6
-    if latex and text and letter_count >= 12 and not is_fragment:
-        return latex
-    if latex and readable_latex not in _latex_to_print_text(text):
-        return f"{text}\n{latex}".strip()
-    return text or latex
+    text = (task.get("question_text") or "").strip()
+    has_words = re.compile(r"[А-Яа-яЁё]")
+    if not latex or has_words.search(latex) or not has_words.search(text):
+        return latex or text
+    # A bare formula (older snapshots) carries none of the instruction
+    # wording, so the printed task keeps the statement from question_text.
+    if _latex_to_print_text(latex) in _latex_to_print_text(text):
+        return text
+    return f"{text}\n{latex}"
 
 
 def _draw_math_grid(

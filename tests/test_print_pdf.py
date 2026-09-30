@@ -28,6 +28,7 @@ from src.domain.print_pdf import (
     _mixed_inline_rows,
     _render_math_artifact,
     _split_print_parts,
+    _task_text,
     _styles,
     _task_badge_text_baseline,
     _teacher_choice_label,
@@ -361,3 +362,20 @@ def test_student_and_teacher_print_pdfs_are_valid_a4_documents() -> None:
     assert key_pdf.startswith(b"%PDF-")
     # A student paper and a teacher key have intentionally different content.
     assert student_pdf != key_pdf
+
+
+def test_question_latex_is_the_printed_statement() -> None:
+    task = {"question_text": "Решите уравнение x^2 = 9", "question_latex": "Решите уравнение $x^{2} = 9$"}
+    assert _task_text(task) == "Решите уравнение $x^{2} = 9$"
+
+
+def test_bare_formula_latex_keeps_the_instruction_wording() -> None:
+    """Older snapshots hold only the formula in question_latex; the printed task must still say what to do."""
+    task = {"question_text": "Вычислите значение выражения.", "question_latex": r"$\frac{3}{4} + \sqrt{2x^2} = \frac{5}{6}$"}
+    printed = _task_text(task)
+    assert printed.startswith("Вычислите значение выражения.")
+    assert r"\frac{3}{4}" in printed
+
+
+def test_empty_question_latex_falls_back_to_question_text() -> None:
+    assert _task_text({"question_text": "Найдите $x$.", "question_latex": ""}) == "Найдите $x$."
