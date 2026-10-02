@@ -92,6 +92,8 @@ jobs:
             # nginx caches upstream DNS; a recreated container gets a new IP
             docker compose -f algo-infrastructure/compose/docker-compose.staging.yml \
               -p algo-staging --env-file .env.staging restart nginx
+            # drop dangling images left by the rebuild (build cache is kept)
+            docker image prune -f >/dev/null 2>&1 || true
           "
 
       - name: Verify container is healthy
