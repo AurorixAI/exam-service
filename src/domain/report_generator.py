@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from src.domain.answer_utils import check_answer as _check_answer
 from src.domain.distractor_utils import resolve_analytics_explanation
+from src.domain.task_display import bind_report_task_statements, question_display_fields
 from src.domain.gemini_client import call_gemini, parse_json_response
 from src.models import ExamSession, GeneratedExam
 from src.repositories.exam_repo import ExamReportRepository
@@ -136,7 +137,6 @@ def _aggregate(
 
         task_meta = task_lookup.get(task_id, {})
         skill_name = task_meta.get("skill_name") or task_meta.get("toc_title") or "Задача"
-        full_q_text = (task_meta.get("question_text") or task_meta.get("question_latex") or "").strip()
         correct_answer = str(task_meta.get("correct_answer") or "").strip()
 
         hits = task_distractor_hits.get(task_id, {})
@@ -156,8 +156,7 @@ def _aggregate(
 
         task_analytics.append({
             "task_id": task_id,
-            "question_text": full_q_text,
-            "question_preview": full_q_text[:180],
+            **question_display_fields(task_meta),
             "correct_answer": correct_answer,
             "skill_name": skill_name,
             "attempts": total_attempts,
@@ -222,7 +221,7 @@ def _build_deepseek_prompt(
 
     tasks_details = []
     for idx, t in enumerate(all_tasks, 1):
-        q_text = t.get("question_text") or t.get("question_preview") or t.get("skill_name") or "Задача"
+        q_text = t.get("question_latex") or t.get("question_text") or t.get("question_preview") or t.get("skill_name") or "Задача"
         c_ans = t.get("correct_answer") or "Не указан"
         err_pct = round((1 - t["correct_rate"]) * 100)
         distractor_desc = ""
@@ -231,7 +230,7 @@ def _build_deepseek_prompt(
                 [f"«{d['explanation']}» ({d['count']} чел, {d['students_pct']}%)" for d in t["distractor_hits"][:3]]
             )
         tasks_details.append(
-            f'Задание {idx}. Тема: «{t["skill_name"]}»\n'
+            f'Задание {idx}. task_id: {t["task_id"]}. Тема: «{t["skill_name"]}»\n'
             f'  Условие: «{q_text}»\n'
             f'  Правильный ответ: «{c_ans}»\n'
             f'  Статистика: успешно решили {round(t["correct_rate"] * 100)}%, ошиблись {err_pct}% ({t["wrong_count"]} из {t["attempts"]} чел.){distractor_desc}'
@@ -276,6 +275,7 @@ def _build_deepseek_prompt(
   ],
   "problem_tasks_analysis": [
     {{
+      "task_id": "Точный task_id исходного задания из данных выше",
       "task_title": "Задание N: Точное название темы",
       "question_text": "Полный текст или математическое условие задачи с формулами в LaTeX",
       "correct_answer": "Правильный ответ",
@@ -441,8 +441,10 @@ def _build_deterministic_fallback(
         )
 
         problem_analysis.append({
+            "task_id": t["task_id"],
             "task_title": f"Задание {idx}: {skill}",
             "question_text": q_text,
+            "question_latex": t.get("question_latex") or "",
             "correct_answer": correct_ans,
             "error_rate_pct": err_pct,
             "misconception": misconception,
@@ -555,6 +557,7 @@ def generate_exam_report(
         grade = next((s.class_level for s in submitted if s.class_level), None)
         report_dict = _build_deterministic_fallback(exam.title, grade, agg)
 
+    report_dict = bind_report_task_statements(report_dict, agg["task_analytics"])
     narrative_json_str = json.dumps(report_dict, ensure_ascii=False)
 
     try:

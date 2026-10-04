@@ -7,7 +7,15 @@ name: Deploy
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, CEO]
+
+# CEO is the working branch: run verification, never deploy it implicitly.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   SERVER_HOST: 91.99.183.252
@@ -23,6 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify deployment guards without deploying
+        run: python3 .github/scripts/test_deploy_workflow_guards.py
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -37,6 +48,7 @@ jobs:
         run: pytest tests/ -q --tb=short
 
   deploy:
+    if: github.ref_name == 'main' || github.ref_name == 'develop'
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -72,29 +84,68 @@ jobs:
             } >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Pull + rebuild on server
+      - name: Build the exact tested Git revision on server
         run: |
           RELEASED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" "
-            set -e
-            cd ~/algo/${{ steps.t.outputs.srcdir }}
-            git fetch --quiet origin ${{ github.ref_name }}
-            git checkout --quiet ${{ github.ref_name }}
-            git reset --hard --quiet origin/${{ github.ref_name }}
-            cd ~/algo
-            export RELEASE_SHA='${{ github.sha }}'
-            export RELEASE_REF='${{ github.ref_name }}'
-            export RELEASED_AT='$RELEASED_AT'
-            docker compose -f ${{ steps.t.outputs.compose }} \
-              -p ${{ steps.t.outputs.project }} \
-              --env-file ${{ steps.t.outputs.envfile }} \
-              up -d --build $COMPOSE_SERVICE
-            # nginx caches upstream DNS; a recreated container gets a new IP
-            docker compose -f algo-infrastructure/compose/docker-compose.staging.yml \
-              -p algo-staging --env-file .env.staging restart nginx
-            # drop dangling images left by the rebuild (build cache is kept)
-            docker image prune -f >/dev/null 2>&1 || true
-          "
+          ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" bash -s -- \
+            "${{ steps.t.outputs.srcdir }}" "${{ steps.t.outputs.compose }}" \
+            "${{ steps.t.outputs.project }}" "${{ steps.t.outputs.envfile }}" \
+            "${{ steps.t.outputs.container }}" "${{ github.sha }}" \
+            "${{ github.ref_name }}" "${{ github.run_id }}-${{ github.run_attempt }}" \
+            "$RELEASED_AT" "$COMPOSE_SERVICE" <<'REMOTE'
+          set -euo pipefail
+          srcdir=$1; compose=$2; project=$3; envfile=$4; container=$5
+          sha=$6; ref=$7; run_id=$8; released_at=$9; service=${10}
+          root="$HOME/algo"
+          cd "$root/$srcdir"
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "Refusing deployment from a modified server checkout" >&2
+            exit 1
+          fi
+          git fetch --quiet origin "$ref"
+          git cat-file -e "$sha^{commit}"
+          git merge-base --is-ancestor "$sha" FETCH_HEAD
+          git checkout --detach --quiet "$sha"
+          test "$(git rev-parse HEAD)" = "$sha"
+          release_dir="$root/releases/git-$service-$sha-$run_id"
+          # A new context contains only committed files. Ignored env/cache files
+          # from the server checkout never enter COPY . . or the build context.
+          test ! -e "$release_dir"
+          mkdir -p "$release_dir/source"
+          git archive --format=tar "$sha" > "$release_dir/source.tar"
+          archive_sha=$(sha256sum "$release_dir/source.tar" | cut -d ' ' -f 1)
+          tar -xf "$release_dir/source.tar" -C "$release_dir/source"
+          previous_image=$(docker inspect --format '{{.Image}}' "$container")
+          rollback_tag="algolab-rollback-$project-$service:${sha:0:12}-$run_id"
+          docker image tag "$previous_image" "$rollback_tag"
+          python3 - "$release_dir" "$service" "$sha" "$ref" "$archive_sha" \
+            "$previous_image" "$rollback_tag" "$released_at" <<'PY_RELEASE'
+          import json, pathlib, sys
+          release, service, sha, ref, archive, previous, rollback, at = sys.argv[1:]
+          path = pathlib.Path(release)
+          build = {"context": str(path / "source"), "labels": {
+              "org.opencontainers.image.revision": sha,
+              "io.algolab.source.archive.sha256": archive,
+          }}
+          (path / "source.compose.json").write_text(json.dumps({"services": {service: {"build": build}}}))
+          (path / "release-record.json").write_text(json.dumps({
+              "service": service, "source_sha": sha, "source_ref": ref,
+              "source_archive_sha256": archive, "previous_image_id": previous,
+              "rollback_tag": rollback, "released_at": at,
+          }, indent=2) + "\n")
+          PY_RELEASE
+          cd "$root"
+          export RELEASE_SHA="$sha" RELEASE_REF="$ref" RELEASED_AT="$released_at"
+          docker compose -f "$compose" -f "$release_dir/source.compose.json" \
+            -p "$project" --env-file "$envfile" build "$service"
+          docker compose -f "$compose" -f "$release_dir/source.compose.json" \
+            -p "$project" --env-file "$envfile" \
+            up -d --no-build --no-deps "$service"
+          # Only this application changes; DB/Redis/dependencies stay running.
+          docker exec algo-staging-nginx nginx -t
+          docker exec algo-staging-nginx nginx -s reload
+          # Keep the tagged previous image for rollback. Never prune in deploy.
+          REMOTE
 
       - name: Verify container is healthy
         run: |
@@ -106,6 +157,10 @@ jobs:
               # a leading newline and never matches. Guard on .State.Health.
               STATUS=\$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \$C 2>/dev/null || echo missing)
               RUNNING=\$(docker inspect --format='{{.State.Running}}' \$C 2>/dev/null || echo false)
+              if [ \"\$RUNNING\" != true ]; then
+                echo \"\$C is not running\" >&2
+                exit 1
+              fi
               case \$STATUS in
                 healthy) echo \"\$C is healthy\"; exit 0 ;;
                 none)    [ \"\$RUNNING\" = true ] && { echo \"\$C is running (no healthcheck defined)\"; exit 0; } ;;
@@ -120,18 +175,25 @@ jobs:
       - name: Verify deployed revision
         run: |
           ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" "
+            set -euo pipefail
             C=${{ steps.t.outputs.container }}
             DEPLOYED_SHA=\$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \$C | sed -n 's/^RELEASE_SHA=//p')
             if [ \"\$DEPLOYED_SHA\" != \"${{ github.sha }}\" ]; then
               echo \"Expected ${{ github.sha }}, container reports \$DEPLOYED_SHA\" >&2
               exit 1
             fi
-            echo \"\$C runs release \$DEPLOYED_SHA\"
+            IMAGE_ID=\$(docker inspect --format '{{.Image}}' \"\$C\")
+            IMAGE_REVISION=\$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' \"\$IMAGE_ID\")
+            if [ \"\$IMAGE_REVISION\" != \"${{ github.sha }}\" ]; then
+              echo \"Expected image revision ${{ github.sha }}, running image reports \$IMAGE_REVISION\" >&2
+              exit 1
+            fi
+            echo \"\$C runs verified image \$IMAGE_ID at release \$DEPLOYED_SHA\"
           "
 
       - name: Export deployed release manifest
         run: |
-          METADATA="$(ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" "docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' ${{ steps.t.outputs.container }}")"
+          METADATA="$(ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" "docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' ${{ steps.t.outputs.container }} | sed -n -e '/^RELEASE_SHA=/p' -e '/^RELEASE_REF=/p' -e '/^RELEASED_AT=/p'")"
           IMAGE_ID="$(ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" "docker inspect --format '{{.Image}}' ${{ steps.t.outputs.container }}")"
           DEPLOYED_SHA="$(printf '%s\n' "$METADATA" | sed -n 's/^RELEASE_SHA=//p')"
           DEPLOYED_REF="$(printf '%s\n' "$METADATA" | sed -n 's/^RELEASE_REF=//p')"
@@ -148,10 +210,18 @@ jobs:
             "released_at=$DEPLOYED_AT" > release-manifest.txt
           sed 's/^/- /' release-manifest.txt >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Include source archive and rollback identity
+        run: |
+          ssh -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" \
+            "cat ~/algo/releases/git-$COMPOSE_SERVICE-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}/release-record.json" \
+            > release-record.json
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-manifest-${{ github.sha }}
-          path: release-manifest.txt
+          path: |
+            release-manifest.txt
+            release-record.json
           if-no-files-found: error
 
       - name: Verify site responds

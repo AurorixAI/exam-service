@@ -12,7 +12,7 @@ from src.api.router import AssignExamRequest
 from src.core.auth import ExamActor
 from src.models.exam_models import GeneratedExam
 
-from tests.conftest import TEST_ORG_ID, TEST_USER_ID
+from tests.conftest import TEST_GROUP_ID, TEST_ORG_ID, TEST_USER_ID
 
 
 def test_legacy_assignment_can_never_open_a_lobby_for_print_delivery(monkeypatch) -> None:
@@ -94,7 +94,7 @@ class TestCloneAndRenameLifecycle:
             org_id=TEST_ORG_ID,
             created_by=TEST_USER_ID,
             delivery_mode="print",
-            group_id="group-old",
+            group_id=TEST_GROUP_ID,
             group_name="Старая группа",
             scheduled_lesson_id="lesson-old",
             scheduled_lesson_date="2026-08-30",

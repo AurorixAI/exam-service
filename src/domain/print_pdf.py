@@ -1214,14 +1214,7 @@ def _task_text(task: dict[str, Any]) -> str:
     # match question_text in meaning); question_text only backs up empty rows.
     latex = (task.get("question_latex") or "").strip()
     text = (task.get("question_text") or "").strip()
-    has_words = re.compile(r"[А-Яа-яЁё]")
-    if not latex or has_words.search(latex) or not has_words.search(text):
-        return latex or text
-    # A bare formula (older snapshots) carries none of the instruction
-    # wording, so the printed task keeps the statement from question_text.
-    if _latex_to_print_text(latex) in _latex_to_print_text(text):
-        return text
-    return f"{text}\n{latex}"
+    return latex or text
 
 
 def _draw_math_grid(

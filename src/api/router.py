@@ -27,6 +27,8 @@ Endpoints:
 """
 from __future__ import annotations
 
+from src.domain.task_display import question_display_fields, report_display_projection
+
 import base64
 import hashlib
 import logging
@@ -4955,9 +4957,6 @@ async def get_exam_analytics(
             or task_meta.get("toc_title")
             or ""
         )
-        # Первые 120 символов вопроса — учитель сразу узнаёт задачу
-        question_preview = (task_meta.get("question_text") or "")[:120].strip()
-
         hits = task_distractor_hits.get(task_id, {})
         distractor_hits = sorted(
             [
@@ -4974,7 +4973,7 @@ async def get_exam_analytics(
 
         task_analytics.append({
             "task_id": task_id,
-            "question_preview": question_preview,
+            **question_display_fields(task_meta),
             "skill_name": skill_name,
             "attempts": total_attempts,
             "correct_count": correct,
@@ -5078,6 +5077,9 @@ async def generate_exam_report_endpoint(
     if report is None:
         raise HTTPException(422, "Нет сданных работ — отчёт не может быть сформирован")
 
+    task_analytics, narrative_ru = report_display_projection(
+        exam.variants or [], report.task_analytics or [], report.narrative_ru,
+    )
     return ExamReportResponse(
         exam_id=exam_id,
         title=exam.title,
@@ -5085,9 +5087,9 @@ async def generate_exam_report_endpoint(
         submitted_count=report.submitted_count,
         avg_score_pct=float(report.avg_score_pct or 0),
         pass_rate_pct=float(report.pass_rate_pct or 0),
-        task_analytics=report.task_analytics or [],
+        task_analytics=task_analytics,
         top_errors=report.top_errors or [],
-        narrative_ru=report.narrative_ru,
+        narrative_ru=narrative_ru,
         narrative_generated=report.narrative_generated or False,
         is_final=report.is_final or False,
         generated_at=report.generated_at.isoformat() if report.generated_at else None,
@@ -5117,6 +5119,9 @@ async def get_exam_report_endpoint(
             "Отчёт ещё не сгенерирован. Вызовите POST /exams/{exam_id}/report",
         )
 
+    task_analytics, narrative_ru = report_display_projection(
+        exam.variants or [], report.task_analytics or [], report.narrative_ru,
+    )
     return ExamReportResponse(
         exam_id=exam_id,
         title=exam.title,
@@ -5124,9 +5129,9 @@ async def get_exam_report_endpoint(
         submitted_count=report.submitted_count,
         avg_score_pct=float(report.avg_score_pct or 0),
         pass_rate_pct=float(report.pass_rate_pct or 0),
-        task_analytics=report.task_analytics or [],
+        task_analytics=task_analytics,
         top_errors=report.top_errors or [],
-        narrative_ru=report.narrative_ru,
+        narrative_ru=narrative_ru,
         narrative_generated=report.narrative_generated or False,
         is_final=report.is_final or False,
         generated_at=report.generated_at.isoformat() if report.generated_at else None,

@@ -182,10 +182,16 @@ async def require_exam_access(exam: object, actor: ExamActor) -> None:
         # Deliberately indistinguishable from a missing exam.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Экзамен не найден")
 
-    if actor.is_org_admin or getattr(exam, "created_by", None) == actor.user_id:
+    if actor.is_org_admin:
         return
 
     group_id = getattr(exam, "group_id", None)
-    if not group_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Нет доступа к этому экзамену")
-    await require_group_access(actor, str(group_id))
+    if group_id:
+        # A classroom run belongs to the current group scope. Its original
+        # author loses access immediately when the group is reassigned.
+        await require_group_access(actor, str(group_id))
+        return
+    # Unassigned library templates still belong to their author.
+    if getattr(exam, "created_by", None) == actor.user_id:
+        return
+    raise HTTPException(status.HTTP_403_FORBIDDEN, "Нет доступа к этому экзамену")
