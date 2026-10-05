@@ -11,6 +11,7 @@ Retry policy (tenacity):
 from __future__ import annotations
 
 import logging
+from urllib.parse import quote
 
 import httpx
 from tenacity import (
@@ -54,6 +55,11 @@ def get_client() -> httpx.Client:
 def get(path: str, **kwargs) -> httpx.Response:
     """GET with automatic retry on transient network errors."""
     return get_client().get(path, **kwargs)
+
+
+def get_task(task_id: str) -> httpx.Response:
+    """Fetch an opaque bank ID as one URL path segment, including '?' and '%'."""
+    return get("/api/v1/content/tasks/" + quote(task_id, safe=""))
 
 
 @retry(

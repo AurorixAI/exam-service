@@ -62,7 +62,7 @@ class TaskRepository:
         return [_normalize_task(t) for t in resp.json()]
 
     def get_task_by_id(self, task_id: str) -> Optional[dict]:
-        resp = content_client.get(f"{BASE}/tasks/{task_id}")
+        resp = content_client.get_task(task_id)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
