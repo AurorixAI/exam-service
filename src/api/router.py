@@ -2433,7 +2433,6 @@ async def get_live_exam_dashboard_summary(
         group_id = str(exam.group_id) if exam.group_id else None
         needs_group_lookup = bool(
             not actor.is_org_admin
-            and exam.created_by != actor.user_id
             and group_id
         )
         if needs_group_lookup and group_id in group_access:

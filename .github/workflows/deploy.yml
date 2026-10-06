@@ -144,7 +144,8 @@ jobs:
           # Only this application changes; DB/Redis/dependencies stay running.
           docker exec algo-staging-nginx nginx -t
           docker exec algo-staging-nginx nginx -s reload
-          # Keep the tagged previous image for rollback. Never prune in deploy.
+          # Keep the tagged previous image for rollback; dangling images are
+          # pruned only after the release is verified (see Verify deployed revision).
           REMOTE
 
       - name: Verify container is healthy
@@ -189,6 +190,9 @@ jobs:
               exit 1
             fi
             echo \"\$C runs verified image \$IMAGE_ID at release \$DEPLOYED_SHA\"
+            # Release verified: drop dangling images only. Tagged rollback images
+            # are still referenced by a tag, so `image prune -f` never removes them.
+            docker image prune -f >/dev/null 2>&1 || true
           "
 
       - name: Export deployed release manifest
