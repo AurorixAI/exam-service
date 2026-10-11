@@ -279,9 +279,11 @@ class TaskResultItem(BaseModel):
     text: str
     question_latex: Optional[str] = None
     student_answer: Optional[str]
-    correct_answer: str
+    # Key-revealing fields are None while the exam is still running for
+    # classmates (see get_results / answer_key_available).
+    correct_answer: Optional[str] = None
     correct_answer_latex: Optional[str] = None
-    is_correct: bool
+    is_correct: Optional[bool] = None
     options: List[str] = []
     skill_name: str = ""
     distractor_hit: Optional[DistractorHit] = None
@@ -300,6 +302,10 @@ class SessionResultResponse(BaseModel):
     percentage: float
     time_spent_seconds: int
     submitted_at: Optional[datetime]
+    # False until the whole exam is over: the key, per-task verdicts and
+    # explanations are withheld so an early finisher cannot leak them.
+    answer_key_available: bool = False
+    message: Optional[str] = None
     tasks: List[TaskResultItem] = []
 
 
@@ -4486,6 +4492,12 @@ async def get_results(
         raise HTTPException(400, "Экзамен ещё не сдан")
 
     exam = ExamRepository(db).get_by_id(session.exam_id)
+    # The answer key may be shown only when the exam is over for everyone:
+    # closed by the teacher or by the common timer (which finalizes all
+    # sessions) or archived. A single submitted session is not enough.
+    key_visible = bool(
+        exam and (_check_and_auto_close_exam(db, exam) or exam.status in {"closed", "archived"})
+    )
     variants = (exam.variants or []) if exam else []
     variant = next(
         (v for v in variants if v.get("variant_number") == session.variant_number),
@@ -4499,12 +4511,22 @@ async def get_results(
         task_id = t.get("task_id", "")
         correct_answer = t.get("correct_answer", "")
         student_answer = (session.answers or {}).get(task_id)
-        is_correct = _check_answer(student_answer or "", correct_answer)
         options = (
             _build_session_mc_options(exam, session, t)
             if exam and _should_show_mc(t, (exam.settings or {}).get("mc_mode", "auto"))
             else []
         )
+        if not key_visible:
+            task_items.append(TaskResultItem(
+                task_id=task_id,
+                text=t.get("question_text", ""),
+                question_latex=t.get("question_latex"),
+                student_answer=student_answer,
+                options=options,
+                skill_name=t.get("skill_name", ""),
+            ))
+            continue
+        is_correct = _check_answer(student_answer or "", correct_answer)
         d_hit = dist_analytics.get(task_id)
         hit_explanation = ""
         if d_hit:
@@ -4545,6 +4567,8 @@ async def get_results(
         percentage=round(session.score / max_score * 100, 1) if max_score else 0.0,
         time_spent_seconds=session.time_spent_seconds,
         submitted_at=session.submitted_at,
+        answer_key_available=key_visible,
+        message=None if key_visible else "Разбор заданий будет доступен после завершения экзамена",
         tasks=task_items,
     )
 

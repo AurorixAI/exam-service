@@ -388,6 +388,9 @@ class TestGetResults:
         client.post(f"/api/v1/exam-sessions/{session.id}/submit", json={
             "answers": {"TASK_001": "10", "TASK_002": "99"},
         })
+        # The key is revealed only once the whole exam is over.
+        exam.status = "closed"
+        db.commit()
         # Now get results
         resp = client.get(f"/api/v1/exam-sessions/{session.id}/results")
         assert resp.status_code == 200
@@ -410,11 +413,56 @@ class TestGetResults:
         client.post(f"/api/v1/exam-sessions/{session.id}/submit", json={
             "answers": {"TASK_001": "99"},
         })
+        exam.status = "closed"
+        db.commit()
         resp = client.get(f"/api/v1/exam-sessions/{session.id}/results")
-        task_result = resp.json()["tasks"][0]
+        data = resp.json()
+        assert data["answer_key_available"] is True
+        task_result = data["tasks"][0]
         assert task_result["correct_answer"] == "42"
         assert task_result["student_answer"] == "99"
         assert task_result["is_correct"] is False
+
+    def test_results_hide_key_while_exam_running(self, client, db):
+        """A student who submitted early must not see the key while classmates write."""
+        task = make_task("TASK_001", answer="42")
+        task["correct_answer_latex"] = "42_latex"
+        task["distractor_meta"] = [{"value": "99", "error_type": "x", "explanation": "SECRET_EXPL"}]
+        exam = make_exam_in_db(db, tasks=[task])
+        session = make_session_in_db(db, exam)
+        client.post(f"/api/v1/exam-sessions/{session.id}/submit", json={
+            "answers": {"TASK_001": "99"},
+        })
+        assert exam.status == "active"
+        resp = client.get(f"/api/v1/exam-sessions/{session.id}/results")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["answer_key_available"] is False
+        assert data["message"]
+        item = data["tasks"][0]
+        assert item["student_answer"] == "99"
+        assert item["correct_answer"] is None
+        assert item["correct_answer_latex"] is None
+        assert item["is_correct"] is None
+        assert item["distractor_hit"] is None
+        assert "SECRET_EXPL" not in resp.text and "42_latex" not in resp.text
+
+    def test_results_key_shown_after_teacher_closes_exam(self, client, db):
+        exam = make_exam_in_db(db, tasks=[make_task("TASK_001", answer="42")])
+        session = make_session_in_db(db, exam)
+        client.post(f"/api/v1/exam-sessions/{session.id}/submit", json={"answers": {"TASK_001": "1"}})
+        assert client.get(f"/api/v1/exam-sessions/{session.id}/results").json()["answer_key_available"] is False
+        assert client.post(f"/api/v1/exams/{exam.id}/close").status_code == 200
+        data = client.get(f"/api/v1/exam-sessions/{session.id}/results").json()
+        assert data["answer_key_available"] is True
+        assert data["tasks"][0]["correct_answer"] == "42"
+        assert data["tasks"][0]["is_correct"] is False
+
+    def test_teacher_draft_still_shows_key_while_running(self, client, db):
+        exam = make_exam_in_db(db, tasks=[make_task("TASK_001", answer="42")])
+        resp = client.get(f"/api/v1/exams/{exam.id}/draft")
+        assert resp.status_code == 200
+        assert "42" in resp.text
 
     def test_results_before_submit_returns_400(self, client, db):
         exam = make_exam_in_db(db)
@@ -537,18 +585,25 @@ class TestFullStudentJourney:
         assert sub_data["correct_count"] == 3
         assert sub_data["percentage"] == 100.0
 
-        # 7. Student views results
+        # 7. Student views results: key is hidden while the exam is running
         res = client.get(f"/api/v1/exam-sessions/{session_id}/results", headers=headers)
         assert res.status_code == 200
         res_data = res.json()
         assert res_data["student_name"] == "Болат Ахметов"
         assert res_data["correct_count"] == 3
-        assert all(t["is_correct"] for t in res_data["tasks"])
+        assert res_data["answer_key_available"] is False
+        assert all(t["correct_answer"] is None for t in res_data["tasks"])
 
         # 7. Teacher closes
         close = client.post(f"/api/v1/exams/{exam_id}/close")
         assert close.status_code == 200
         assert close.json()["status"] == "closed"
+
+        # 7b. After the exam ends the full review is available
+        res = client.get(f"/api/v1/exam-sessions/{session_id}/results", headers=headers)
+        res_data = res.json()
+        assert res_data["answer_key_available"] is True
+        assert all(t["is_correct"] for t in res_data["tasks"])
 
         # 8. Student can no longer start after close
         start_after_close = client.post(f"/api/v1/exams/by-code/{code}/start", json={
