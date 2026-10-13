@@ -68,7 +68,8 @@ from src.core.exceptions import (
 from src.models import ExamLifecycleEvent, ExamPrintPackage, ExamReport, GeneratedExam, ExamSession
 from src.repositories.task_repo import TaskRepository, TextbookRepository
 from src.repositories.exam_repo import ExamRepository, SessionRepository, ExamReportRepository
-from src.domain.choice_options import choice_pairs, ordered as order_choices
+from src.domain.choice_options import ordered as order_choices
+from src.domain.grading import check_task_answer, mc_choices, should_show_mc
 from src.domain.print_package import (
     PrintLayoutValidationError,
     build_default_print_layout,
@@ -1314,10 +1315,7 @@ def _difficulty_counts(tasks_count: int, dist: Dict[str, float]) -> Dict[str, in
 
 
 def _should_show_mc(task: dict, mc_mode: str = "auto") -> bool:
-    if mc_mode == "all_open":
-        return False
-    has_options = bool(task.get("answer_options") or task.get("distractor_meta"))
-    return has_options
+    return should_show_mc(task, mc_mode)
 
 
 
@@ -1343,12 +1341,7 @@ def _build_mc_options(
 
 def _mc_choices(task: dict) -> List[tuple[str, str]]:
     """(value, display) choices; the key once, graded by this service's grader."""
-    correct = str(task.get("correct_answer") or "")
-    return choice_pairs(
-        task,
-        graded_as_key=lambda value: _check_answer(value, correct),
-        max_distractors=3,
-    )
+    return mc_choices(task)
 
 
 def _build_session_mc_options(exam: GeneratedExam, session: ExamSession, task: dict) -> List[str]:
@@ -1850,10 +1843,11 @@ def _grade_and_submit_session(
 
     correct_count = 0
     distractor_analytics: dict = {}
+    mc_mode = (exam.settings or {}).get("mc_mode", "auto")
     for t in tasks_raw:
         task_id = t.get("task_id", "")
         student_ans = answers.get(task_id, "")
-        is_correct = _check_answer(student_ans, t.get("correct_answer", ""))
+        is_correct = check_task_answer(t, student_ans, mc_mode)
         if is_correct:
             correct_count += 1
         else:
@@ -4506,6 +4500,7 @@ async def get_results(
     tasks_raw = variant.get("tasks", []) if variant else []
 
     dist_analytics = session.distractor_analytics or {}
+    results_mc_mode = (exam.settings or {}).get("mc_mode", "auto") if exam else "auto"
     task_items = []
     for t in tasks_raw:
         task_id = t.get("task_id", "")
@@ -4526,7 +4521,7 @@ async def get_results(
                 skill_name=t.get("skill_name", ""),
             ))
             continue
-        is_correct = _check_answer(student_answer or "", correct_answer)
+        is_correct = check_task_answer(t, student_answer or "", results_mc_mode)
         d_hit = dist_analytics.get(task_id)
         hit_explanation = ""
         if d_hit:
@@ -4930,13 +4925,13 @@ async def get_exam_analytics(
 
     # {task_id: {explanation_key: {explanation, error_type, count}}}
     task_distractor_hits: Dict[str, Dict[str, dict]] = {}
+    mc_mode = (exam.settings or {}).get("mc_mode", "auto")
 
     for s in submitted:
         for task_id, student_ans in (s.answers or {}).items():
             task = task_lookup.get(task_id, {})
-            correct_ans = task.get("correct_answer", "")
             task_total[task_id] = task_total.get(task_id, 0) + 1
-            if _check_answer(student_ans, correct_ans):
+            if check_task_answer(task, student_ans, mc_mode):
                 task_correct[task_id] = task_correct.get(task_id, 0) + 1
 
         # Агрегируем дистрактор-попадания

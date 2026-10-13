@@ -4,9 +4,10 @@ Mirrors diagnostic-service ``src/domain/answer_value.py`` (the services share
 no package): both must agree on which stored options are one answer written
 twice, or a task would be served differently in a diagnostic and an exam.
 
-Nothing here is used to grade a typed answer. It only decides which stored
-options a student could not tell apart, so it is deliberately strict: when in
-doubt two answers count as different.
+It decides which stored options a student could not tell apart, and is the
+base of ``answer_utils.check_open_answer`` (typed answers, see there for the
+rules added on top).  It is deliberately strict: when in doubt two answers
+count as different.  Keep it a mirror of the diagnostic file.
 """
 from __future__ import annotations
 
