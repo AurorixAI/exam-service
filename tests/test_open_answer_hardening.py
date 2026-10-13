@@ -304,6 +304,32 @@ def test_a_marker_of_another_grader_version_is_regraded(client, db):
     assert client.get(f"/api/v1/exam-sessions/{session.id}/results").json()["tasks"][0]["is_correct"] is True
 
 
+@pytest.mark.parametrize("junk", [None, [], ["T1"], [{"hit": True}], "garbage", "", 0, 7])
+def test_a_legacy_column_that_is_not_a_dict_is_stale_without_hits_not_an_error(client, db, junk):
+    exam = _exam(db, [_task()])
+    session = _legacy_session(db, exam, {"T1": "1/2"}, hits=None)
+    session.distractor_analytics = junk
+    db.commit()
+    assert grading.regrade_if_stale(session, exam) is True
+    assert session.distractor_analytics == {GRADING_KEY: {"v": GRADER_VERSION, "verdicts": {"T1": True}}}
+    assert (session.score, session.correct_count) == (10, 1)
+    assert grading.regrade_if_stale(session, exam) is False             # once
+
+
+@pytest.mark.parametrize("junk", [None, ["x"], "garbage"])
+def test_results_and_analytics_survive_a_junk_column(client, db, junk):
+    exam = _exam(db, [_task()])
+    session = _legacy_session(db, exam, {"T1": "1/2"})
+    session.distractor_analytics = junk
+    db.commit()
+    client.post(f"/api/v1/exams/{exam.id}/close")
+    results = client.get(f"/api/v1/exam-sessions/{session.id}/results")
+    assert results.status_code == 200 and results.json()["tasks"][0]["is_correct"] is True
+    assert client.get(f"/api/v1/exams/{exam.id}/analytics").status_code == 200
+    db.refresh(session)
+    assert _aggregate(exam, [session])["avg_score_pct"] == 100.0
+
+
 def test_report_aggregate_uses_the_regraded_score_of_a_legacy_session(db):
     exam = _exam(db, [_task()])
     session = _legacy_session(db, exam, {"T1": "1/2"})

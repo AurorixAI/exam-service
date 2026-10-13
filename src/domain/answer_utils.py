@@ -55,7 +55,8 @@ def check_answer(student: str, correct: str) -> bool:
 #      Deliberately NOT merged: "нет действительных корней" (over the complex numbers there are roots), and
 #      "0" / "0 корней" (a count, not a set).
 #   5. A typed answer longer than MAX_OPEN_ANSWER_CHARS is wrong without being parsed (a number, a short
-#      expression or a few words are shorter; the 96 bank keys longer than that are texts of proofs).
+#      expression or a few words are shorter).  In the bank 96 raw keys are longer than that, 78 once the `$` are
+#      removed (the length that is compared); they are texts of proofs, nobody types them.
 # Everything else is compared as written: when in doubt two answers are different.
 # Known limits (owner decisions pending): letter case is ignored (F = f, as in the diagnostic), and a task that asks
 # for a particular form ("запишите в виде смешанного числа") accepts any equal value in lowest terms (7/2 for 3 1/2).

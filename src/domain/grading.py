@@ -125,9 +125,11 @@ def regrade_if_stale(session: Any, exam: Any) -> bool:
         return False
     mc_mode = (exam.settings or {}).get("mc_mode", "auto")
     verdicts = grade_session_tasks(session_tasks(exam, session), session.answers or {}, mc_mode)
+    # Old rows may hold anything in this column (NULL, a list, a string): that is "stale, no hits", not an error.
+    old_hits = session.distractor_analytics if isinstance(session.distractor_analytics, dict) else {}
     hits = {
         task_id: hit
-        for task_id, hit in (session.distractor_analytics or {}).items()
+        for task_id, hit in old_hits.items()
         if task_id != GRADING_KEY and not verdicts.get(task_id)
     }
     correct = sum(verdicts.values())
