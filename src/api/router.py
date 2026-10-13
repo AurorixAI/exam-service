@@ -38,7 +38,7 @@ import secrets
 import string
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -69,7 +69,16 @@ from src.models import ExamLifecycleEvent, ExamPrintPackage, ExamReport, Generat
 from src.repositories.task_repo import TaskRepository, TextbookRepository
 from src.repositories.exam_repo import ExamRepository, SessionRepository, ExamReportRepository
 from src.domain.choice_options import ordered as order_choices
-from src.domain.grading import check_task_answer, mc_choices, should_show_mc
+from src.domain.grading import (
+    check_task_answer,
+    grade_session_tasks,
+    mc_choices,
+    regrade_if_stale,
+    session_tasks,
+    should_show_mc,
+    stored_verdicts,
+    with_grading,
+)
 from src.domain.print_package import (
     PrintLayoutValidationError,
     build_default_print_layout,
@@ -249,13 +258,22 @@ class StartExamResponse(BaseModel):
     session_token: Optional[str] = None
 
 
+# A typed answer is a number, an expression or a few words.  The request bounds what is stored (and later graded in
+# one transaction for the whole class): a longer value is a 422, not a row.  Task ids are checked against the exam
+# by ``_validate_answer_keys``; their length and count are bounded here too.
+MAX_ANSWER_CHARS = 1000
+MAX_ANSWERS_PER_REQUEST = 200
+AnswerText = Annotated[str, Field(max_length=MAX_ANSWER_CHARS)]
+AnswerTaskId = Annotated[str, Field(max_length=100)]
+
+
 class SaveProgressRequest(BaseModel):
-    answers: Dict[str, str] = Field(default_factory=dict)
+    answers: Dict[AnswerTaskId, AnswerText] = Field(default_factory=dict, max_length=MAX_ANSWERS_PER_REQUEST)
     time_spent_seconds: Optional[int] = None
 
 
 class SubmitExamRequest(BaseModel):
-    answers: Dict[str, str]       # {task_id: answer_string}
+    answers: Dict[AnswerTaskId, AnswerText] = Field(max_length=MAX_ANSWERS_PER_REQUEST)  # {task_id: answer_string}
     time_spent_seconds: int = 0
 
 
@@ -1834,26 +1852,23 @@ def _grade_and_submit_session(
     commit: bool = True,
 ) -> dict:
     """Helper to grade answers, compute distractor analytics, and record submission."""
-    variants = exam.variants or []
-    variant = next(
-        (v for v in variants if v.get("variant_number") == session.variant_number),
-        variants[0] if variants else None,
-    )
-    tasks_raw = variant.get("tasks", []) if variant else []
-
-    correct_count = 0
-    distractor_analytics: dict = {}
+    tasks_raw = session_tasks(exam, session)
     mc_mode = (exam.settings or {}).get("mc_mode", "auto")
+    # One verdict per task, stored with the session: results, analytics and the report show these, not a regrade.
+    verdicts = grade_session_tasks(tasks_raw, answers, mc_mode)
+    correct_count = sum(verdicts.values())
+    distractor_analytics: dict = {}
     for t in tasks_raw:
         task_id = t.get("task_id", "")
-        student_ans = answers.get(task_id, "")
-        is_correct = check_task_answer(t, student_ans, mc_mode)
-        if is_correct:
-            correct_count += 1
-        else:
-            hit = _match_distractor(student_ans, t.get("distractor_meta") or [])
-            if hit:
-                distractor_analytics[task_id] = build_analytics_hit(hit)
+        if verdicts.get(task_id):
+            continue
+        try:
+            hit = _match_distractor(answers.get(task_id, ""), t.get("distractor_meta") or [])
+        except Exception as exc:  # noqa: BLE001 - a hit is analytics, it must never stop a submit
+            log.warning("distractor match failed for task %s: %s", task_id, type(exc).__name__)
+            hit = None
+        if hit:
+            distractor_analytics[task_id] = build_analytics_hit(hit)
 
     total_tasks = len(tasks_raw)
     score = correct_count * 10
@@ -1867,7 +1882,7 @@ def _grade_and_submit_session(
         correct_count,
         total_tasks,
         time_spent_seconds,
-        distractor_analytics=distractor_analytics or None,
+        distractor_analytics=with_grading(distractor_analytics, verdicts),
         commit=commit,
     )
     return {
@@ -4492,13 +4507,14 @@ async def get_results(
     key_visible = bool(
         exam and (_check_and_auto_close_exam(db, exam) or exam.status in {"closed", "archived"})
     )
-    variants = (exam.variants or []) if exam else []
-    variant = next(
-        (v for v in variants if v.get("variant_number") == session.variant_number),
-        variants[0] if variants else None,
-    )
-    tasks_raw = variant.get("tasks", []) if variant else []
+    tasks_raw = session_tasks(exam, session)
 
+    # The verdicts shown and the score shown come from one grading: the one stored at submit, or - for a session
+    # submitted before verdicts were stored - one regrade that also rewrites its score (see grading.regrade_if_stale).
+    if regrade_if_stale(session, exam):
+        db.commit()
+        db.refresh(session)
+    verdicts = stored_verdicts(session.distractor_analytics) or {}
     dist_analytics = session.distractor_analytics or {}
     results_mc_mode = (exam.settings or {}).get("mc_mode", "auto") if exam else "auto"
     task_items = []
@@ -4521,7 +4537,7 @@ async def get_results(
                 skill_name=t.get("skill_name", ""),
             ))
             continue
-        is_correct = check_task_answer(t, student_answer or "", results_mc_mode)
+        is_correct = verdicts[task_id] if task_id in verdicts else check_task_answer(t, student_answer or "", results_mc_mode)
         d_hit = dist_analytics.get(task_id)
         hit_explanation = ""
         if d_hit:
@@ -4888,6 +4904,9 @@ async def get_exam_analytics(
     total = len(sessions)
     submitted = [s for s in sessions if s.status == "submitted"]
     n_submitted = len(submitted)
+    # Scores and per-task correctness below must come from one grading (see grading.regrade_if_stale).
+    if any([regrade_if_stale(s, exam) for s in submitted]):
+        db.commit()
 
     if n_submitted == 0:
         return ExamAnalyticsResponse(
@@ -4928,10 +4947,11 @@ async def get_exam_analytics(
     mc_mode = (exam.settings or {}).get("mc_mode", "auto")
 
     for s in submitted:
+        verdicts = stored_verdicts(s.distractor_analytics) or {}
         for task_id, student_ans in (s.answers or {}).items():
             task = task_lookup.get(task_id, {})
             task_total[task_id] = task_total.get(task_id, 0) + 1
-            if check_task_answer(task, student_ans, mc_mode):
+            if verdicts[task_id] if task_id in verdicts else check_task_answer(task, student_ans, mc_mode):
                 task_correct[task_id] = task_correct.get(task_id, 0) + 1
 
         # Агрегируем дистрактор-попадания

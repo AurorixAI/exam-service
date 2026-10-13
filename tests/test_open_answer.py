@@ -247,7 +247,7 @@ def test_sample_keys_typed_without_dollar_are_accepted_and_distractors_are_not()
     assert stats["self_failures"] == []
     # before: the old grader accepted almost none of these keys typed without `$`
     assert stats["self_typed_ok_legacy"] < stats["tasks"] // 2
-    assert stats["self_typed_ok_open"] == stats["tasks"]
+    assert stats["self_typed_ok_open"] == stats["tasks"] - stats["keys_over_length_limit"]
     assert {violation[0] for violation in stats["violations"]} <= set(BANK_DEFECTS)
 
 

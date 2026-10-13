@@ -1,7 +1,7 @@
 """Regression of the typed-answer grader against task banks (used by the test-suite and by the CLI script).
 
 For every task:
-  * the key typed without any ``$`` must be accepted;
+  * the key typed without any ``$`` must be accepted (keys longer than the typed-answer limit are counted apart);
   * no stored distractor of the same task, typed as stored or without ``$``, may be accepted as the key.
 ``BANK_DEFECTS`` are tasks whose distractor genuinely IS the key (checked by hand, see the notes); they are reported
 for the content team and are the only tolerated violations.
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from src.domain.answer_utils import check_answer, check_open_answer
+from src.domain.answer_utils import MAX_OPEN_ANSWER_CHARS, check_answer, check_open_answer
 
 BANK_DEFECTS = {
     # distractor `+∞` is the key `+\infty` written in Unicode
@@ -32,6 +32,7 @@ def distractor_values(row: dict) -> list[str]:
 def regression(rows: Iterable[dict]) -> dict:
     stats = {
         "tasks": 0,
+        "keys_over_length_limit": 0,
         "keys_with_dollar": 0,
         "self_typed_ok_legacy": 0,
         "self_typed_ok_open": 0,
@@ -42,19 +43,23 @@ def regression(rows: Iterable[dict]) -> dict:
     }
     for row in rows:
         key = str(row["correct_answer"])
+        task_id = row.get("id") or row.get("task_id")
         typed = key.replace("$", "").strip()
         distractors = distractor_values(row)
         stats["tasks"] += 1
+        if len(typed) > MAX_OPEN_ANSWER_CHARS:      # texts of proofs: not a typed answer, never graded by value
+            stats["keys_over_length_limit"] += 1
+            continue
         stats["keys_with_dollar"] += "$" in key
         stats["self_typed_ok_legacy"] += check_answer(typed, key)
         if check_open_answer(typed, key):
             stats["self_typed_ok_open"] += 1
         else:
-            stats["self_failures"].append((row["id"], key))
+            stats["self_failures"].append((task_id, key))
         if any(check_answer(d.replace("$", "").strip(), key) or check_answer(d, key) for d in distractors):
             stats["tasks_with_distractor_accepted_legacy"] += 1
         bad = [d for d in distractors if check_open_answer(d.replace("$", "").strip(), key) or check_open_answer(d, key)]
         if bad:
             stats["tasks_with_distractor_accepted_open"] += 1
-            stats["violations"].append((row["id"], key, bad))
+            stats["violations"].append((task_id, key, bad))
     return stats

@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from math import gcd
 
-from src.domain.answer_value import _notation_key, answers_equivalent
+from src.domain.answer_value import _MAX_NUMBER_CHARS, _THIN_SPACE_RE, _notation_key, answers_equivalent
 
 
 def normalise_answer(answer: str) -> str:
@@ -54,11 +54,16 @@ def check_answer(student: str, correct: str) -> bool:
 #      `x ∈ ∅`).  Only a WHOLE answer is read this way: "нет корней при a<0" is not the empty set.
 #      Deliberately NOT merged: "нет действительных корней" (over the complex numbers there are roots), and
 #      "0" / "0 корней" (a count, not a set).
+#   5. A typed answer longer than MAX_OPEN_ANSWER_CHARS is wrong without being parsed (a number, a short
+#      expression or a few words are shorter; the 96 bank keys longer than that are texts of proofs).
 # Everything else is compared as written: when in doubt two answers are different.
+# Known limits (owner decisions pending): letter case is ignored (F = f, as in the diagnostic), and a task that asks
+# for a particular form ("запишите в виде смешанного числа") accepts any equal value in lowest terms (7/2 for 3 1/2).
+MAX_OPEN_ANSWER_CHARS = 300
 _SINGLE_TOKEN_BRACES_RE = re.compile(r"([\^_])\{\s*([^\W_])\s*\}")
 _FRACTION_FORM_RES = (
-    # latex: [-][whole]\frac{num}{den}
-    re.compile(r"-?\s*(\d+)?\s*\\frac\{\s*(-?\d+)\s*\}\{\s*(\d+)\s*\}"),
+    # latex: [-][whole]\frac{num}{den}   (`\s*(?:(\d+)\s*)?` - one `\s*` per gap, so it is linear)
+    re.compile(r"-?\s*(?:(\d+)\s*)?\\frac\{\s*(-?\d+)\s*\}\{\s*(\d+)\s*\}"),
     # plain mixed number: [-]whole num/den
     re.compile(r"-?(\d+)\s+(-?\d+)\s*/\s*(\d+)"),
     # plain fraction: num/den (no whole part)
@@ -88,8 +93,13 @@ def _is_empty_set(value: str) -> bool:
 
 def _fraction_shape(value: str):
     """(whole, numerator, denominator) exactly as written, or None if the text is not a fraction / mixed number."""
+    # The same normalisation as `answer_value.exact_number`: whatever it reads as a fraction must be seen here too
+    # (`4/10\,`, `4/10\quad` and `42/10\;` are the fraction 4/10, not something to be graded by value for free).
     text = value.replace("$", "").replace("{,}", ",").replace("−", "-")
-    text = text.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac").strip()
+    text = text.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
+    text = _THIN_SPACE_RE.sub(" ", text).strip()
+    if len(text) > _MAX_NUMBER_CHARS:
+        return None
     for pattern in _FRACTION_FORM_RES:
         match = pattern.fullmatch(text)
         if match:
@@ -110,10 +120,21 @@ def _value_match_allowed(typed: str, key: str) -> bool:
 
 
 def check_open_answer(student: str, correct: str) -> bool:
-    """True only when a typed answer provably says the same as the stored key."""
+    """True only when a typed answer provably says the same as the stored key.
+
+    Never raises: an answer longer than ``MAX_OPEN_ANSWER_CHARS`` is wrong without being parsed, and any parser
+    failure (``int`` of a number with > 4300 digits is a ValueError since Python 3.11) means "not proven" = wrong.
+    """
     typed, key = str(student or ""), str(correct or "")
-    if not typed.strip() or not key.strip():
+    if not typed.strip() or not key.strip() or len(typed) > MAX_OPEN_ANSWER_CHARS:
         return False
+    try:
+        return _open_answer_matches(typed, key)
+    except (ValueError, OverflowError, RecursionError):
+        return False
+
+
+def _open_answer_matches(typed: str, key: str) -> bool:
     if _is_empty_set(typed) and _is_empty_set(key):
         return True
     typed = _SINGLE_TOKEN_BRACES_RE.sub(r"\1\2", typed)
