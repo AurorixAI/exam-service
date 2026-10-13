@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from src.domain.answer_utils import check_answer as _check_answer
+from src.domain.grading import check_task_answer, regrade_if_stale, stored_verdicts
 from src.domain.distractor_utils import resolve_analytics_explanation
 from src.domain.task_display import bind_report_task_statements, question_display_fields
 from src.domain.gemini_client import call_gemini, parse_json_response
@@ -42,6 +42,9 @@ def _aggregate(
 ) -> Dict[str, Any]:
     submitted = [s for s in sessions if s.status == "submitted"]
     n = len(submitted)
+    # Scores and per-task correctness below must come from one grading (see grading.regrade_if_stale).
+    for s in submitted:
+        regrade_if_stale(s, exam)
 
     if n == 0:
         return {
@@ -78,8 +81,10 @@ def _aggregate(
     task_total: Dict[str, int] = {}
     task_distractor_hits: Dict[str, Dict[str, dict]] = {}
     task_student_answers: Dict[str, List[str]] = {}
+    mc_mode = (exam.settings or {}).get("mc_mode", "auto")
 
     for s in submitted:
+        verdicts = stored_verdicts(s.distractor_analytics) or {}
         # Get all tasks that were in this student's variant
         v_tasks = variant_lookup.get(s.variant_number, [])
         if not v_tasks and exam.variants:
@@ -90,23 +95,21 @@ def _aggregate(
         for t in v_tasks:
             task_id = t["task_id"]
             seen_task_ids.add(task_id)
-            correct_ans = t.get("correct_answer", "")
             student_ans = (s.answers or {}).get(task_id, "")
             task_total[task_id] = task_total.get(task_id, 0) + 1
             if str(student_ans).strip():
                 task_student_answers.setdefault(task_id, []).append(str(student_ans).strip())
-            if student_ans and _check_answer(student_ans, correct_ans):
+            if student_ans and (verdicts[task_id] if task_id in verdicts else check_task_answer(t, student_ans, mc_mode)):
                 task_correct[task_id] = task_correct.get(task_id, 0) + 1
 
         # Also account for any answered tasks outside variant list just in case
         for task_id, student_ans in (s.answers or {}).items():
             if task_id not in seen_task_ids:
                 task_meta = task_lookup.get(task_id, {})
-                correct_ans = task_meta.get("correct_answer", "")
                 task_total[task_id] = task_total.get(task_id, 0) + 1
                 if str(student_ans).strip():
                     task_student_answers.setdefault(task_id, []).append(str(student_ans).strip())
-                if student_ans and _check_answer(student_ans, correct_ans):
+                if student_ans and (verdicts[task_id] if task_id in verdicts else check_task_answer(task_meta, student_ans, mc_mode)):
                     task_correct[task_id] = task_correct.get(task_id, 0) + 1
 
         for task_id, hit in (s.distractor_analytics or {}).items():

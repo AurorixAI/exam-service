@@ -4,9 +4,10 @@ Mirrors diagnostic-service ``src/domain/answer_value.py`` (the services share
 no package): both must agree on which stored options are one answer written
 twice, or a task would be served differently in a diagnostic and an exam.
 
-Nothing here is used to grade a typed answer. It only decides which stored
-options a student could not tell apart, so it is deliberately strict: when in
-doubt two answers count as different.
+It decides which stored options a student could not tell apart, and is the
+base of ``answer_utils.check_open_answer`` (typed answers, see there for the
+rules added on top).  It is deliberately strict: when in doubt two answers
+count as different.  Keep it a mirror of the diagnostic file.
 """
 from __future__ import annotations
 
@@ -37,6 +38,9 @@ def answer_value_key(value: object) -> str:
     return text.casefold()
 
 
+# int() / Fraction() of a number with more than 4300 digits is a ValueError since Python 3.11; no school answer is
+# this long, so a longer text is "not a plain number" (None) instead of an exception.
+_MAX_NUMBER_CHARS = 1000
 _LEFT_RIGHT_RE = re.compile(r"\\(?:left|right)(?![A-Za-z])")
 _DIGIT_GAP_RE = re.compile(r"(?<=\d)\s+(?=\d)")
 _DECIMAL_COMMA_RE = re.compile(r"(?<=\d)(?:\{,\}|,)(?=\d)")
@@ -46,13 +50,22 @@ _FUNC_ARG_BRACES_RE = re.compile(
     r"(\\(?:arcsin|arccos|arctan|arctg|arcctg|sin|cos|tan|tg|cot|ctg|sec|csc|ln|lg|log|exp)"
     r"(?:[_^](?:\{[^{}]*\}|[0-9A-Za-z]))*)\s*\{(\\?[A-Za-z]+|\d+)\}"
 )
-_TRAILING_PUNCT_RE = re.compile(r"[\s.;]+$")
 _THIN_SPACE_RE = re.compile(r"\\[,;!]|\\q?quad(?![A-Za-z])")
-_MIXED_LATEX_RE = re.compile(r"(-?)\s*(\d+)?\s*\\frac\{\s*(-?\d+)\s*\}\{\s*(\d+)\s*\}")
+# `\s*(\d+)?\s*` would let two adjacent `\s*` split a run of spaces n ways (quadratic on text a student typed);
+# `\s*(?:(\d+)\s*)?` accepts the same strings in linear time.
+_MIXED_LATEX_RE = re.compile(r"(-?)\s*(?:(\d+)\s*)?\\frac\{\s*(-?\d+)\s*\}\{\s*(\d+)\s*\}")
 _MIXED_PLAIN_RE = re.compile(r"(-?)(\d+)\s+(\d+)\s*/\s*(\d+)")
 _FRACTION_RE = re.compile(r"(-?\d+)\s*/\s*(\d+)")
 _THOUSANDS_RE = re.compile(r"-?\d{1,3}(?: \d{3})+")
 _DECIMAL_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
+
+
+def _strip_trailing_punct(text: str) -> str:
+    """Drop trailing whitespace, `.` and `;` (what `[\\s.;]+$` matched, without its quadratic backtracking)."""
+    end = len(text)
+    while end and (text[end - 1].isspace() or text[end - 1] in ".;"):
+        end -= 1
+    return text[:end]
 
 
 def _notation_key(value: object) -> str:
@@ -69,7 +82,7 @@ def _notation_key(value: object) -> str:
     text = _LEFT_RIGHT_RE.sub("", text)
     text = _FUNC_ARG_BRACES_RE.sub(r"\1 \2", text)
     text = _DECIMAL_COMMA_RE.sub(".", text)
-    text = _TRAILING_PUNCT_RE.sub("", text)
+    text = _strip_trailing_punct(text)
     text = _DIGIT_GAP_RE.sub("␣", text)
     return answer_value_key(text)
 
@@ -85,6 +98,8 @@ def exact_number(value: object) -> Optional[Fraction]:
     text = str(value or "").replace("$", "").replace("{,}", ",").replace("−", "-")
     text = text.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
     text = _THIN_SPACE_RE.sub(" ", text).strip()
+    if len(text) > _MAX_NUMBER_CHARS:
+        return None
     m = _MIXED_LATEX_RE.fullmatch(text)
     if m:
         sign, whole, num, den = m.groups()
