@@ -3951,48 +3951,45 @@ async def get_exam_by_code(code: str, db: Session = Depends(get_db)):
     )
 
 
-def _find_submitted_session(sessions: list, student_id: Optional[str], student_name: Optional[str], identifier: Optional[str] = None):
+def _norm_ident(value: Optional[str]) -> str:
+    return (value or "").strip().lower()
+
+
+def _find_student_session(
+    sessions: list,
+    statuses: tuple,
+    student_id: Optional[str],
+    identifier: Optional[str] = None,
+):
+    """Find the attempt that belongs to ONE canonical roster student.
+
+    Identity only, never a name: two students of a group may share a full name
+    ("Мария Иванова" TE-040 and TE-041), and a name is no evidence that two
+    people are the same.  A session matches when its ``student_id`` (the
+    canonical UUID) or its ``display_id`` equals the canonical UUID or the
+    display ID of the student.  Older rows that kept the display ID in
+    ``student_id`` still match.  A session with neither (or with a different
+    one) matches nothing, whatever name it carries - it fails closed.
+    """
+    keys = {key for key in (_norm_ident(student_id), _norm_ident(identifier)) if key}
+    if not keys:
+        return None
+    for s in sessions:
+        if s.status not in statuses:
+            continue
+        if _norm_ident(s.student_id) in keys or _norm_ident(s.display_id) in keys:
+            return s
+    return None
+
+
+def _find_submitted_session(sessions: list, student_id: Optional[str], identifier: Optional[str] = None):
     """Find if a student already completed an exam session."""
-    s_id = (student_id or "").strip().lower()
-    s_name = (student_name or "").strip().lower()
-    ident = (identifier or "").strip().lower()
-
-    for s in sessions:
-        if s.status != "submitted":
-            continue
-        curr_id = (s.student_id or "").strip().lower()
-        curr_disp = (s.display_id or "").strip().lower()
-        curr_name = (s.student_name or "").strip().lower()
-
-        if s_id and (curr_id == s_id or curr_disp == s_id):
-            return s
-        if ident and (curr_id == ident or curr_disp == ident or curr_name == ident):
-            return s
-        if s_name and curr_name == s_name:
-            return s
-    return None
+    return _find_student_session(sessions, ("submitted",), student_id, identifier)
 
 
-def _find_active_session(sessions: list, student_id: Optional[str], student_name: Optional[str], identifier: Optional[str] = None):
+def _find_active_session(sessions: list, student_id: Optional[str], identifier: Optional[str] = None):
     """Find if a student currently has a waiting or in_progress session."""
-    s_id = (student_id or "").strip().lower()
-    s_name = (student_name or "").strip().lower()
-    ident = (identifier or "").strip().lower()
-
-    for s in sessions:
-        if s.status not in ("waiting", "in_progress"):
-            continue
-        curr_id = (s.student_id or "").strip().lower()
-        curr_disp = (s.display_id or "").strip().lower()
-        curr_name = (s.student_name or "").strip().lower()
-
-        if s_id and (curr_id == s_id or curr_disp == s_id):
-            return s
-        if ident and (curr_id == ident or curr_disp == ident or curr_name == ident):
-            return s
-        if s_name and curr_name == s_name:
-            return s
-    return None
+    return _find_student_session(sessions, ("waiting", "in_progress"), student_id, identifier)
 
 
 @router.post("/exams/by-code/{code}/check-student", response_model=CheckStudentExamResponse,
@@ -4039,7 +4036,6 @@ async def check_student_for_exam(
     submitted_sess = _find_submitted_session(
         all_sessions,
         student.get("id"),
-        student.get("full_name"),
         student.get("display_id"),
     )
     if submitted_sess:
@@ -4103,7 +4099,7 @@ async def start_exam(
 
     # 1. Single attempt guard: Check if already submitted
     submitted_sess = _find_submitted_session(
-        all_sessions, canonical_student_id, canonical_student_name, canonical_display_id
+        all_sessions, canonical_student_id, canonical_display_id
     )
     if submitted_sess:
         return StartExamResponse(
@@ -4119,7 +4115,7 @@ async def start_exam(
 
     # 2. Check if student already has a session in progress or waiting
     existing_session = _find_active_session(
-        all_sessions, canonical_student_id, canonical_student_name, canonical_display_id
+        all_sessions, canonical_student_id, canonical_display_id
     )
 
     # Determine global exam start time
