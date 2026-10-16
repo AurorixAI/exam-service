@@ -63,6 +63,7 @@ class StaffSlots:
 
 _last_refusal_log = 0.0
 _staff_slots: Optional[StaffSlots] = None
+_heavy_slots: Optional[StaffSlots] = None
 _staff_slots_lock = threading.Lock()
 
 
@@ -76,10 +77,21 @@ def staff_slots() -> StaffSlots:
     return _staff_slots
 
 
+def heavy_slots() -> StaffSlots:
+    """The cap of the long staff calls (LLM report, PDF rendering): separate from the staff slots, never shared with them."""
+    global _heavy_slots
+    if _heavy_slots is None:
+        with _staff_slots_lock:
+            if _heavy_slots is None:
+                _heavy_slots = StaffSlots(get_settings().heavy_slots)
+    return _heavy_slots
+
+
 def reset_staff_slots() -> None:
-    """Tests: forget the limiter so the next request builds it from the current settings."""
-    global _staff_slots
+    """Tests: forget the limiters so the next request builds them from the current settings."""
+    global _staff_slots, _heavy_slots
     _staff_slots = None
+    _heavy_slots = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +131,23 @@ async def require_exam_staff(request: Request) -> AsyncIterator[ExamActor]:
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Сервер сейчас обслуживает много запросов преподавателей. Подождите несколько секунд и повторите.",
             headers={"Retry-After": "2"},
+        )
+    try:
+        yield await _resolve_staff_actor(request)
+    finally:
+        slots.release()
+
+
+async def require_heavy_staff(request: Request) -> AsyncIterator[ExamActor]:
+    """``require_exam_staff`` for a LONG call (LLM report, PDF rendering): a slot of the small heavy pool instead of a
+    staff slot, so a handful of 2-minute reports cannot starve the dashboards; beyond the pool 503 + Retry-After 10."""
+    slots = heavy_slots()
+    if not slots.try_acquire():
+        log.warning("heavy slots exhausted (%d of %d in use): refusing %s", slots.in_use, slots.size, request.url.path)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Сейчас формируются другие отчёты и печатные файлы. Подождите немного и повторите.",
+            headers={"Retry-After": "10"},
         )
     try:
         yield await _resolve_staff_actor(request)

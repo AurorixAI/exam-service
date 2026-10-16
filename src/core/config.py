@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     # ...of which this many are kept for changes (close, start, assign...): a flood of dashboard reads fills the
     # others first, so the teacher who presses «close» during it is still served.
     teacher_write_reserve: int = 4
+    # LONG staff calls - the LLM report (up to 120 s), PDF rendering through chromium - have a small cap of their own
+    # per worker and hold NO staff slot: a dozen of them must not starve the dashboards (503 + Retry-After 10 beyond).
+    heavy_slots: int = 3
     # Content Service — HTTP read API (replaces direct content-db connection)
     content_service_url: str = "http://content-service:8004"
     # Auth Service — HTTP API for group/student verification

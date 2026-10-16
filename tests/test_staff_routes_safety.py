@@ -13,8 +13,10 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import logging
 import threading
 import time
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 
 import pytest
@@ -30,6 +32,7 @@ from src.core import database
 from src.core.auth import StaffSlots
 from src.domain import report_generator
 from src.models import ExamPrintPackage, ExamReport, ExamSession, GeneratedExam
+from src.repositories.exam_repo import ExamReportRepository
 from tests.conftest import (
     TEST_GROUP_ID,
     TEST_ORG_ID,
@@ -458,3 +461,179 @@ def test_the_print_pdf_is_rendered_with_no_transaction_open(client, db, monkeypa
     resp = client.get(f"{API}/exams/{exam.id}/print-package/{kind}/1.pdf")
     assert resp.status_code == 200 and resp.content == b"%PDF-stub"
     assert state == {"in_transaction": False}
+
+
+# ── mini-R3: the long calls have a cap of their own ───────────────────────────────────────────────────────────
+def test_long_staff_calls_have_their_own_small_cap_and_hold_no_staff_slot(monkeypatch):
+    import httpx
+
+    app, gate = _staff_app(monkeypatch, 1)  # one staff slot, so a leak of it would show at once
+    monkeypatch.setattr(core_auth, "_heavy_slots", StaffSlots(1))
+
+    @app.get("/heavy")
+    async def heavy(actor=Depends(core_auth.require_heavy_staff)):
+        await gate["event"].wait()
+        return {"ok": True}
+
+    async def scenario():
+        gate["event"] = asyncio.Event()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as http:
+            first = asyncio.create_task(http.get("/heavy"))
+            await asyncio.sleep(0.1)
+            in_use = (core_auth.heavy_slots().in_use, core_auth.staff_slots().in_use)
+            refused = await http.get("/heavy")
+            gate["event"].set()  # the dashboard poll below must not wait for the report to end
+            dashboard = await http.get("/hold")
+            await first
+            again = await http.get("/heavy")
+        return in_use, refused, dashboard, again
+
+    in_use, refused, dashboard, again = asyncio.run(scenario())
+    assert in_use == (1, 0)  # the long call holds a heavy slot and NO staff slot
+    assert refused.status_code == 503 and refused.headers["retry-after"] == "10"
+    assert dashboard.status_code == 200 and again.status_code == 200
+    assert (core_auth.heavy_slots().in_use, core_auth.staff_slots().in_use) == (0, 0)
+
+
+def test_only_the_report_and_the_pdf_routes_take_the_heavy_cap():
+    heavy = set()
+    for route in router_module.router.routes:
+        calls = {dep.call for dep in getattr(getattr(route, "dependant", None), "dependencies", [])}
+        if core_auth.require_heavy_staff in calls:
+            heavy.add(route.endpoint.__name__)
+            assert core_auth.require_exam_staff not in calls  # and none of them also holds a staff slot
+    assert heavy == {
+        "generate_exam_report_endpoint", "download_print_student_pdf", "download_print_teacher_key_pdf", "preview_print_pdf",
+    }
+
+
+def test_the_heavy_cap_is_three_per_worker():
+    from src.core.config import get_settings
+
+    core_auth.reset_staff_slots()
+    try:
+        assert core_auth.heavy_slots().size == get_settings().heavy_slots == 3
+    finally:
+        core_auth.reset_staff_slots()
+
+
+# ── mini-R3: a double click on «generate report» ──────────────────────────────────────────────────────────────
+def _report_values(**over):
+    base = dict(
+        total_students=3, submitted_count=3, avg_score_pct=50.0, pass_rate_pct=40.0, task_analytics=[], top_errors=[],
+        narrative_ru="first", narrative_generated=True, is_final=False,
+    )
+    base.update(over)
+    return base
+
+
+def test_the_loser_of_a_report_race_overwrites_the_winners_row_instead_of_failing(db, monkeypatch):
+    exam = make_exam_in_db(db)
+    repo = ExamReportRepository(db)
+    repo.upsert(exam.id, "er_winner", **_report_values(narrative_ru="winner"))
+
+    real = ExamReportRepository.get_by_exam
+    calls = {"n": 0}
+
+    def blind_once(self, exam_id):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else real(self, exam_id)  # the loser looked before the winner committed
+
+    monkeypatch.setattr(ExamReportRepository, "get_by_exam", blind_once)
+    loser = repo.upsert(exam.id, "er_loser", **_report_values(narrative_ru="loser", submitted_count=2, is_final=True))
+    assert loser.id == "er_winner" and loser.narrative_ru == "loser" and loser.submitted_count == 2 and loser.is_final
+    assert db.query(ExamReport).filter(ExamReport.exam_id == exam.id).count() == 1
+
+
+def test_a_failure_that_is_not_the_unique_key_is_still_an_error(db, monkeypatch):
+    exam = make_exam_in_db(db)
+    repo = ExamReportRepository(db)
+    with pytest.raises(Exception):
+        repo.upsert("NO_SUCH_EXAM", "er_x", **_report_values())  # foreign key: there is no row to fall back to
+    assert db.query(ExamReport).filter(ExamReport.exam_id == exam.id).count() == 0
+
+
+# ── mini-R3: the bridge sees writes that are already flushed ──────────────────────────────────────────────────
+def _bridge_in_worker(db, work):
+    def in_worker():
+        work()
+        return router_module._await(asyncio.sleep(0, result="done"), db)
+
+    return asyncio.run(run_in_threadpool(in_worker))
+
+
+def test_a_flushed_write_blocks_the_bridge(db):
+    from src.models import ExamLifecycleEvent
+
+    exam = make_exam_in_db(db)
+
+    def flush_an_event():
+        db.add(ExamLifecycleEvent(id="EV_1", exam_id=exam.id, org_id=TEST_ORG_ID, event_type="exam_closed"))
+        db.flush()  # nothing is «pending» any more, but the row (and its locks) are in the transaction
+        assert not (db.new or db.dirty or db.deleted)
+        assert database.wrote_since_commit(db)
+
+    with pytest.raises(RuntimeError, match="written since the last commit"):
+        _bridge_in_worker(db, flush_an_event)
+
+
+def test_a_bulk_update_blocks_the_bridge(db):
+    exam = make_exam_in_db(db)
+
+    def bulk_update():
+        db.query(GeneratedExam).filter(GeneratedExam.id == exam.id).update({"title": "renamed"})
+
+    with pytest.raises(RuntimeError, match="written since the last commit"):
+        _bridge_in_worker(db, bulk_update)
+
+
+def test_a_bulk_delete_blocks_the_bridge(db):
+    exam = make_exam_in_db(db)
+
+    def bulk_delete():
+        db.query(ExamReport).filter(ExamReport.exam_id == exam.id).delete()
+
+    with pytest.raises(RuntimeError, match="written since the last commit"):
+        _bridge_in_worker(db, bulk_delete)
+
+
+def test_a_row_lock_blocks_the_bridge(db):
+    exam = make_exam_in_db(db)
+
+    def lock_the_row():
+        db.query(GeneratedExam).filter(GeneratedExam.id == exam.id).with_for_update().first()
+
+    with pytest.raises(RuntimeError, match="written since the last commit"):
+        _bridge_in_worker(db, lock_the_row)
+
+
+def test_reading_flags_nothing_and_a_commit_clears_the_flag(db):
+    exam = make_exam_in_db(db)
+
+    def read_then_write_then_commit():
+        db.query(GeneratedExam).filter(GeneratedExam.id == exam.id).first()
+        assert not database.wrote_since_commit(db)
+        db.query(GeneratedExam).filter(GeneratedExam.id == exam.id).update({"title": "renamed"})
+        assert database.wrote_since_commit(db)
+        db.commit()
+        assert not database.wrote_since_commit(db)
+
+    assert _bridge_in_worker(db, read_then_write_then_commit) == "done"
+
+
+def test_in_production_a_bridged_call_over_writes_is_logged_and_commits_nothing(db, monkeypatch, caplog):
+    exam = make_exam_in_db(db)
+    monkeypatch.setattr(router_module, "get_settings", lambda: SimpleNamespace(app_env="production"))
+    state = {}
+
+    def write_then_call():
+        db.query(GeneratedExam).filter(GeneratedExam.id == exam.id).update({"title": "renamed"})
+        with caplog.at_level(logging.ERROR, logger="exam_service"):
+            state["result"] = router_module._await(asyncio.sleep(0, result="done"), db)
+        state["still_open"] = db.in_transaction()
+        state["still_flagged"] = database.wrote_since_commit(db)  # no commit happened: nothing is half-saved
+
+    asyncio.run(run_in_threadpool(write_then_call))
+    assert state == {"result": "done", "still_open": True, "still_flagged": True}
+    assert any("uncommitted writes or row locks" in record.getMessage() for record in caplog.records)

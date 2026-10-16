@@ -231,20 +231,33 @@ def test_a_report_whose_model_takes_35_seconds_is_saved_not_lost():
     asyncio.run(_slow_report_scenario())
 
 
+async def _graded_students(http, count=3):
+    """`count` students start and submit through the API (so the exam has submitted works to report on)."""
+    for i in range(count):
+        body = {"student_name": f"Ученик {i}", "student_id": f"00000000-0000-0000-0000-00000000010{i}"}
+        started = await http.post(f"/exams/by-code/{load.CODE}/start", json=body, headers={"X-Real-IP": f"10.8.0.{i + 1}"})
+        assert started.status_code == 200, started.text
+        token = {"X-Exam-Session-Token": started.json()["session_token"]}
+        done = await http.post(
+            f"/exam-sessions/{started.json()['session_id']}/submit",
+            json={"answers": {"TASK_000": "3", "TASK_001": "x"}, "time_spent_seconds": 20}, headers=token,
+        )
+        assert done.status_code == 200, done.text
+
+
+def _reports_in_db():
+    engine = sa.create_engine(PG_URL)
+    with engine.connect() as conn:
+        count = conn.execute(sa.text("SELECT count(*) FROM exam_reports WHERE exam_id = :e"), {"e": load.EXAM_ID}).scalar()
+    engine.dispose()
+    return count
+
+
 async def _slow_report_scenario():
     async with load.running_stack(PG_URL, REDIS_URL, stub_env={"STUB_LLM_LAT_MS": "35000"}) as stack:
         teacher = {"Authorization": "Bearer teacher-load"}
         async with httpx.AsyncClient(base_url=stack.base + API, timeout=100) as http:
-            for i in range(3):
-                body = {"student_name": f"Ученик {i}", "student_id": f"00000000-0000-0000-0000-00000000010{i}"}
-                started = await http.post(f"/exams/by-code/{load.CODE}/start", json=body, headers={"X-Real-IP": f"10.8.0.{i + 1}"})
-                assert started.status_code == 200, started.text
-                token = {"X-Exam-Session-Token": started.json()["session_token"]}
-                done = await http.post(
-                    f"/exam-sessions/{started.json()['session_id']}/submit",
-                    json={"answers": {"TASK_000": "3", "TASK_001": "x"}, "time_spent_seconds": 20}, headers=token,
-                )
-                assert done.status_code == 200, done.text
+            await _graded_students(http)
             began = time.monotonic()
             report, health = await asyncio.gather(
                 http.post(f"/exams/{load.EXAM_ID}/report", headers=teacher),
@@ -259,3 +272,68 @@ async def _slow_report_scenario():
             assert "Класс справился" in payload["narrative_ru"]
             again = await http.get(f"/exams/{load.EXAM_ID}/report", headers=teacher)
             assert again.status_code == 200 and again.json()["submitted_count"] == 3  # and it is in the database
+
+
+def test_a_double_click_on_generate_report_is_two_200s_and_one_report():
+    """Both requests saw no report and both generate it: the loser's INSERT used to violate the unique key -> 500."""
+    asyncio.run(_double_click_scenario())
+
+
+async def _double_click_scenario():
+    async with load.running_stack(PG_URL, REDIS_URL, stub_env={"STUB_LLM_LAT_MS": "1500"}) as stack:
+        teacher = {"Authorization": "Bearer teacher-load"}
+        async with httpx.AsyncClient(base_url=stack.base + API, timeout=60) as http:
+            await _graded_students(http)
+            engine = sa.create_engine(PG_URL, isolation_level="AUTOCOMMIT")
+            with engine.connect() as conn:  # widen the window between «no report yet» and the INSERT, to hit it every time
+                conn.execute(sa.text(
+                    "CREATE OR REPLACE FUNCTION slow_report_insert() RETURNS trigger AS $$ BEGIN PERFORM pg_sleep(0.6);"
+                    " RETURN NEW; END $$ LANGUAGE plpgsql"
+                ))
+                conn.execute(sa.text(
+                    "CREATE TRIGGER slow_report BEFORE INSERT ON exam_reports FOR EACH ROW EXECUTE FUNCTION slow_report_insert()"
+                ))
+            try:
+                first, second, third = await asyncio.gather(*(
+                    http.post(f"/exams/{load.EXAM_ID}/report", params={"force": "true"}, headers=teacher) for _ in range(3)
+                ))
+            finally:
+                with engine.connect() as conn:
+                    conn.execute(sa.text("DROP TRIGGER IF EXISTS slow_report ON exam_reports"))
+                engine.dispose()
+            assert [first.status_code, second.status_code, third.status_code] == [200, 200, 200], (first.text, second.text)
+            assert _reports_in_db() == 1
+
+
+def test_a_few_slow_reports_cannot_starve_the_dashboards():
+    """Reports hold the small heavy cap and no staff slot: beyond it 503 + Retry-After 10, the dashboard stays served."""
+    asyncio.run(_heavy_cap_scenario())
+
+
+async def _heavy_cap_scenario():
+    async with load.running_stack(
+        PG_URL, REDIS_URL, stub_env={"STUB_LLM_LAT_MS": "4000"}, extra_env={"HEAVY_SLOTS": "1"},
+    ) as stack:
+        teacher = {"Authorization": "Bearer teacher-load"}
+        async with httpx.AsyncClient(base_url=stack.base + API, timeout=60) as http:
+            await _graded_students(http)
+
+            async def dashboards():
+                await asyncio.sleep(1.0)  # while the reports are thinking
+                worst = 0.0
+                for _ in range(5):
+                    started = time.monotonic()
+                    answer = await http.get("/exams/live-summary", headers=teacher)
+                    assert answer.status_code == 200, answer.text
+                    worst = max(worst, time.monotonic() - started)
+                return worst
+
+            results = await asyncio.gather(
+                *(http.post(f"/exams/{load.EXAM_ID}/report", params={"force": "true"}, headers=teacher) for _ in range(6)),
+                dashboards(),
+            )
+            reports, worst_dashboard = results[:-1], results[-1]
+            statuses = sorted(r.status_code for r in reports)
+            assert set(statuses) <= {200, 503} and statuses.count(200) >= 1 and statuses.count(503) >= 2, statuses
+            assert all(r.headers["retry-after"] == "10" for r in reports if r.status_code == 503)
+            assert worst_dashboard < 1.5  # three seconds-long reports in flight did not take its slot

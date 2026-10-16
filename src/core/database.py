@@ -4,7 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.exc import DBAPIError, OperationalError, TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -91,3 +91,32 @@ def transient_db_failure(exc: BaseException) -> str | None:
         if isinstance(exc, OperationalError) or exc.connection_invalidated or code in {"57014", "25P03"}:
             return DB_BUSY_MESSAGE
     return None
+
+
+# ── «has this session written (or locked) anything in its current transaction?» ─────────────────────────────────
+# ``Session.new/dirty/deleted`` only show what is NOT flushed yet.  Once a flush or a bulk UPDATE/DELETE/INSERT or a
+# SELECT ... FOR UPDATE has run, the transaction holds row locks that the unit of work no longer reports; a bridged
+# network call (router._await) must not be made over them.  The flag lives in ``Session.info`` until the commit or
+# the rollback that ends the transaction.
+_WROTE_KEY = "wrote_since_commit"
+
+
+def wrote_since_commit(session: Session) -> bool:
+    return bool(session.info.get(_WROTE_KEY))
+
+
+@event.listens_for(Session, "after_flush")
+def _note_flush(session: Session, flush_context) -> None:
+    session.info[_WROTE_KEY] = True
+
+
+@event.listens_for(Session, "do_orm_execute")
+def _note_write_statement(state) -> None:
+    if state.is_insert or state.is_update or state.is_delete or getattr(state.statement, "_for_update_arg", None) is not None:
+        state.session.info[_WROTE_KEY] = True
+
+
+@event.listens_for(Session, "after_commit")
+@event.listens_for(Session, "after_rollback")
+def _forget_writes(session: Session) -> None:
+    session.info.pop(_WROTE_KEY, None)

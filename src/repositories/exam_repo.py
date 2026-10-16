@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, defer
 
 from src.models import GeneratedExam, ExamSession, ExamReport
@@ -93,26 +94,14 @@ class ExamReportRepository:
         narrative_generated: bool,
         is_final: bool,
     ) -> ExamReport:
-        """Create or fully overwrite the report for an exam (idempotent)."""
-        existing = self.get_by_exam(exam_id)
-        if existing:
-            existing.total_students = total_students
-            existing.submitted_count = submitted_count
-            existing.avg_score_pct = avg_score_pct
-            existing.pass_rate_pct = pass_rate_pct
-            existing.task_analytics = task_analytics
-            existing.top_errors = top_errors
-            existing.narrative_ru = narrative_ru
-            existing.narrative_generated = narrative_generated
-            existing.is_final = is_final
-            existing.updated_at = datetime.now(timezone.utc)
-            self.db.commit()
-            self.db.refresh(existing)
-            return existing
+        """Create or fully overwrite the report for an exam (idempotent, and safe against a concurrent twin).
 
-        report = ExamReport(
-            id=report_id,
-            exam_id=exam_id,
+        ``exam_id`` is unique: two requests that both saw no report (a double click on «generate») both try to insert,
+        and the loser's INSERT violates it.  The insert runs in a SAVEPOINT; on that violation the winner's row is
+        read and overwritten instead - the same end state as ``INSERT ... ON CONFLICT (exam_id) DO UPDATE``, on any
+        database, with the loser's transaction (and the caller's other work) intact.
+        """
+        values = dict(
             total_students=total_students,
             submitted_count=submitted_count,
             avg_score_pct=avg_score_pct,
@@ -123,10 +112,27 @@ class ExamReportRepository:
             narrative_generated=narrative_generated,
             is_final=is_final,
         )
-        self.db.add(report)
+
+        existing = self.get_by_exam(exam_id)
+        if existing is None:
+            try:
+                with self.db.begin_nested():
+                    self.db.add(ExamReport(id=report_id, exam_id=exam_id, **values))
+                    self.db.flush()
+            except IntegrityError:
+                existing = self.get_by_exam(exam_id)
+                if existing is None:  # not the unique key after all: a real error
+                    raise
+            else:
+                self.db.commit()
+                return self.get_by_exam(exam_id)
+
+        for field, value in values.items():
+            setattr(existing, field, value)
+        existing.updated_at = datetime.now(timezone.utc)
         self.db.commit()
-        self.db.refresh(report)
-        return report
+        self.db.refresh(existing)
+        return existing
 
 
 class SessionRepository:

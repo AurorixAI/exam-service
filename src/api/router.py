@@ -60,12 +60,13 @@ from src.core.auth import (
     exam_access_group,
     require_exam_access,
     require_exam_staff,
+    require_heavy_staff,
     require_group_access,
     require_student_history_access,
 )
 from src.core.abuse_limit import EntryTicket, admit_identity_attempt, reset_entry_limits
 from src.core.config import get_settings
-from src.core.database import get_db
+from src.core.database import get_db, wrote_since_commit
 from src.core.exceptions import (
     ExamNotFoundError,
     ExamNotActiveError,
@@ -647,21 +648,23 @@ def _await(awaitable, db: Optional[Session] = None):
 
     The teacher and admin routes are plain ``def`` (FastAPI runs them in the thread pool), so their database work
     never blocks the event loop; the few network calls they make are handed to the loop through this bridge.  Rules
-    (pinned by tests/test_concurrency_safety.py):
+    (pinned by tests/test_concurrency_safety.py and test_staff_routes_safety.py):
 
     * pass the route's ``db``: the read transaction is ended first, so the pooled connection is not held idle in
       a transaction for the seconds the network call may take (ROADMAP #95 R3: pool and idle-in-transaction limit);
-    * nothing may be pending in the session at that moment (a write before a network call would hold row locks over
-      it) - the testing profile raises, production logs and leaves the transaction open;
+    * nothing may be pending (unflushed ORM changes) nor written since the last commit (a flush, a bulk
+      UPDATE/DELETE/INSERT, a SELECT ... FOR UPDATE - the row locks would be held over the call).  The testing
+      profile raises; production logs an ERROR, does NOT commit (nothing is half-saved: the route's own commit or
+      the request's rollback decides) and still makes the call;
     * the coroutine does no database work and is given snapshots (``_exam_view``), never attached ORM objects.
     """
     if isinstance(db, Session):
-        if _has_pending_changes(db):
+        if _has_pending_changes(db) or wrote_since_commit(db):
             if get_settings().app_env == "testing":
                 if hasattr(awaitable, "close"):
                     awaitable.close()
-                raise RuntimeError("a bridged network call was made with unflushed ORM changes pending")
-            log.warning("bridged network call with pending ORM changes: the transaction stays open over it")
+                raise RuntimeError("a bridged network call was made with ORM changes pending or written since the last commit")
+            log.error("bridged network call over uncommitted writes or row locks: the transaction stays open over it")
         else:
             _release_read_transaction(db)
     return anyio.from_thread.run(_run_awaitable, awaitable)
@@ -3833,7 +3836,7 @@ def preview_print_pdf(
     kind: Literal["student", "teacher-key"],
     variant_number: int,
     db: Session = Depends(get_db),
-    actor: ExamActor = Depends(require_exam_staff),
+    actor: ExamActor = Depends(require_heavy_staff),
 ):
     """Render a staff-only, non-persistent preview from the current draft.
 
@@ -3874,7 +3877,7 @@ def download_print_student_pdf(
     exam_id: str,
     variant_number: int,
     db: Session = Depends(get_db),
-    actor: ExamActor = Depends(require_exam_staff),
+    actor: ExamActor = Depends(require_heavy_staff),
 ):
     exam = _get_exam_for_actor(db, exam_id, actor)
     _require_print_delivery(exam)
@@ -3896,7 +3899,7 @@ def download_print_teacher_key_pdf(
     exam_id: str,
     variant_number: int,
     db: Session = Depends(get_db),
-    actor: ExamActor = Depends(require_exam_staff),
+    actor: ExamActor = Depends(require_heavy_staff),
 ):
     exam = _get_exam_for_actor(db, exam_id, actor)
     _require_print_delivery(exam)
@@ -5535,7 +5538,7 @@ def generate_exam_report_endpoint(
     exam_id: str,
     force: bool = Query(False, description="Перегенерировать даже если отчёт уже есть"),
     db: Session = Depends(get_db),
-    actor: ExamActor = Depends(require_exam_staff),
+    actor: ExamActor = Depends(require_heavy_staff),
 ):
     """
     Генерирует нарратив с помощью Gemini на основе агрегированной аналитики.

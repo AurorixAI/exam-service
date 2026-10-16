@@ -223,13 +223,14 @@ def client(db, stub_auth_service):
     """TestClient with DB, staff-auth and auth-service calls stubbed out."""
     from src.main import app
     from src.core.database import get_db
-    from src.core.auth import require_exam_staff
+    from src.core.auth import require_exam_staff, require_heavy_staff
 
     def override_get_db():
         yield db
 
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[require_exam_staff] = make_actor
+    app.dependency_overrides[require_heavy_staff] = make_actor  # the report / PDF routes: same actor, no slot
     # Student endpoints require the per-attempt capability issued by ``start``.
     # Factory sessions all carry ``TEST_SESSION_TOKEN``, so sending it by
     # default keeps every request authorised; a test that wants to exercise the
