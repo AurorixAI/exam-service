@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from src.domain.task_display import question_display_fields, report_display_projection
 
+import asyncio
 import base64
 import hashlib
 import logging
@@ -53,8 +54,10 @@ from sqlalchemy import and_, inspect as sa_inspect, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from src.core import auth as core_auth
 from src.core.auth import (
     ExamActor,
+    exam_access_group,
     require_exam_access,
     require_exam_staff,
     require_group_access,
@@ -621,22 +624,103 @@ async def _run_awaitable(awaitable):
     return await awaitable
 
 
-def _await(awaitable):
+def _has_pending_changes(db: Session) -> bool:
+    return bool(db.new or db.deleted or any(db.is_modified(obj) for obj in db.dirty))
+
+
+def _release_read_transaction(db: Session) -> None:
+    """End the read transaction - the pooled connection goes back to the pool - WITHOUT expiring what was loaded.
+
+    The ORM objects stay usable (a plain ``commit()`` would expire them and every attribute read would be a new query);
+    the next statement simply starts a new transaction.  Only for a session with nothing pending.
+    """
+    keep = db.expire_on_commit
+    db.expire_on_commit = False
+    try:
+        db.commit()
+    finally:
+        db.expire_on_commit = keep
+
+
+def _await(awaitable, db: Optional[Session] = None):
     """Run a coroutine - a call to auth-service / content-service - on the event loop, from a worker thread.
 
     The teacher and admin routes are plain ``def`` (FastAPI runs them in the thread pool), so their database work
-    never blocks the event loop; the few network calls they make are handed to the loop through this bridge.  The
-    rules that keep it safe (pinned by tests/test_concurrency_safety.py): nothing that takes a row lock or writes
-    precedes a bridged call in the same transaction, and a coroutine passed here does no database work itself.
+    never blocks the event loop; the few network calls they make are handed to the loop through this bridge.  Rules
+    (pinned by tests/test_concurrency_safety.py):
+
+    * pass the route's ``db``: the read transaction is ended first, so the pooled connection is not held idle in
+      a transaction for the seconds the network call may take (ROADMAP #95 R3: pool and idle-in-transaction limit);
+    * nothing may be pending in the session at that moment (a write before a network call would hold row locks over
+      it) - the testing profile raises, production logs and leaves the transaction open;
+    * the coroutine does no database work and is given snapshots (``_exam_view``), never attached ORM objects.
     """
+    if isinstance(db, Session):
+        if _has_pending_changes(db):
+            if get_settings().app_env == "testing":
+                if hasattr(awaitable, "close"):
+                    awaitable.close()
+                raise RuntimeError("a bridged network call was made with unflushed ORM changes pending")
+            log.warning("bridged network call with pending ORM changes: the transaction stays open over it")
+        else:
+            _release_read_transaction(db)
     return anyio.from_thread.run(_run_awaitable, awaitable)
+
+
+async def _group_access_batch(actor: ExamActor, group_ids: list[str]) -> dict:
+    """One concurrent round of group lookups (a few at a time): {group_id: group dict | the exception it raised}."""
+    gate = asyncio.Semaphore(8)
+
+    async def one(group_id: str):
+        async with gate:
+            return await core_auth.require_group_access(actor, group_id)
+
+    results = await asyncio.gather(*(one(group_id) for group_id in group_ids), return_exceptions=True)
+    return dict(zip(group_ids, results))
+
+
+def _exam_access_decisions(db: Session, exams: list, actor: ExamActor) -> dict[str, bool]:
+    """{exam id: may this actor see it} for a LIST of exams, with ONE concurrent round of group lookups.
+
+    Same rule as ``require_exam_access`` per exam (a refusal 403/404 hides the exam, anything else is raised), but the
+    distinct groups are asked about together, after the read transaction was ended, not one after another with the
+    pooled connection held.
+    """
+    decisions: dict[str, bool] = {}
+    by_group: dict[str, list[str]] = {}
+    for exam in exams:
+        try:
+            group_id = exam_access_group(exam, actor)
+        except HTTPException as exc:
+            if exc.status_code not in {403, 404}:
+                raise
+            decisions[exam.id] = False
+            continue
+        if group_id is None:
+            decisions[exam.id] = True
+        else:
+            by_group.setdefault(group_id, []).append(exam.id)
+    if by_group:
+        outcomes = _await(_group_access_batch(actor, list(by_group)), db)
+        for group_id, outcome in outcomes.items():
+            if isinstance(outcome, HTTPException):
+                if outcome.status_code not in {403, 404}:
+                    raise outcome
+                allowed = False
+            elif isinstance(outcome, BaseException):
+                raise outcome
+            else:
+                allowed = True
+            for exam_id in by_group[group_id]:
+                decisions[exam_id] = allowed
+    return decisions
 
 
 def _get_exam_for_actor(db: Session, exam_id: str, actor: ExamActor) -> GeneratedExam:
     exam = ExamRepository(db).get_by_id(exam_id)
     if not exam:
         raise HTTPException(404, "Экзамен не найден")
-    _await(require_exam_access(exam, actor))
+    _await(require_exam_access(_exam_view(exam), actor), db)
     return exam
 
 
@@ -1616,7 +1700,7 @@ def get_lesson_exam_binding(
     actor: ExamActor = Depends(require_exam_staff),
 ):
     """Return cancellation-safe operational state for a schedule modal."""
-    _await(require_group_access(actor, group_id))
+    _await(require_group_access(actor, group_id), db)
     exams, blocked = _lesson_cancellation_blocker(
         db,
         org_id=actor.org_id,
@@ -1888,7 +1972,7 @@ def generate_exam(
     exam_id = f"EXAM_{uuid4().hex[:8]}"
     skills_set = {t["skill_id"] for t in tasks if t["skill_id"]}
 
-    group = _await(require_group_access(actor, req.group_id)) if req.group_id else None
+    group = _await(require_group_access(actor, req.group_id), db) if req.group_id else None
     exam = GeneratedExam(
         id=exam_id,
         title=req.title,
@@ -2261,28 +2345,10 @@ def list_exams(
     # An owner/admin can see the whole organisation.  A teacher can see their
     # own templates and the runs assigned to a group they teach.
     if not actor.is_org_admin:
-        visible: list[GeneratedExam] = []
-        group_access: dict[str, bool] = {}
-        for exam in exams:
-            group_id = str(exam.group_id) if exam.group_id else None
-            if group_id in group_access:
-                if group_access[group_id]:
-                    visible.append(exam)
-                continue
-            try:
-                _await(require_exam_access(exam, actor))
-                visible.append(exam)
-                if group_id:
-                    group_access[group_id] = True
-            except HTTPException as exc:
-                # A deleted group may still be referenced by an old archived
-                # exam. It is not visible to this teacher, but must not make
-                # the complete library unavailable.
-                if exc.status_code not in {403, 404}:
-                    raise
-                if group_id:
-                    group_access[group_id] = False
-        exams = visible
+        # A deleted group may still be referenced by an old archived exam. It is not visible to this teacher, but
+        # must not make the complete library unavailable (a 403/404 for a group hides its exams, nothing more).
+        decisions = _exam_access_decisions(db, exams, actor)
+        exams = [exam for exam in exams if decisions[exam.id]]
 
     # An open exam is valid only when it has a concrete schedule occurrence.
     # Legacy rows with attempts are intentionally never rewritten here.
@@ -2587,7 +2653,7 @@ def get_live_exam_dashboard_summary(
     )
 
     result: list[LiveExamDashboardResponse] = []
-    group_access: dict[str, bool] = {}
+    eligible: list[GeneratedExam] = []
 
     for exam in candidates:
         if exam.status in {"lobby", "active"} and (
@@ -2606,27 +2672,15 @@ def get_live_exam_dashboard_summary(
             not exam.group_id or not exam.scheduled_lesson_id or not exam.scheduled_lesson_date
         ):
             continue
-        group_id = str(exam.group_id) if exam.group_id else None
-        needs_group_lookup = bool(
-            not actor.is_org_admin
-            and group_id
-        )
-        if needs_group_lookup and group_id in group_access:
-            if not group_access[group_id]:
-                continue
-        else:
-            try:
-                _await(require_exam_access(exam, actor))
-                if needs_group_lookup and group_id:
-                    group_access[group_id] = True
-            except HTTPException as exc:
-                # A deleted group on a historical exam must never make the
-                # complete operational dashboard unavailable.
-                if exc.status_code not in {403, 404}:
-                    raise
-                if needs_group_lookup and group_id:
-                    group_access[group_id] = False
-                continue
+        eligible.append(exam)
+
+    # One concurrent round of group lookups for the whole snapshot, after the read transaction was ended.  A deleted
+    # group on a historical exam must never make the complete operational dashboard unavailable.
+    decisions = _exam_access_decisions(db, eligible, actor)
+
+    for exam in eligible:
+        if not decisions[exam.id]:
+            continue
 
         _check_and_auto_close_exam(db, exam)
         if exam.status not in {"lobby", "print_ready", "active", "closed"}:
@@ -2772,7 +2826,7 @@ def clone_exam(
     src = _get_exam_for_teacher_operator(db, exam_id, actor)
     if src.status == "archived":
         raise HTTPException(409, "Экзамен находится в архиве. Сначала восстановите его, затем создайте копию.")
-    group = _await(require_group_access(actor, req.group_id)) if req.group_id else None
+    group = _await(require_group_access(actor, req.group_id), db) if req.group_id else None
     requested_title = req.title.strip() if req.title is not None else None
     if requested_title is not None and not requested_title:
         raise HTTPException(422, "Название экзамена не может состоять только из пробелов")
@@ -2876,7 +2930,7 @@ def assign_exam(
             422,
             "Для формата «Печать» выберите занятие через подготовку печатного комплекта",
         )
-    group = _await(require_group_access(actor, req.group_id))
+    group = _await(require_group_access(actor, req.group_id), db)
     if _has_any_sessions(db, exam_id):
         raise HTTPException(
             409,
@@ -2894,6 +2948,16 @@ def assign_exam(
     previous_group_id = exam.group_id
     previous_lesson_id = exam.scheduled_lesson_id
     previous_lesson_date = exam.scheduled_lesson_date
+    canonical_group = None
+    if req.publish:
+        # BEFORE any change to the exam: nothing may be pending in the session over a network call
+        canonical_group, _ = _await(_resolve_lesson_occurrence(
+            actor,
+            group_id=str(group["id"]),
+            lesson_id=req.lesson_id,
+            lesson_date=req.lesson_date,
+        ), db)
+
     exam.group_id = str(group["id"])
     exam.group_name = group.get("name")
     exam.class_level = group.get("class_level")
@@ -2905,12 +2969,6 @@ def assign_exam(
 
     access_code = None
     if req.publish:
-        canonical_group, _ = _await(_resolve_lesson_occurrence(
-            actor,
-            group_id=str(group["id"]),
-            lesson_id=req.lesson_id,
-            lesson_date=req.lesson_date,
-        ))
         _ensure_lesson_slot_is_available(
             db,
             exam,
@@ -3025,7 +3083,7 @@ def publish_exam(
         group_id=target_group_id,
         lesson_id=req.lesson_id,
         lesson_date=req.lesson_date,
-    ))
+    ), db)
     _ensure_lesson_slot_is_available(
         db,
         exam,
@@ -3130,7 +3188,7 @@ def open_exam_lobby(
         group_id=str(exam.group_id),
         lesson_id=req.lesson_id,
         lesson_date=req.lesson_date,
-    ))
+    ), db)
     _ensure_lesson_slot_is_available(
         db,
         exam,
@@ -3238,6 +3296,7 @@ def cancel_exam_delivery(
         db.query(GeneratedExam)
         .filter(GeneratedExam.id == exam_id, GeneratedExam.org_id == actor.org_id)
         .with_for_update()
+        .populate_existing()  # re-read under the lock: the state checked below is the committed one
         .first()
     )
     if not exam:
@@ -3302,7 +3361,7 @@ def start_exam_live(
 
     if exam.status != "lobby":
         raise HTTPException(409, "Начать можно только экзамен, открытый в лобби")
-    _await(_require_lesson_in_progress(_exam_view(exam), actor))
+    _await(_require_lesson_in_progress(_exam_view(exam), actor), db)
     exam.status = "active"
     sessions = SessionRepository(db).list_by_exam(exam_id)
     started_count = 0
@@ -3613,7 +3672,7 @@ def prepare_print_package(
         group_id=req.group_id,
         lesson_id=req.lesson_id,
         lesson_date=req.lesson_date,
-    ))
+    ), db)
     _ensure_lesson_slot_is_available(
         db,
         exam,
@@ -3640,8 +3699,7 @@ def prepare_print_package(
         )
     except PrintLayoutValidationError as exc:
         raise HTTPException(422, str(exc)) from exc
-    db.commit()  # nothing is written yet; the figures are fetched over the network: no «idle in transaction» meanwhile
-    snapshot = _await(_embed_print_figures(snapshot))
+    snapshot = _await(_embed_print_figures(snapshot), db)  # nothing is written yet: the bridge ends the read transaction
 
     exam.group_id = str(canonical_group["id"])
     exam.group_name = canonical_group.get("name")
@@ -3716,7 +3774,7 @@ def start_print_exam(
     package = _get_print_package_or_404(db, exam.id)
     if package.status != "ready":
         raise HTTPException(409, "Печатный комплект недоступен для проведения")
-    _await(_require_lesson_in_progress(_exam_view(exam), actor))
+    _await(_require_lesson_in_progress(_exam_view(exam), actor), db)
 
     exam.status = "active"
     settings = deepcopy(exam.settings or {})
@@ -3792,8 +3850,7 @@ def preview_print_pdf(
         raise HTTPException(409, "Печатный комплект уже зафиксирован. Скачайте его из карточки экзамена")
 
     snapshot = _build_print_preview_snapshot(exam)
-    db.commit()  # the figures are fetched over the network below: do not sit «idle in transaction» meanwhile
-    snapshot = _await(_embed_print_figures(snapshot))
+    snapshot = _await(_embed_print_figures(snapshot), db)  # ends the read transaction before the figures are fetched
     try:
         pdf = (
             render_student_exam_pdf(snapshot, variant_number)
@@ -3801,13 +3858,13 @@ def preview_print_pdf(
             else render_teacher_key_pdf(snapshot, variant_number)
         )
     except (KeyError, ValueError) as exc:
-        log.exception("Cannot render print preview for exam %s", exam.id)
+        log.exception("Cannot render print preview for exam %s", exam_id)
         raise HTTPException(500, "Не удалось сформировать предпросмотр печатного бланка") from exc
 
     filename = (
-        f"algo_exam_preview_{exam.id}_variant_{variant_number}.pdf"
+        f"algo_exam_preview_{exam_id}_variant_{variant_number}.pdf"
         if kind == "student"
-        else f"algo_exam_preview_key_{exam.id}_variant_{variant_number}.pdf"
+        else f"algo_exam_preview_key_{exam_id}_variant_{variant_number}.pdf"
     )
     return _pdf_response(pdf, filename, download=False)
 
@@ -3824,12 +3881,14 @@ def download_print_student_pdf(
     package = _get_print_package_or_404(db, exam.id)
     if package.status not in {"ready", "released", "completed"}:
         raise HTTPException(410, "Печатный комплект отменён и больше не доступен")
+    snapshot, package_id = package.snapshot, package.id
+    _release_read_transaction(db)  # the rendering below (chromium) takes seconds: no «idle in transaction» meanwhile
     try:
-        pdf = render_student_exam_pdf(package.snapshot, variant_number)
+        pdf = render_student_exam_pdf(snapshot, variant_number)
     except (KeyError, ValueError) as exc:
-        log.exception("Cannot render student print package %s", package.id)
+        log.exception("Cannot render student print package %s", package_id)
         raise HTTPException(500, "Не удалось сформировать печатный бланк") from exc
-    return _pdf_download_response(pdf, f"algo_exam_{exam.id}_variant_{variant_number}.pdf")
+    return _pdf_download_response(pdf, f"algo_exam_{exam_id}_variant_{variant_number}.pdf")
 
 
 @router.get("/exams/{exam_id}/print-package/teacher-key/{variant_number}.pdf", summary="Скачать ключ преподавателя")
@@ -3846,12 +3905,14 @@ def download_print_teacher_key_pdf(
     package = _get_print_package_or_404(db, exam.id)
     if package.status not in {"ready", "released", "completed"}:
         raise HTTPException(410, "Печатный комплект отменён и больше не доступен")
+    snapshot, package_id = package.snapshot, package.id
+    _release_read_transaction(db)  # the rendering below (chromium) takes seconds: no «idle in transaction» meanwhile
     try:
-        pdf = render_teacher_key_pdf(package.snapshot, variant_number)
+        pdf = render_teacher_key_pdf(snapshot, variant_number)
     except (KeyError, ValueError) as exc:
-        log.exception("Cannot render teacher print key %s", package.id)
+        log.exception("Cannot render teacher print key %s", package_id)
         raise HTTPException(500, "Не удалось сформировать ключ преподавателя") from exc
-    return _pdf_download_response(pdf, f"algo_exam_{exam.id}_teacher_key_variant_{variant_number}.pdf")
+    return _pdf_download_response(pdf, f"algo_exam_{exam_id}_teacher_key_variant_{variant_number}.pdf")
 
 
 @router.get(
@@ -4120,7 +4181,7 @@ def _entry_gate(db: Session, exam_id: str) -> GeneratedExam:
 
 
 async def _close_ticket(ticket: EntryTicket) -> None:
-    """Give the provisional failure back.  Shielded: a client that hangs up must not keep its budget spent."""
+    """Release the in-flight reservation.  Shielded: a client that hangs up must not keep its slot taken."""
     with anyio.CancelScope(shield=True):
         await run_in_threadpool(ticket.close)
 
@@ -4270,7 +4331,7 @@ async def check_student_for_exam(
     try:
         return await _check_student_admitted(exam, req, ticket, db)
     finally:
-        await _close_ticket(ticket)  # gives the provisional failure back unless the lookup really failed
+        await _close_ticket(ticket)  # releases the in-flight reservation (a real failure was counted by ticket.fail())
 
 
 def _check_student_outcome(db: Session, exam: GeneratedExam, student: dict) -> CheckStudentExamResponse:
@@ -5125,7 +5186,7 @@ def list_student_exam_history(
     Printed exams are intentionally absent until a future marking workflow
     stores per-student results in ``exam_sessions``.
     """
-    _await(require_student_history_access(actor, student_id))
+    _await(require_student_history_access(actor, student_id), db)
     rows = (
         db.query(ExamSession, GeneratedExam)
         .join(GeneratedExam, GeneratedExam.id == ExamSession.exam_id)

@@ -14,6 +14,10 @@ from fastapi import FastAPI
 
 LAT_MIN = float(os.getenv("STUB_LAT_MIN_MS", "50")) / 1000
 LAT_MAX = float(os.getenv("STUB_LAT_MAX_MS", "200")) / 1000
+# the group lookup of the teacher routes (`/auth/org/groups/{id}`) can be made slow on its own: a loaded auth-service
+GROUP_LAT = float(os.getenv("STUB_GROUP_LAT_MS", "0")) / 1000
+# the report model (Azure OpenAI / DeepSeek chat-completions shape) can be made as slow as a real one
+LLM_LAT = float(os.getenv("STUB_LLM_LAT_MS", "0")) / 1000
 _NAMESPACE = uuid.UUID("6f1c0c3e-0a52-4d57-9a3d-3b9d2f5a1e10")
 
 app = FastAPI()
@@ -47,7 +51,7 @@ async def me():
 
 @app.get("/api/v1/auth/org/groups/{group_id}")
 async def group(group_id: str):
-    await _latency()
+    await asyncio.sleep(GROUP_LAT) if GROUP_LAT else await _latency()
     return {"id": group_id, "name": "8А", "class_level": 8, "teacher_id": "USR_LOAD", "teacher_name": "Учитель"}
 
 
@@ -55,3 +59,11 @@ async def group(group_id: str):
 async def attendance(org_id: str, group_id: str, lesson_id: str, lesson_date: str = ""):
     await _latency()
     return {"status": "in_progress"}
+
+
+@app.post("/llm")
+async def llm():
+    """A chat-completions answer after STUB_LLM_LAT_MS: valid JSON with a summary, as the report asks the model for."""
+    await asyncio.sleep(LLM_LAT)
+    narrative = '{"summary": "Класс справился с работой.", "strengths": ["Линейные уравнения"], "critical_gaps": []}'
+    return {"choices": [{"message": {"content": narrative}}]}

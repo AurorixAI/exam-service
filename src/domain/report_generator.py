@@ -522,25 +522,32 @@ def generate_exam_report(
     Aggregate sessions, call Azure DeepSeek (or Gemini fallback), upsert ExamReport.
     """
     repo = ExamReportRepository(db)
+    exam_id, exam_title = exam.id, exam.title
 
     if not force:
-        existing = repo.get_by_exam(exam.id)
+        existing = repo.get_by_exam(exam_id)
         if existing:
-            log.info("ExamReport already exists for exam %s — returning cached", exam.id)
+            log.info("ExamReport already exists for exam %s — returning cached", exam_id)
             return existing
 
     agg = _aggregate(exam, sessions)
 
     if agg["submitted_count"] == 0:
-        log.warning("No submitted sessions for exam %s — skipping report", exam.id)
+        log.warning("No submitted sessions for exam %s — skipping report", exam_id)
         return None
 
-    # AI narrative JSON generation
+    submitted = [s for s in sessions if s.status == "submitted"]
+    grade = next((s.class_level for s in submitted if s.class_level), None)
+
+    # The aggregates are plain dicts now.  End the read transaction BEFORE the model is called: the call takes up to
+    # 120 s (and the server kills a transaction that idles for 30 s - ROADMAP #95 R3: the report was lost and the
+    # teacher was told «no submitted works»).  Nothing below reads the ORM objects again.
+    db.commit()
+
+    # AI narrative JSON generation (no transaction, no connection held)
     report_dict: Optional[Dict[str, Any]] = None
     try:
-        submitted = [s for s in sessions if s.status == "submitted"]
-        grade = next((s.class_level for s in submitted if s.class_level), None)
-        prompt = _build_deepseek_prompt(exam.title, grade, agg)
+        prompt = _build_deepseek_prompt(exam_title, grade, agg)
 
         raw_response = call_gemini(
             prompt,
@@ -551,22 +558,24 @@ def generate_exam_report(
         report_dict = parse_json_response(raw_response)
         if not report_dict or not report_dict.get("summary"):
             log.warning("DeepSeek output invalid JSON; using deterministic fallback")
-            report_dict = _build_deterministic_fallback(exam.title, grade, agg)
+            report_dict = _build_deterministic_fallback(exam_title, grade, agg)
         else:
-            log.info("DeepSeek report successfully generated for exam %s", exam.id)
+            log.info("DeepSeek report successfully generated for exam %s", exam_id)
     except Exception as exc:
-        log.warning("AI generation failed for exam %s: %s — using deterministic fallback", exam.id, exc)
-        submitted = [s for s in sessions if s.status == "submitted"]
-        grade = next((s.class_level for s in submitted if s.class_level), None)
-        report_dict = _build_deterministic_fallback(exam.title, grade, agg)
+        log.warning("AI generation failed for exam %s: %s — using deterministic fallback", exam_id, exc)
+        report_dict = _build_deterministic_fallback(exam_title, grade, agg)
 
     report_dict = bind_report_task_statements(report_dict, agg["task_analytics"])
     narrative_json_str = json.dumps(report_dict, ensure_ascii=False)
 
+    # Save in a fresh, short transaction.  «Final» is decided on the exam as it is NOW: it may have been closed (or
+    # not) while the model was thinking.  A failure here is NOT «no submitted works»: it propagates (a transient
+    # database condition becomes a 503 the teacher retries, anything else a 500).
     try:
-        is_final = exam.status == "closed" or exam.status == "archived"
+        status = db.query(GeneratedExam.status).filter(GeneratedExam.id == exam_id).scalar()
+        is_final = status == "closed" or status == "archived"
         report = repo.upsert(
-            exam.id,
+            exam_id,
             _rand_id("er"),
             total_students=agg["total_students"],
             submitted_count=agg["submitted_count"],
@@ -580,10 +589,10 @@ def generate_exam_report(
         )
         log.info(
             "ExamReport saved for exam %s (submitted=%d, narrative=yes, final=%s)",
-            exam.id, agg["submitted_count"], is_final,
+            exam_id, agg["submitted_count"], is_final,
         )
         return report
     except Exception as exc:
-        log.error("Failed to save ExamReport for exam %s: %s", exam.id, exc, exc_info=True)
+        log.error("Failed to save ExamReport for exam %s: %s", exam_id, exc, exc_info=True)
         db.rollback()
-        return None
+        raise

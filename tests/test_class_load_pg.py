@@ -195,3 +195,67 @@ async def _lock_wait_scenario():
             assert one.json()["answered_count"] == 2 and one.json()["correct_count"] == 1
         blocker.close()
         engine.dispose()
+
+
+def test_a_flood_of_slow_teacher_polls_does_not_slow_the_students_down():
+    """80 concurrent teacher polls, each waiting 3 s for the group lookup, over a running exam of 60 students.
+
+    Before the staff cap and the released connections: students' p95 2.7 s (the polls held the threads and the pool).
+    """
+    report = asyncio.run(load.run_load(
+        60, PG_URL, REDIS_URL, teacher_pollers=80, group_latency_ms=3000, progress_saves=6, request_timeout=20,
+        deadline=120,
+    ))
+    print("\n" + report.render())
+    assert report.failures() == []
+    assert report.student_p95() < 1.0
+    flood = [s for s in report.samples if s.name == "t-flood"]
+    assert any(s.status == "200" for s in flood) and any(s.status == "503" for s in flood)  # served up to the cap, shed beyond
+    assert max(s.seconds for s in flood if s.status == "503") < 1.0  # the refusal is immediate, not a queue
+
+
+def test_a_class_of_60_behind_one_nat_with_a_slow_auth_service_gets_in():
+    """Lookups in flight are not failures: 60 students, one address, a burst in half a second, auth answers in 0.6-0.9 s."""
+    report = asyncio.run(load.run_load(
+        60, PG_URL, REDIS_URL, same_ip=True, ramp=0.5, latency_ms=(600, 900), progress_saves=4, reload_ratio=0.5,
+        request_timeout=20, deadline=90,
+    ))
+    print("\n" + report.render())
+    assert report.failures() == []
+    assert not any(sample.status == "429" for sample in report.samples)
+    assert report.finished_students == 60
+
+
+def test_a_report_whose_model_takes_35_seconds_is_saved_not_lost():
+    """The model call ran inside an open read transaction: killed at 30 s, swallowed, answered as «no submitted works»."""
+    asyncio.run(_slow_report_scenario())
+
+
+async def _slow_report_scenario():
+    async with load.running_stack(PG_URL, REDIS_URL, stub_env={"STUB_LLM_LAT_MS": "35000"}) as stack:
+        teacher = {"Authorization": "Bearer teacher-load"}
+        async with httpx.AsyncClient(base_url=stack.base + API, timeout=100) as http:
+            for i in range(3):
+                body = {"student_name": f"Ученик {i}", "student_id": f"00000000-0000-0000-0000-00000000010{i}"}
+                started = await http.post(f"/exams/by-code/{load.CODE}/start", json=body, headers={"X-Real-IP": f"10.8.0.{i + 1}"})
+                assert started.status_code == 200, started.text
+                token = {"X-Exam-Session-Token": started.json()["session_token"]}
+                done = await http.post(
+                    f"/exam-sessions/{started.json()['session_id']}/submit",
+                    json={"answers": {"TASK_000": "3", "TASK_001": "x"}, "time_spent_seconds": 20}, headers=token,
+                )
+                assert done.status_code == 200, done.text
+            began = time.monotonic()
+            report, health = await asyncio.gather(
+                http.post(f"/exams/{load.EXAM_ID}/report", headers=teacher),
+                http.get(stack.base + "/health/live"),
+            )
+            took = time.monotonic() - began
+            assert health.status_code == 200
+            assert report.status_code == 200, report.text
+            assert took > 34, took  # the model really took its 35 s
+            payload = report.json()
+            assert payload["narrative_generated"] is True and payload["submitted_count"] == 3
+            assert "Класс справился" in payload["narrative_ru"]
+            again = await http.get(f"/exams/{load.EXAM_ID}/report", headers=teacher)
+            assert again.status_code == 200 and again.json()["submitted_count"] == 3  # and it is in the database

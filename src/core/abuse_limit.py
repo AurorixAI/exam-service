@@ -10,8 +10,13 @@ expensive instead, without locking out a legitimate class:
   or name counts once, a legitimate student fails rarely, a walk over the ID space fails on every guess - and it
   is kept per (exam code, client address), never per address alone.  The volume of ALL attempts is capped far
   above what a class does, only to stop floods.
-* The budget is taken at ADMISSION, atomically (a provisional failure added to a set under the limit in one Redis
-  step) and given back when the attempt resolves a student, so parallel requests cannot overshoot it.
+* The failure is counted when it HAPPENS (``EntryTicket.fail()``: the lookup found nobody), and a new attempt is
+  refused while the address already holds the budget of distinct failed inputs.  What parallel requests may do is
+  bounded by a SEPARATE in-flight reservation (ENTRY_IN_FLIGHT, taken atomically at admission, released when the
+  attempt ends): a class that joins within a second behind a slow auth-service has dozens of lookups in flight at
+  once and none of them is a failure yet, so they must not spend the failure budget (they did, ROADMAP #95 R3: 30
+  students in flight refused the 31st).  A parallel burst of walkers can therefore overshoot the failure budget by
+  at most the in-flight cap, once; the next attempt after it is refused.
 * A distributed walk (many addresses, one code) is met by a per-code circuit breaker that does NOT lock the code:
   once the code has collected CODE_FAILS_SOFT distinct failures in an hour, only an address that is itself
   walking is refused - at least BREAKER_MIN_DISTINCT_FAILS failures AND more than half of its RESOLVED lookups
@@ -67,9 +72,13 @@ class Limit:
 # the real brake against a walk over the ID space is the DISTINCT-failure budget below, not the volume.
 ATTEMPTS_PER_MINUTE = Limit(600, 60)
 ATTEMPTS_PER_HOUR = Limit(3000, 3600)
-# DISTINCT failed inputs.  A legitimate class has a handful (typos, retyped once); a walk has one per guess.
+# DISTINCT failed inputs.  A legitimate class has a handful (typos, retyped once); a walk has one per guess.  Counted
+# when a lookup really fails, never for a lookup that is merely in flight.
 FAILS_PER_MINUTE = Limit(30, 60)
 FAILS_PER_HOUR = Limit(150, 3600)
+# Lookups in flight at once per (code, address): a class of 60-100 behind one NAT joining within a second, with an
+# auth-service that takes a second to answer, has that many.  The window is only the lifetime of a leaked reservation.
+ENTRY_IN_FLIGHT = Limit(200, 120)
 # Per exam code over ALL addresses: when this many distinct failures were seen in an hour the breaker is armed.
 # It is above one address's hour budget on purpose: a lone walker meets its own budget first, the breaker is for
 # several addresses walking the same code...
@@ -329,6 +338,33 @@ class _Counters:
             self._prune(now)
             return ADDED, len(members), left
 
+    def peek_member(self, key: str, member: str, limit: int) -> Tuple[int, int, int]:
+        """Would *member* be let in?  (EXISTS | ADDED = there is room | FULL, members now, seconds left); changes nothing."""
+        client = self._redis()
+        if client is not None:
+            try:
+                pipe = client.pipeline()
+                pipe.sismember(key, member)
+                pipe.scard(key)
+                pipe.ttl(key)
+                present, size, ttl = pipe.execute()
+                self._mark_up()
+                left = max(int(ttl), 1)
+                if present:
+                    return EXISTS, int(size), left
+                return (FULL if int(size) >= limit else ADDED), int(size), left
+            except Exception as exc:  # noqa: BLE001
+                self._mark_down(exc)
+        now = _now()
+        with self._lock:
+            members, ends_at = self._sets.get(key, (set(), 0.0))
+            if ends_at <= now:
+                return ADDED, 0, 1
+            left = max(math.ceil(ends_at - now), 1)
+            if member in members:
+                return EXISTS, len(members), left
+            return (FULL if len(members) >= limit else ADDED), len(members), left
+
     def remove_member(self, key: str, member: str) -> None:
         client = self._redis()
         if client is not None:
@@ -433,25 +469,29 @@ def too_many_attempts(retry_after: int) -> HTTPException:
 
 # ── the exam entry policy ──────────────────────────────────────────────────────────────────────────────────
 class EntryTicket:
-    """One admitted identity attempt, holding a provisional failure until it resolves.
+    """One admitted identity attempt.
 
-    ``fail()`` makes the failure real (the lookup found nobody); ``matched()`` records that it found a student;
-    ``close()`` - always called, in a ``finally`` - gives back the provisional failure THIS ticket took, unless
-    ``fail()`` was called: a match, a 410, a 503 are not failed guesses.  A member another request had added
-    first is never taken back by a ticket that did not add it.
+    It holds an IN-FLIGHT reservation until it ends (``close()``, always called, in a ``finally``).  ``fail()`` makes a
+    failure real - the lookup found nobody - and only then is the input counted against the failure budgets;
+    ``matched()`` records that it found a student.  A 410, a 503, a match, a client that hung up are not failed guesses.
+    A reservation another request took first is never released by a ticket that did not take it.
     """
 
     def __init__(
         self,
         ip_scope: str,
         member: str,
-        added_keys: Tuple[str, ...],
+        fail_keys: Tuple[str, ...],
+        flight_key: str,
+        flight_taken: bool,
         code_fail_key: str,
         ok_key: str,
     ) -> None:
         self._ip_scope = ip_scope
         self._member = member
-        self._added_keys = added_keys
+        self._fail_keys = fail_keys
+        self._flight_key = flight_key
+        self._flight_taken = flight_taken
         self._code_fail_key = code_fail_key
         self._ok_key = ok_key
         self._failed = False
@@ -461,6 +501,9 @@ class EntryTicket:
         if self._failed:
             return
         self._failed = True
+        # the per-address budgets: the set may hold the budget plus what was in flight when it filled (bounded)
+        for key, limit in zip(self._fail_keys, (FAILS_PER_MINUTE, FAILS_PER_HOUR)):
+            counters.add_member(key, self._member, limit.window, limit.count + ENTRY_IN_FLIGHT.count)
         # the per-code breaker counts each (address, input) once, in a set that stops growing at a cap
         counters.add_member(
             self._code_fail_key, _keyed_hash(f"{self._ip_scope}|{self._member}"), CODE_FAILS_SOFT.window, CODE_FAIL_SET_CAP
@@ -475,9 +518,8 @@ class EntryTicket:
         if self._closed:
             return
         self._closed = True
-        if not self._failed:
-            for key in self._added_keys:
-                counters.remove_member(key, self._member)
+        if self._flight_taken:
+            counters.remove_member(self._flight_key, self._member)
 
 
 def reset_entry_limits(exam_code: str) -> int:
@@ -516,18 +558,20 @@ def admit_identity_attempt(request: Request, exam_code: str, *typed_identity: Op
         if attempts > limit.count:
             exceeded.append(left)
 
-    # the provisional failure: taken atomically under the budget, given back on a match (EntryTicket.close)
-    added: list[str] = []
+    # the failure budgets: an input that already failed is let through (it counts once); a NEW input is refused while the
+    # address holds the budget of distinct failed inputs.  In-flight lookups are not failures and are not counted here.
     for key, limit in zip(fail_keys, (FAILS_PER_MINUTE, FAILS_PER_HOUR)):
-        status, _, left = counters.add_member(key, member, limit.window, limit.count)
+        status, _, left = counters.peek_member(key, member, limit.count)
         if status == FULL:
             exceeded.append(left)
-        elif status == ADDED:
-            added.append(key)
 
     if exceeded:
-        for key in added:
-            counters.remove_member(key, member)
         raise too_many_attempts(max(exceeded))
 
-    return EntryTicket(ip_scope, member, tuple(added), code_fail_key, ok_key)
+    # the in-flight reservation: taken atomically under its own, larger budget, released by ticket.close()
+    flight_key = f"examflight:{ip_scope}"
+    status, _, _ = counters.add_member(flight_key, member, ENTRY_IN_FLIGHT.window, ENTRY_IN_FLIGHT.count)
+    if status == FULL:
+        raise too_many_attempts(3)  # a flood of simultaneous lookups: a few seconds, not the minute of a failure budget
+
+    return EntryTicket(ip_scope, member, fail_keys, flight_key, status == ADDED, code_fail_key, ok_key)

@@ -109,6 +109,10 @@ class LoadReport:
     def overall_p95(self) -> float:
         return round(self._pct([s.seconds for s in self.samples if s.ok], 0.95), 3)
 
+    def student_p95(self) -> float:
+        """p95 of what the STUDENTS saw (teacher panels excluded): the number a flood of teacher polls must not move."""
+        return round(self._pct([s.seconds for s in self.samples if not s.name.startswith("t-")], 0.95), 3)
+
     def health_summary(self) -> dict:
         out: dict = {}
         for kind in sorted({h[0] for h in self.health}):
@@ -140,7 +144,7 @@ class LoadReport:
         lines = [
             f"class load: {self.students} students, mode={self.mode}{'+expiry' if self.expiry else ''}, {self.workers}"
             f" workers, wall {self.wall_seconds:.1f}s, finished {self.finished_students}/{self.students},"
-            f" overall p95 {self.overall_p95()}s"
+            f" overall p95 {self.overall_p95()}s, students' p95 {self.student_p95()}s"
         ]
         for name, row in self.by_endpoint().items():
             lines.append(
@@ -260,6 +264,7 @@ def _seed(pg_url: str, mode: str, expire_after: Optional[float] = None) -> None:
         settings["started_at"] = started.isoformat()
     with engine.begin() as conn:
         conn.execute(sa.text("SET LOCAL lock_timeout = '10s'"))
+        conn.execute(sa.text("DELETE FROM exam_reports WHERE exam_id = :e"), {"e": EXAM_ID})
         conn.execute(sa.text("DELETE FROM exam_sessions WHERE exam_id = :e"), {"e": EXAM_ID})
         conn.execute(sa.text("DELETE FROM generated_exams WHERE id = :e"), {"e": EXAM_ID})
         conn.execute(
@@ -475,9 +480,12 @@ class _Run:
         """A teacher watching the class: three panels polled all the time; «close» when asked, under the load."""
         headers = {"Authorization": "Bearer teacher-load"}
 
+        # under a flood of polls the panels may be shed too (503 + Retry-After is the agreed answer, not a failure)
+        shed_ok = (200, 503) if self.cfg.teacher_pollers else (200,)
+
         async def poll(name: str, path: str, every: float) -> None:
             while not stop.is_set():
-                await self.call(client, name, "GET", path, headers=headers)
+                await self.call(client, name, "GET", path, headers=headers, accept=shed_ok)
                 await asyncio.sleep(every)
 
         pollers = [
@@ -485,6 +493,15 @@ class _Run:
             asyncio.create_task(poll("t-live-summary", "/exams/live-summary", 0.5)),
             asyncio.create_task(poll("t-sessions", f"/exams/{EXAM_ID}/sessions", 0.7)),
         ]
+
+        async def flood(index: int) -> None:  # many teachers / many open dashboards: a 503 + Retry-After is an answer
+            await asyncio.sleep(index * 0.01)
+            while not stop.is_set():
+                r = await self.call(client, "t-flood", "GET", f"/exams/{EXAM_ID}/lobby-status", headers=headers,
+                                    accept=(200, 503))
+                await asyncio.sleep(float(r.headers.get("retry-after", 0.2)) if r is not None and r.status_code == 503 else 0.2)
+
+        pollers += [asyncio.create_task(flood(i)) for i in range(self.cfg.teacher_pollers)]
         try:
             if self.cfg.close_after is not None:
                 await started.wait()
@@ -538,6 +555,7 @@ async def running_stack(
     latency_ms: tuple = (50, 200),
     expire_after: Optional[float] = None,
     extra_env: Optional[dict] = None,
+    stub_env: Optional[dict] = None,
 ):
     """auth stub + exam-service (uvicorn, `workers` processes) + one seeded exam; everything is stopped on exit."""
     await asyncio.to_thread(_drop_other_connections, pg_url)  # a crashed earlier run must not leave its locks behind
@@ -549,12 +567,14 @@ async def running_stack(
         stub = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "--app-dir", str(HERE), "auth_stub:app", "--port", str(stub_port),
              "--log-level", "warning"],
-            env=_env(STUB_LAT_MIN_MS=str(latency_ms[0]), STUB_LAT_MAX_MS=str(latency_ms[1])),
+            env=_env(STUB_LAT_MIN_MS=str(latency_ms[0]), STUB_LAT_MAX_MS=str(latency_ms[1]), **(stub_env or {})),
             stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True,
         )
         env = _env(
             DATABASE_URL=pg_url, REDIS_URL=redis_url, AUTH_SERVICE_URL=f"http://127.0.0.1:{stub_port}",
-            INTERNAL_SERVICE_TOKEN="load-test-token", APP_ENV="production", **(extra_env or {}),
+            INTERNAL_SERVICE_TOKEN="load-test-token", APP_ENV="production",
+            AZURE_DEEPSEEK_API_KEY="load-llm-key", AZURE_DEEPSEEK_ENDPOINT=f"http://127.0.0.1:{stub_port}/llm",
+            **(extra_env or {}),
         )
         app = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "src.main:app", "--host", "127.0.0.1", "--port", str(app_port),
@@ -608,19 +628,22 @@ async def run_load(
     expire_after: Optional[float] = None,
     teacher: bool = False,
     close_after: Optional[float] = None,
+    teacher_pollers: int = 0,
+    group_latency_ms: Optional[int] = None,
     extra_env: Optional[dict] = None,
 ) -> LoadReport:
-    teacher = teacher or close_after is not None
+    teacher = teacher or close_after is not None or teacher_pollers > 0
+    stub_env = {"STUB_GROUP_LAT_MS": str(group_latency_ms)} if group_latency_ms else None
     cfg = argparse.Namespace(
         students=students, progress_saves=progress_saves, reload_ratio=reload_ratio, ramp=ramp, same_ip=same_ip,
-        deadline=deadline, expire_after=expire_after, close_after=close_after,
+        deadline=deadline, expire_after=expire_after, close_after=close_after, teacher_pollers=teacher_pollers,
     )
     report = LoadReport(
         students=students, mode=mode, workers=workers, expiry=expire_after is not None or close_after is not None
     )
     async with running_stack(
         pg_url, redis_url, mode=mode, workers=workers, latency_ms=latency_ms, expire_after=expire_after,
-        extra_env=extra_env,
+        extra_env=extra_env, stub_env=stub_env,
     ) as stack:
         run = _Run(cfg)
         if mode != "lobby":
@@ -683,6 +706,8 @@ def main() -> int:
     parser.add_argument("--expire-after", type=float, default=None, help="the exam timer runs out this many seconds in")
     parser.add_argument("--teacher", action="store_true", help="a teacher polls the monitoring panels all the time")
     parser.add_argument("--close-after", type=float, default=None, help="the teacher closes the exam this many seconds after it started")
+    parser.add_argument("--teacher-pollers", type=int, default=0, help="N extra concurrent teacher panel pollers")
+    parser.add_argument("--group-latency", type=int, default=None, help="auth-service group lookup latency, ms")
     parser.add_argument("--show-log", action="store_true", help="print the server log (without the per-request lines)")
     args = parser.parse_args()
     low, high = (int(x) for x in args.latency.split(","))
@@ -690,7 +715,8 @@ def main() -> int:
         args.students, args.pg, args.redis, mode=args.mode, workers=args.workers, latency_ms=(low, high),
         progress_saves=args.saves, reload_ratio=args.reload_ratio, request_timeout=args.timeout,
         deadline=args.deadline, ramp=args.ramp, same_ip=args.same_ip, expire_after=args.expire_after,
-        teacher=args.teacher, close_after=args.close_after,
+        teacher=args.teacher, close_after=args.close_after, teacher_pollers=args.teacher_pollers,
+        group_latency_ms=args.group_latency,
     ))
     print(report.render())
     if args.show_log and not report.failures():

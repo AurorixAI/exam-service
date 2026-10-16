@@ -30,6 +30,7 @@ from src.core.config import get_settings
 from src.core.abuse_limit import (
     ADDED,
     ATTEMPTS_PER_MINUTE,
+    ENTRY_IN_FLIGHT,
     BREAKER_MIN_DISTINCT_FAILS,
     CODE_FAIL_SET_CAP,
     CODE_FAILS_SOFT,
@@ -342,6 +343,9 @@ class _FakeRedis:
             def get(self, key):
                 self.calls.append(("get", key))
 
+            def sismember(self, key, member):
+                self.calls.append(("sismember", (key, member)))
+
             def scard(self, key):
                 self.calls.append(("scard", key))
 
@@ -351,7 +355,9 @@ class _FakeRedis:
             def execute(self):
                 out = []
                 for op, key in self.calls:
-                    if op == "get":
+                    if op == "sismember":
+                        out.append(1 if key[1] in outer.sets.get(key[0], ()) else 0)
+                    elif op == "get":
                         out.append(outer.get(key))
                     elif op == "scard":
                         out.append(len(outer.sets.get(key, ())))
@@ -435,6 +441,11 @@ class TestRedisBackend:
             assert counters.add_member("rlt:s", "b", 60, 2)[0] == ADDED
             status, size, ttl = counters.add_member("rlt:s", "c", 60, 2)
             assert (status, size) == (FULL, 2) and 0 < ttl <= 60
+            assert counters.peek_member("rlt:s", "a", 2)[0] == EXISTS  # already there: counts once
+            assert counters.peek_member("rlt:s", "z", 2)[:2] == (FULL, 2)
+            assert counters.peek_member("rlt:s", "z", 3)[:2] == (ADDED, 2)  # room, nothing added
+            assert counters.count_members("rlt:s")[0] == 2
+            assert counters.peek_member("rlt:none", "z", 2) == (ADDED, 0, 1)
             counters.remove_member("rlt:s", "a")
             assert counters.count_members("rlt:s")[0] == 1
             assert counters.count_members("rlt:nothing") == (0, 0)
@@ -474,7 +485,7 @@ class TestLegitimateClassIsNotLockedOut:
         assert waiting.status_code == 429 and int(waiting.headers["Retry-After"]) <= 60
         clock.now += 61
         for i in range(1, 31):
-            assert check(client, f"TE-{i:03d}").json()["enrolled"] is True  # and each success gives its provisional back
+            assert check(client, f"TE-{i:03d}").json()["enrolled"] is True  # and a success costs nothing
 
     def test_two_classes_with_different_codes_behind_one_nat_have_separate_budgets(self, client, db, exam, roster):
         second = GeneratedExam(
@@ -633,7 +644,7 @@ class TestRetryAfterIsTheLongestWait:
         clock = _Clock(monkeypatch)
         request = _req({"X-Real-IP": "203.0.113.7"})
         for n in range(FAILS_PER_MINUTE.count):
-            admit_identity_attempt(request, CODE, miss(n))
+            admit_identity_attempt(request, CODE, miss(n)).fail()
         clock.now += 20
         with pytest.raises(HTTPException) as caught:
             admit_identity_attempt(request, CODE, miss(999))
@@ -641,82 +652,131 @@ class TestRetryAfterIsTheLongestWait:
         assert int(caught.value.headers["Retry-After"]) == 40  # the minute window opened 20 s ago
 
 
-class TestTheProvisionalFailureIsAtomic:
-    def test_parallel_admissions_cannot_exceed_the_budget(self):
-        """200 threads with 200 distinct inputs against a budget of 30 per minute: exactly 30 are admitted."""
-        request = _req({"X-Real-IP": "203.0.113.7"})
+ADDRESS = "203.0.113.7"
+
+
+def _keys():
+    scope = f"{code_key(CODE)}:0:{ADDRESS}"
+    return f"examfail:60:{scope}", f"examfail:3600:{scope}", f"examflight:{scope}"
+
+
+class TestLookupsInFlightAreNotFailures:
+    """ROADMAP #95 R3: a class behind one NAT joins within a second and the auth-service answers slowly: dozens of
+    lookups are in flight at once.  They hold a reservation of their own; only a lookup that FAILS spends the budget."""
+
+    def test_parallel_admissions_are_bounded_by_the_in_flight_budget(self):
+        """300 simultaneous distinct inputs against a reservation budget of 200: exactly 200 are admitted."""
+        request = _req({"X-Real-IP": ADDRESS})
         admitted, refused, errors = [], [], []
         barrier = threading.Barrier(50)
 
         def worker(base):
             try:
                 barrier.wait()
-                for n in range(base, base + 4):
+                for n in range(base, base + 6):
                     try:
                         admitted.append(admit_identity_attempt(request, CODE, miss(n)))
                     except HTTPException as exc:
-                        refused.append(exc.status_code)
+                        refused.append(exc)
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
 
-        threads = [threading.Thread(target=worker, args=(i * 4,)) for i in range(50)]
+        threads = [threading.Thread(target=worker, args=(i * 6,)) for i in range(50)]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
         assert not errors
-        assert len(admitted) == FAILS_PER_MINUTE.count and set(refused) == {429}
-        assert len(admitted) + len(refused) == 200
+        assert len(admitted) == ENTRY_IN_FLIGHT.count and len(admitted) + len(refused) == 300
+        assert {exc.status_code for exc in refused} == {429} and {exc.headers["Retry-After"] for exc in refused} == {"3"}
 
-    def test_a_match_gives_the_provisional_failure_back(self):
-        request = _req({"X-Real-IP": "203.0.113.7"})
-        key = f"examfail:60:{code_key(CODE)}:0:203.0.113.7"
+    def test_a_class_of_sixty_in_flight_at_once_spends_no_failure_budget(self):
+        request = _req({"X-Real-IP": ADDRESS})
+        minute, hour, flight = _keys()
+        tickets = [admit_identity_attempt(request, CODE, f"TE-{n:03d}") for n in range(60)]  # 60 lookups in flight
+        assert counters.count_members(flight)[0] == 60
+        assert counters.count_members(minute) == (0, 0) and counters.count_members(hour) == (0, 0)
+        for ticket in tickets:
+            ticket.matched("student")
+            ticket.close()
+        assert counters.count_members(flight) == (0, 0)
+        assert admit_identity_attempt(request, CODE, "TE-061") is not None  # and the address is as free as before
+
+    def test_a_match_releases_the_reservation_and_costs_no_failure(self):
+        request = _req({"X-Real-IP": ADDRESS})
+        minute, _, flight = _keys()
         ticket = admit_identity_attempt(request, CODE, "TE-001")
-        assert counters.count_members(key)[0] == 1  # taken at admission
+        assert counters.count_members(flight)[0] == 1  # taken at admission
         ticket.close()  # the lookup found a student: no failure was called
-        assert counters.count_members(key) == (0, 0)
+        assert counters.count_members(flight) == (0, 0) and counters.count_members(minute) == (0, 0)
         ticket.close()  # idempotent
 
-    def test_a_failure_stays_counted(self):
-        request = _req({"X-Real-IP": "203.0.113.7"})
-        key = f"examfail:60:{code_key(CODE)}:0:203.0.113.7"
+    def test_a_failure_is_counted_when_it_happens_and_stays_after_close(self):
+        request = _req({"X-Real-IP": ADDRESS})
+        minute, hour, flight = _keys()
         ticket = admit_identity_attempt(request, CODE, "NOBODY")
+        assert counters.count_members(minute) == (0, 0)  # not a failure yet
         ticket.fail()
+        assert counters.count_members(minute)[0] == 1 and counters.count_members(hour)[0] == 1
         ticket.close()
-        assert counters.count_members(key)[0] == 1
+        assert counters.count_members(minute)[0] == 1 and counters.count_members(flight) == (0, 0)
 
     def test_a_refused_admission_leaves_nothing_behind(self):
-        request = _req({"X-Real-IP": "203.0.113.7"})
-        key_minute = f"examfail:60:{code_key(CODE)}:0:203.0.113.7"
-        key_hour = f"examfail:3600:{code_key(CODE)}:0:203.0.113.7"
+        request = _req({"X-Real-IP": ADDRESS})
+        minute, hour, flight = _keys()
         for n in range(FAILS_PER_MINUTE.count):
-            admit_identity_attempt(request, CODE, miss(n)).fail()
+            ticket = admit_identity_attempt(request, CODE, miss(n))
+            ticket.fail()
+            ticket.close()
         with pytest.raises(HTTPException):
             admit_identity_attempt(request, CODE, "one-more")
-        assert counters.count_members(key_minute)[0] == FAILS_PER_MINUTE.count
-        assert counters.count_members(key_hour)[0] == FAILS_PER_MINUTE.count  # not rolled forward by the refusal
+        assert counters.count_members(minute)[0] == FAILS_PER_MINUTE.count
+        assert counters.count_members(hour)[0] == FAILS_PER_MINUTE.count  # not rolled forward by the refusal
+        assert counters.count_members(flight) == (0, 0)  # and no reservation was taken for it
+
+    def test_a_retyped_failed_input_is_let_through_even_when_the_budget_is_spent(self):
+        request = _req({"X-Real-IP": ADDRESS})
+        for n in range(FAILS_PER_MINUTE.count):
+            admit_identity_attempt(request, CODE, miss(n)).fail()
+        again = admit_identity_attempt(request, CODE, miss(3))  # the same wrong input: it counts once
+        again.fail()
+        assert counters.count_members(_keys()[0])[0] == FAILS_PER_MINUTE.count
+
+    def test_a_burst_of_walkers_overshoots_the_failure_budget_by_at_most_the_in_flight_cap_once(self):
+        """The price of not charging in-flight lookups: 200 guesses fired at once all fail - and the next is refused."""
+        request = _req({"X-Real-IP": ADDRESS})
+        tickets = [admit_identity_attempt(request, CODE, miss(n)) for n in range(ENTRY_IN_FLIGHT.count)]
+        with pytest.raises(HTTPException) as caught:
+            admit_identity_attempt(request, CODE, miss(9_999))
+        assert caught.value.status_code == 429
+        for ticket in tickets:
+            ticket.fail()
+            ticket.close()
+        assert counters.count_members(_keys()[0])[0] == ENTRY_IN_FLIGHT.count
+        with pytest.raises(HTTPException) as after:
+            admit_identity_attempt(request, CODE, miss(10_000))
+        assert after.value.status_code == 429 and int(after.value.headers["Retry-After"]) > 3
 
 
-class TestATicketGivesBackOnlyWhatItTook:
-    def test_a_second_request_with_the_same_input_cannot_take_the_first_ones_failure_back(self):
-        request = _req({"X-Real-IP": "203.0.113.7"})
-        key = f"examfail:60:{code_key(CODE)}:0:203.0.113.7"
-        first = admit_identity_attempt(request, CODE, "TE-9999")  # adds the member
-        second = admit_identity_attempt(request, CODE, "TE-9999")  # the member is already there: adds nothing
+class TestATicketReleasesOnlyWhatItTook:
+    def test_a_second_request_with_the_same_input_cannot_release_the_first_ones_reservation(self):
+        request = _req({"X-Real-IP": ADDRESS})
+        flight = _keys()[2]
+        first = admit_identity_attempt(request, CODE, "TE-9999")  # takes the reservation
+        second = admit_identity_attempt(request, CODE, "TE-9999")  # the member is already there: takes nothing
         second.close()  # ends without a lookup (a 503, say): it has nothing to give back
-        assert counters.count_members(key)[0] == 1
-        first.fail()
+        assert counters.count_members(flight)[0] == 1
         first.close()
-        assert counters.count_members(key)[0] == 1
+        assert counters.count_members(flight) == (0, 0)
 
-    def test_the_ticket_that_added_it_does_give_it_back(self):
-        request = _req({"X-Real-IP": "203.0.113.7"})
-        key = f"examfail:60:{code_key(CODE)}:0:203.0.113.7"
+    def test_the_ticket_that_took_it_does_release_it(self):
+        request = _req({"X-Real-IP": ADDRESS})
+        flight = _keys()[2]
         first = admit_identity_attempt(request, CODE, "TE-001")
         second = admit_identity_attempt(request, CODE, "TE-001")
         first.matched("student-1")
         first.close()
-        assert counters.count_members(key) == (0, 0)
+        assert counters.count_members(flight) == (0, 0)
         second.close()  # nothing left to remove, nothing breaks
 
 

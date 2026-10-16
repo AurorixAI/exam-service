@@ -107,7 +107,7 @@ def test_cancelling_an_unstarted_online_delivery_revokes_public_access(monkeypat
     """Cancellation returns a lobby to a reusable draft without deleting tasks."""
     exam = _bound_lobby()
     db = MagicMock()
-    db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = exam
+    db.query.return_value.filter.return_value.with_for_update.return_value.populate_existing.return_value.first.return_value = exam
 
     def get_exam(*_args, **_kwargs):
         return exam

@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     db_idle_in_transaction_timeout_ms: int = 30000
     # Size of the thread pool FastAPI/Starlette runs plain ``def`` handlers and ``run_in_threadpool`` in (per worker).
     worker_threads: int = 40
+    # Staff (teacher/admin) requests in flight per worker.  They wait on auth-service with a thread in hand, so they get
+    # their own cap: a flood of dashboard polls is answered 503 + Retry-After instead of taking the threads and the
+    # connections the students of a running exam need.
+    teacher_slots: int = 16
+    # ...of which this many are kept for changes (close, start, assign...): a flood of dashboard reads fills the
+    # others first, so the teacher who presses «close» during it is still served.
+    teacher_write_reserve: int = 4
     # Content Service — HTTP read API (replaces direct content-db connection)
     content_service_url: str = "http://content-service:8004"
     # Auth Service — HTTP API for group/student verification

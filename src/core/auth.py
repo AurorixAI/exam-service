@@ -7,8 +7,11 @@ service and makes token revocation / role changes take effect immediately.
 """
 from __future__ import annotations
 
+import logging
+import threading
+import time
 from dataclasses import dataclass
-from typing import Mapping
+from typing import AsyncIterator, Mapping, Optional
 from uuid import UUID
 
 import httpx
@@ -17,7 +20,66 @@ from fastapi import HTTPException, Request, status
 from src.core.config import get_settings
 
 
+log = logging.getLogger("exam_service.auth")
+
 _STAFF_ROLES = {"owner", "admin", "teacher"}
+
+
+class StaffSlots:
+    """A bounded number of staff requests in flight in this worker; a full house is refused at once, never queued.
+
+    Teacher and admin routes wait on auth-service (hundreds of ms, seconds when it is loaded) holding a worker thread.
+    Without a cap of their own, a burst of dashboard polls takes every thread of the pool and the students of a
+    running exam queue behind them (ROADMAP #95 R3: students' p95 2.7 s under 80 polls).  Thread-safe and independent
+    of any event loop; the cap is per worker process.
+    """
+
+    def __init__(self, size: int, write_reserve: int = 0) -> None:
+        self._size = max(int(size), 1)
+        # reads stop `write_reserve` slots earlier: the last ones are for requests that change something
+        self._read_limit = max(self._size - max(int(write_reserve), 0), 1)
+        self._used = 0
+        self._lock = threading.Lock()
+
+    def try_acquire(self, write: bool = True) -> bool:
+        with self._lock:
+            if self._used >= (self._size if write else self._read_limit):
+                return False
+            self._used += 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            self._used = max(self._used - 1, 0)
+
+    @property
+    def in_use(self) -> int:
+        return self._used
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+
+_last_refusal_log = 0.0
+_staff_slots: Optional[StaffSlots] = None
+_staff_slots_lock = threading.Lock()
+
+
+def staff_slots() -> StaffSlots:
+    global _staff_slots
+    if _staff_slots is None:
+        with _staff_slots_lock:
+            if _staff_slots is None:
+                settings = get_settings()
+                _staff_slots = StaffSlots(settings.teacher_slots, settings.teacher_write_reserve)
+    return _staff_slots
+
+
+def reset_staff_slots() -> None:
+    """Tests: forget the limiter so the next request builds it from the current settings."""
+    global _staff_slots
+    _staff_slots = None
 
 
 @dataclass(frozen=True)
@@ -44,7 +106,27 @@ def _forwarded_auth_headers(request: Request) -> dict[str, str]:
     return headers
 
 
-async def require_exam_staff(request: Request) -> ExamActor:
+async def require_exam_staff(request: Request) -> AsyncIterator[ExamActor]:
+    """Take a staff slot (503 + Retry-After when the worker is full), resolve the actor, hold the slot until the end
+    of the request.  A yield-dependency: FastAPI releases the slot when the response is done, whatever happened."""
+    slots = staff_slots()
+    if not slots.try_acquire(write=request.method not in {"GET", "HEAD", "OPTIONS"}):
+        global _last_refusal_log
+        if time.monotonic() - _last_refusal_log > 10:  # one line per ten seconds, not one per refused poll
+            _last_refusal_log = time.monotonic()
+            log.warning("staff slots exhausted (%d of %d in use): refusing %s", slots.in_use, slots.size, request.url.path)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Сервер сейчас обслуживает много запросов преподавателей. Подождите несколько секунд и повторите.",
+            headers={"Retry-After": "2"},
+        )
+    try:
+        yield await _resolve_staff_actor(request)
+    finally:
+        slots.release()
+
+
+async def _resolve_staff_actor(request: Request) -> ExamActor:
     """Resolve a staff actor through auth-service and fail closed on errors."""
     cached = getattr(request.state, "exam_actor", None)
     if cached is not None:
@@ -165,8 +247,11 @@ async def require_student_history_access(actor: ExamActor, student_id: str) -> d
     return response.json()
 
 
-async def require_exam_access(exam: object, actor: ExamActor) -> None:
-    """Enforce organisation and teacher ownership for one exam.
+def exam_access_group(exam: object, actor: ExamActor) -> Optional[str]:
+    """Everything ``require_exam_access`` decides WITHOUT the network.
+
+    Raises the refusal, or returns the id of the group whose access auth-service must still confirm (``None``: access
+    is already granted).  Split out so a list of exams can be checked with one lookup per distinct group.
 
     Legacy rows without ``org_id`` are intentionally not exposed.  Showing
     them to an arbitrary staff member would reintroduce the data-leak this
@@ -183,15 +268,21 @@ async def require_exam_access(exam: object, actor: ExamActor) -> None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Экзамен не найден")
 
     if actor.is_org_admin:
-        return
+        return None
 
     group_id = getattr(exam, "group_id", None)
     if group_id:
         # A classroom run belongs to the current group scope. Its original
         # author loses access immediately when the group is reassigned.
-        await require_group_access(actor, str(group_id))
-        return
+        return str(group_id)
     # Unassigned library templates still belong to their author.
     if getattr(exam, "created_by", None) == actor.user_id:
-        return
+        return None
     raise HTTPException(status.HTTP_403_FORBIDDEN, "Нет доступа к этому экзамену")
+
+
+async def require_exam_access(exam: object, actor: ExamActor) -> None:
+    """Enforce organisation and teacher ownership for one exam."""
+    group_id = exam_access_group(exam, actor)
+    if group_id:
+        await require_group_access(actor, group_id)
