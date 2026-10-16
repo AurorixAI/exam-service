@@ -34,6 +34,7 @@ import hashlib
 import logging
 import math
 import random
+import re
 import secrets
 import string
 from copy import deepcopy
@@ -975,26 +976,44 @@ def _invalidate_unbound_open_exam(db: Session, exam: GeneratedExam) -> bool:
 LESSON_OVER_MESSAGE = "Занятие уже прошло или отменено — выберите другое"
 
 
-def _clock_minutes(value: Any) -> Optional[int]:
+_JS_NUMBER = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
+def _js_number(text: str) -> float:
+    """``Number(text)`` of JavaScript, as far as the dialog's ``clockMinutes`` needs it: never raises.
+
+    Blank is 0; a plain decimal (``1e999`` is Infinity, as in JS); ``Infinity``; everything else - ``inf``, ``nan``,
+    ``1_0``, hex, Unicode digits, words - is NaN.
+    """
+    text = text.strip()
+    if text == "":
+        return 0.0
+    if text in ("Infinity", "+Infinity"):
+        return math.inf
+    if text == "-Infinity":
+        return -math.inf
+    return float(text) if _JS_NUMBER.fullmatch(text) else math.nan
+
+
+def _clock_minutes(value: Any) -> Optional[float]:
     """Minutes since midnight of an «HH:MM» end time, read the way the frontend reads it (``clockMinutes``).
 
-    No end time at all (None / empty) is None: the lesson is not judged over.  A malformed one is read as 0 - the
-    frontend does the same (``Number("x") || 0``), so such a lesson is already over and the dialog hides it.
+    No end time at all (None, empty or blank) is None: the lesson is not judged over.  A malformed one is read as 0 -
+    the frontend does the same (``Number("x") || 0``), so such a lesson is already over and the dialog hides it.
+    The result is a float so that the odd ones behave as in JS too: Infinity is never over, NaN always is.
+    Nothing here raises: an end time that cannot be read is a lesson that is over, never a 500.
     """
     if value is None or str(value).strip() == "":
         return None
 
     def number(part: Optional[str]) -> float:
-        try:
-            parsed = float(part) if part is not None and part.strip() != "" else 0.0
-        except ValueError:
-            return 0.0
+        parsed = 0.0 if part is None else _js_number(part)
         return 0.0 if parsed != parsed else parsed  # NaN reads as 0
 
     parts = str(value).split(":")
     hours = number(parts[0])
     minutes = number(parts[1]) if len(parts) > 1 else 0.0
-    return int(hours * 60 + minutes)
+    return hours * 60 + minutes
 
 
 def _lesson_is_bindable(
@@ -4178,6 +4197,7 @@ async def _check_student_admitted(
                 message=str(exc.detail),
             )
         raise
+    ticket.matched(student.get("id"))
 
     submitted_sess = _find_submitted_session(
         all_sessions,
@@ -4257,6 +4277,7 @@ async def _start_exam_admitted(
         if exc.status_code == 403:
             ticket.fail()
         raise
+    ticket.matched(canonical_student.get("id"))
     canonical_student_id = str(canonical_student["id"])
     canonical_display_id = canonical_student.get("display_id")
     canonical_student_name = canonical_student.get("full_name") or req.student_name

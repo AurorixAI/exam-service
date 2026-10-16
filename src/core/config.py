@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     # notification from auth-service; browser credentials are never accepted
     # on that internal route.
     internal_service_token: str = ""
+    # Key of the HMAC the public entry limits hash typed IDs/names with (src/core/abuse_limit.py).  Empty: derived from
+    # INTERNAL_SERVICE_TOKEN; with neither (development) a random per-process key and a warning.
+    entry_limit_secret: str = ""
 
     # Redis — template cache
     redis_url: str = "redis://localhost:6379"

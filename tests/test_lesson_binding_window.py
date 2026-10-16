@@ -96,6 +96,25 @@ class TestTheRule:
         assert _clock_minutes("25:99") == 25 * 60 + 99  # no range check, as in the dialog
         assert _clock_minutes("soon") == 0 and _clock_minutes("x:y") == 0 and _clock_minutes(":") == 0
         assert _clock_minutes(None) is None and _clock_minutes("") is None
+        assert _clock_minutes("   ") is None  # blank: not judged, like an empty one
+
+    def test_the_odd_ones_never_raise_and_read_like_javascript(self):
+        import math
+
+        # Number("1e999") and Number("Infinity") are Infinity: never over. Python's float() would also take "inf" / "nan"
+        # / "1_0" / Unicode digits, which JS reads as NaN (= 0, over): none of that may raise or differ.
+        assert _clock_minutes("1e999") == math.inf and _clock_minutes("Infinity:00") == math.inf
+        assert _clock_minutes("-Infinity") == -math.inf
+        for odd in ("inf", "nan", "infinity", "1_0", "0x1F", "١٢:٣٠", "1e", "--1", "1.2.3", "٣"):
+            assert _clock_minutes(odd) == 0, odd
+        assert _clock_minutes("inf:nan:zz") == 0 and _clock_minutes("1e999:-1e999") != _clock_minutes("1e999:-1e999")  # NaN
+        assert _clock_minutes("9.5:30") == 600.0 and _clock_minutes(".5") == 30.0 and _clock_minutes("+11:+30") == 690
+        assert _clock_minutes("x" * 100_000) == 0
+
+    def test_infinity_is_not_over_and_nan_is_over_in_the_rule(self):
+        assert bindable(TODAY_S, end="1e999", now="23:59") is True
+        assert bindable(TODAY_S, end="1e999:-1e999", now="00:01") is False  # NaN: nothing is before it
+        assert bindable(TODAY_S, end="inf", now="00:01") is False
 
 
 # ── resolve against a mocked auth-service ───────────────────────────────────────────────────────────────────
@@ -167,6 +186,15 @@ def refused(lesson_date, **kwargs) -> HTTPException:
 
 
 class TestResolveEnforcesTheRule:
+    @pytest.mark.parametrize("end", ["1e999", "inf", "nan", "1_0", "  ", "x" * 5000])
+    def test_an_odd_end_time_is_never_a_server_error(self, auth, end):
+        auth(_Auth(end=end), now="15:00")
+        try:
+            resolve(TODAY_S)
+        except HTTPException as error:
+            assert error.status_code == 409 and error.detail == MESSAGE  # over, like in the dialog
+        # (no other exception type can escape: a 500 would fail the test here)
+
     def test_a_future_lesson_is_allowed(self, auth):
         auth(_Auth())
         group, occurrence = resolve(TOMORROW_S)

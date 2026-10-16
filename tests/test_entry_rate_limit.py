@@ -8,6 +8,8 @@ whole class behind one school NAT must still get in.
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import sys
 import threading
@@ -24,10 +26,12 @@ from fastapi import HTTPException
 
 from src.api import router
 from src.core import abuse_limit
+from src.core.config import get_settings
 from src.core.abuse_limit import (
     ADDED,
     ATTEMPTS_PER_MINUTE,
     BREAKER_MIN_DISTINCT_FAILS,
+    CODE_FAIL_SET_CAP,
     CODE_FAILS_SOFT,
     EXISTS,
     FAILS_PER_HOUR,
@@ -175,6 +179,60 @@ class TestClientAddress:
         assert identity_key("TE-031", None, None) != identity_key("TE-032", None, None)
         assert identity_key("a", "b", None) != identity_key("a", None, "b")  # which field the text was typed in matters
         assert len(identity_key("x" * 100_000)) == len(identity_key("a"))
+
+
+class TestIdentityHash:
+    """The typed IDs / names are hashed with a keyed HMAC: a copy of Redis does not give the roster back."""
+
+    def _secret(self, monkeypatch, value, token=""):
+        settings = get_settings()
+        monkeypatch.setattr(settings, "entry_limit_secret", value)
+        monkeypatch.setattr(settings, "internal_service_token", token)
+        monkeypatch.setattr(abuse_limit, "_identity_hmac_key", None)
+
+    def test_it_is_not_the_plain_hash_of_the_input(self, monkeypatch):
+        self._secret(monkeypatch, "alpha")
+        plain = hashlib.sha256("te-031".encode("utf-8")).hexdigest()[:24]
+        assert identity_key("TE-031") != plain
+        assert identity_key("TE-031") == identity_key(" te-031 ")  # still one key for one input
+
+    def test_another_secret_is_another_key_and_the_same_secret_the_same(self, monkeypatch):
+        self._secret(monkeypatch, "alpha")
+        first = identity_key("TE-031")
+        self._secret(monkeypatch, "beta")
+        assert identity_key("TE-031") != first
+        self._secret(monkeypatch, "alpha")
+        assert identity_key("TE-031") == first
+
+    def test_without_its_own_secret_the_internal_token_keys_it_and_its_own_secret_wins(self, monkeypatch):
+        self._secret(monkeypatch, "", token="service-token")
+        with_token = identity_key("TE-031")
+        assert with_token != hashlib.sha256("te-031".encode("utf-8")).hexdigest()[:24]
+        self._secret(monkeypatch, "", token="another-token")
+        assert identity_key("TE-031") != with_token
+        self._secret(monkeypatch, "alpha", token="service-token")
+        with_secret = identity_key("TE-031")
+        self._secret(monkeypatch, "alpha", token="another-token")
+        assert identity_key("TE-031") == with_secret  # the dedicated secret wins over the token
+
+    def test_with_no_secret_at_all_it_still_works_and_warns_once(self, monkeypatch, caplog):
+        self._secret(monkeypatch, "", token="")
+        monkeypatch.setattr(get_settings(), "app_env", "development")
+        with caplog.at_level(logging.WARNING, logger="exam_service.abuse_limit"):
+            keys = {identity_key("TE-031") for _ in range(5)}
+        assert len(keys) == 1
+        assert len([r for r in caplog.records if "abuse_limit_no_secret" in r.getMessage()]) == 1
+
+    def test_what_reaches_redis_is_keyed(self, monkeypatch):
+        self._secret(monkeypatch, "alpha")
+        fake = _FakeRedis()
+        counters.use_redis(fake)
+        request = _req({"X-Real-IP": "203.0.113.7"})
+        admit_identity_attempt(request, CODE, "TE-031", None, "TE-031").fail()
+        stored = {member for members in fake.sets.values() for member in members}
+        assert stored
+        plain = {hashlib.sha256(text.encode("utf-8")).hexdigest()[:24] for text in ("te-031", "te-031\x1f\x1fte-031")}
+        assert not (stored & plain)
 
 
 # ── counters ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -639,6 +697,37 @@ class TestTheProvisionalFailureIsAtomic:
         assert counters.count_members(key_hour)[0] == FAILS_PER_MINUTE.count  # not rolled forward by the refusal
 
 
+class TestATicketGivesBackOnlyWhatItTook:
+    def test_a_second_request_with_the_same_input_cannot_take_the_first_ones_failure_back(self):
+        request = _req({"X-Real-IP": "203.0.113.7"})
+        key = f"examfail:60:{code_key(CODE)}:0:203.0.113.7"
+        first = admit_identity_attempt(request, CODE, "TE-9999")  # adds the member
+        second = admit_identity_attempt(request, CODE, "TE-9999")  # the member is already there: adds nothing
+        second.close()  # ends without a lookup (a 503, say): it has nothing to give back
+        assert counters.count_members(key)[0] == 1
+        first.fail()
+        first.close()
+        assert counters.count_members(key)[0] == 1
+
+    def test_the_ticket_that_added_it_does_give_it_back(self):
+        request = _req({"X-Real-IP": "203.0.113.7"})
+        key = f"examfail:60:{code_key(CODE)}:0:203.0.113.7"
+        first = admit_identity_attempt(request, CODE, "TE-001")
+        second = admit_identity_attempt(request, CODE, "TE-001")
+        first.matched("student-1")
+        first.close()
+        assert counters.count_members(key) == (0, 0)
+        second.close()  # nothing left to remove, nothing breaks
+
+
+class TestPerCodeFailureSetIsBounded:
+    def test_it_stops_growing_at_the_cap(self):
+        for k in range(CODE_FAIL_SET_CAP + 60):
+            ticket = admit_identity_attempt(_req({"X-Real-IP": f"10.{k // 250}.{k % 250}.9"}), CODE, miss(k))
+            ticket.fail()
+        assert counters.count_members(f"examcodefail:{code_key(CODE)}:0")[0] == CODE_FAIL_SET_CAP
+
+
 class TestCodeCircuitBreaker:
     def _arm(self, n=CODE_FAILS_SOFT.count + 5):
         """A distributed walk: many addresses, a few distinct failures each."""
@@ -655,9 +744,43 @@ class TestCodeCircuitBreaker:
         admit_identity_attempt(walker, CODE, miss(900)).close()  # control: the code is not under attack, admitted
         self._arm()
         with pytest.raises(HTTPException) as caught:
-            admit_identity_attempt(walker, CODE, miss(901))  # 30 distinct failures out of 31 attempts
+            admit_identity_attempt(walker, CODE, miss(901))  # 30 distinct failures, no student ever found
         assert caught.value.status_code == 429
         assert int(caught.value.headers["Retry-After"]) > 3000  # until its hour of failures runs out
+
+    def test_a_walker_that_ignores_retry_after_cannot_dilute_its_failure_share(self, client, db, exam, roster, monkeypatch):
+        """Measured before the fix: refused / malformed requests were in the denominator, 150 guesses got through."""
+        clock = _Clock(monkeypatch)
+        self._arm()
+        for n in range(BREAKER_MIN_DISTINCT_FAILS):
+            assert check(client, miss(n), ip="203.0.113.50").status_code == 200
+            if n == 24:
+                clock.now += 61  # keep under the per-minute budget
+        clock.now += 61
+        through = 0
+        for n in range(30, 330):  # 300 more guesses, every 429 ignored; some of them malformed (400)
+            response = check(client, miss(n), ip="203.0.113.50") if n % 3 else check(client, "", ip="203.0.113.50")
+            if response.status_code != 429 and n % 3:
+                through += 1
+            if n % 30 == 0:
+                clock.now += 61  # the minute windows roll on, the hour window (and the breaker) hold
+        assert through == 0
+        assert check(client, miss(9999), ip="203.0.113.50").status_code == 429
+        assert check(client, "TE-001", ip="198.51.100.250").status_code == 200  # another address is not touched
+
+    def test_malformed_requests_resolve_nothing(self, client, db, exam, roster):
+        self._arm()
+        for n in range(BREAKER_MIN_DISTINCT_FAILS):
+            admit_identity_attempt(_req({"X-Real-IP": "203.0.113.50"}), CODE, miss(n)).fail()
+        for _ in range(150):
+            check(client, "", ip="203.0.113.50")  # 400: no identity given, resolved nothing
+        assert check(client, miss(7777), ip="203.0.113.50").status_code == 429
+
+    def test_every_spelling_of_one_valid_id_is_one_student(self, client, db, exam, roster):
+        ok_key = f"examok:3600:{code_key(CODE)}:0:203.0.113.7"
+        for spelling in ("TE-001", "te-001", " TE-001 ", "Te-001"):
+            assert check(client, spelling).json()["enrolled"] is True
+        assert counters.count_members(ok_key)[0] == 1  # a walker cannot grow its matches by retyping one valid ID
 
     def test_a_nat_with_a_few_typos_stays_in_even_when_the_code_is_under_attack(self, client, db, exam, roster):
         self._arm()
@@ -667,18 +790,36 @@ class TestCodeCircuitBreaker:
             assert check(client, f"TE-{i:03d}").status_code == 200
             assert start(client, f"TE-{i:03d}").status_code == 200
 
-    def test_failing_a_lot_is_not_enough_when_most_attempts_succeed(self, client, db, exam, roster, monkeypatch):
+    def test_failing_is_not_enough_while_students_are_found_in_proportion(self, client, db, exam, roster, monkeypatch):
+        """40 students found (the whole roster) + 35 distinct failures = 47% failed: a busy class, not a walker."""
         clock = _Clock(monkeypatch)
         self._arm()
-        for _ in range(3):  # 120 successful attempts of the class...
-            for i in range(1, 41):
-                assert check(client, f"TE-{i:03d}").status_code == 200
-            clock.now += 61
-        for n in range(BREAKER_MIN_DISTINCT_FAILS + 5):  # ...and 35 distinct failures: the failure share is 22%
+        for i in range(1, 41):
+            assert check(client, f"TE-{i:03d}").status_code == 200
+            if i % 20 == 0:
+                clock.now += 61
+        for n in range(35):
             assert check(client, miss(n)).status_code == 200
             if n == 24:
                 clock.now += 61
         assert check(client, "TE-001").status_code == 200
+
+    def test_the_share_decides_not_the_count(self, client, db, exam, roster, monkeypatch):
+        """With all 40 students found, the 42nd failure takes the share over a half: refused from there on."""
+        clock = _Clock(monkeypatch)
+        self._arm()
+        for i in range(1, 41):
+            check(client, f"TE-{i:03d}")
+        admitted = 0
+        for n in range(80):
+            response = check(client, miss(n))
+            if response.status_code == 429:
+                break
+            admitted += 1
+            if n % 25 == 24:
+                clock.now += 61
+        assert admitted == 41  # 41 / (41 + 40) is over a half
+
 
     def test_a_fresh_address_enters_while_the_breaker_is_armed(self, client, db, exam, roster):
         self._arm()

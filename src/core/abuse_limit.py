@@ -14,7 +14,10 @@ expensive instead, without locking out a legitimate class:
   step) and given back when the attempt resolves a student, so parallel requests cannot overshoot it.
 * A distributed walk (many addresses, one code) is met by a per-code circuit breaker that does NOT lock the code:
   once the code has collected CODE_FAILS_SOFT distinct failures in an hour, only an address that is itself
-  walking is refused - at least BREAKER_MIN_DISTINCT_FAILS failures AND more than half of its attempts failing.
+  walking is refused - at least BREAKER_MIN_DISTINCT_FAILS failures AND more than half of its RESOLVED lookups
+  failing.  Resolved means a lookup that ended with a student found or a student not found, counted by distinct
+  input / distinct student: a request that was refused, malformed or timed out resolves nothing, so a walker that
+  ignores Retry-After cannot dilute its own failure share, and matches are bounded by the size of the roster.
   A class behind a NAT with a few typos stays in.
 * The teacher can clear all of this for an exam (``reset_entry_limits``): every key carries a per-code epoch
   number, a reset bumps it, and the old keys are simply never read again (they expire by themselves).
@@ -29,9 +32,11 @@ typed.  Without X-Real-IP the request did not come through our proxy and the soc
 from __future__ import annotations
 
 import hashlib
+import hmac
 import ipaddress
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -66,6 +71,10 @@ FAILS_PER_HOUR = Limit(150, 3600)
 # It is above one address's hour budget on purpose: a lone walker meets its own budget first, the breaker is for
 # several addresses walking the same code...
 CODE_FAILS_SOFT = Limit(200, 3600)
+# The per-code set of failures stops growing here (the breaker is long armed by then): memory stays bounded.
+CODE_FAIL_SET_CAP = 2 * CODE_FAILS_SOFT.count
+# The distinct students a walker can match are bounded by the roster; the set is capped anyway.
+RESOLVED_OK_SET_CAP = 1000
 # ...and refuses only an address that is walking: this many distinct failures and more than this share of attempts.
 BREAKER_MIN_DISTINCT_FAILS = 30
 BREAKER_FAIL_RATIO = 0.5
@@ -115,10 +124,35 @@ def code_key(code: str) -> str:
 
 
 _WHITESPACE = re.compile(r"\s+")
+_identity_hmac_key: Optional[bytes] = None
+
+
+def _identity_secret() -> bytes:
+    """The key the typed identities are hashed with: what sits in Redis cannot be turned back into IDs and names.
+
+    ENTRY_LIMIT_SECRET, else a key derived from INTERNAL_SERVICE_TOKEN (already a deployed secret).  With neither
+    (a development machine) a random per-process key and ONE warning: the limits work, only the counters are not
+    shared between workers for the same typed input.
+    """
+    global _identity_hmac_key
+    if _identity_hmac_key is None:
+        settings = get_settings()
+        source = (settings.entry_limit_secret or settings.internal_service_token or "").encode("utf-8")
+        if not source:
+            if settings.app_env != "testing":
+                log.warning("abuse_limit_no_secret: ENTRY_LIMIT_SECRET / INTERNAL_SERVICE_TOKEN are not set, "
+                            "typed identities are hashed with a random per-process key")
+            source = os.urandom(32)
+        _identity_hmac_key = hmac.new(source, b"exam-entry-identity-v1", hashlib.sha256).digest()
+    return _identity_hmac_key
+
+
+def _keyed_hash(message: str) -> str:
+    return hmac.new(_identity_secret(), message.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
 
 
 def identity_key(*typed: Optional[str]) -> str:
-    """The typed identity (ID / name fields) normalised and hashed: retyping the same input is the same key.
+    """The typed identity (ID / name fields) normalised and hashed (HMAC): retyping the same input is the same key.
 
     NFKC + case-folding + collapsed spaces only.  It is deliberately NOT as forgiving as auth-service's matching
     (that one equates more spellings): merging spellings auth tells apart would let one input stand for several.
@@ -126,7 +160,7 @@ def identity_key(*typed: Optional[str]) -> str:
     parts = [
         _WHITESPACE.sub(" ", unicodedata.normalize("NFKC", part or "").casefold()).strip() for part in typed
     ]
-    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:24]
+    return _keyed_hash("\x1f".join(parts))
 
 
 # ── counters ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -376,6 +410,8 @@ class _Counters:
         self._client = None
         self._down_until = 0.0
         self._warned = False
+        global _identity_hmac_key
+        _identity_hmac_key = None
 
 
 counters = _Counters()
@@ -396,16 +432,25 @@ def too_many_attempts(retry_after: int) -> HTTPException:
 class EntryTicket:
     """One admitted identity attempt, holding a provisional failure until it resolves.
 
-    ``fail()`` makes the failure real (the lookup found nobody); ``close()`` - always called, in a ``finally`` -
-    gives the provisional failure back unless ``fail()`` was called: a match, a 410, a 503 are not failed guesses.
+    ``fail()`` makes the failure real (the lookup found nobody); ``matched()`` records that it found a student;
+    ``close()`` - always called, in a ``finally`` - gives back the provisional failure THIS ticket took, unless
+    ``fail()`` was called: a match, a 410, a 503 are not failed guesses.  A member another request had added
+    first is never taken back by a ticket that did not add it.
     """
 
-    def __init__(self, ip_scope: str, code_scope: str, member: str, fail_keys: Tuple[str, str], code_key_: str) -> None:
+    def __init__(
+        self,
+        ip_scope: str,
+        member: str,
+        added_keys: Tuple[str, ...],
+        code_fail_key: str,
+        ok_key: str,
+    ) -> None:
         self._ip_scope = ip_scope
-        self._code_scope = code_scope
         self._member = member
-        self._fail_keys = fail_keys
-        self._code_key = code_key_
+        self._added_keys = added_keys
+        self._code_fail_key = code_fail_key
+        self._ok_key = ok_key
         self._failed = False
         self._closed = False
 
@@ -413,20 +458,22 @@ class EntryTicket:
         if self._failed:
             return
         self._failed = True
-        # the per-code breaker counts each (address, input) once
+        # the per-code breaker counts each (address, input) once, in a set that stops growing at a cap
         counters.add_member(
-            self._code_key,
-            hashlib.sha256(f"{self._ip_scope}|{self._member}".encode("utf-8")).hexdigest()[:24],
-            CODE_FAILS_SOFT.window,
-            10**9,
+            self._code_fail_key, _keyed_hash(f"{self._ip_scope}|{self._member}"), CODE_FAILS_SOFT.window, CODE_FAIL_SET_CAP
         )
+
+    def matched(self, student_id: Optional[str]) -> None:
+        """The lookup found this student: one more resolved lookup of this address (a student counts once)."""
+        if student_id:
+            counters.add_member(self._ok_key, _keyed_hash(f"ok|{student_id}"), FAILS_PER_HOUR.window, RESOLVED_OK_SET_CAP)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         if not self._failed:
-            for key in self._fail_keys:
+            for key in self._added_keys:
                 counters.remove_member(key, self._member)
 
 
@@ -447,14 +494,18 @@ def admit_identity_attempt(request: Request, exam_code: str, *typed_identity: Op
     member = identity_key(*typed_identity)
     fail_keys = tuple(f"examfail:{limit.window}:{ip_scope}" for limit in (FAILS_PER_MINUTE, FAILS_PER_HOUR))
     code_fail_key = f"examcodefail:{code_scope}:{epoch}"
+    ok_key = f"examok:{FAILS_PER_HOUR.window}:{ip_scope}"
     exceeded: list[int] = []
 
     # the breaker: armed by the code's distinct failures, aimed at an address that is itself walking
     code_failures, _ = counters.count_members(code_fail_key)
     if code_failures >= CODE_FAILS_SOFT.count:
         ip_failures, left = counters.count_members(fail_keys[1])
-        attempts, _ = counters.peek(f"examtry:{ATTEMPTS_PER_HOUR.window}:{ip_scope}")
-        if ip_failures >= BREAKER_MIN_DISTINCT_FAILS and attempts and ip_failures / attempts > BREAKER_FAIL_RATIO:
+        # resolved lookups only: distinct failed inputs against distinct students found. The attempts counter is NOT
+        # the denominator - refused, malformed and timed-out requests are in it, and a walker that ignores Retry-After
+        # would dilute its own failure share with them.
+        ip_matches, _ = counters.count_members(ok_key)
+        if ip_failures >= BREAKER_MIN_DISTINCT_FAILS and ip_failures / (ip_failures + ip_matches) > BREAKER_FAIL_RATIO:
             exceeded.append(left)
 
     for limit in (ATTEMPTS_PER_MINUTE, ATTEMPTS_PER_HOUR):
@@ -463,7 +514,7 @@ def admit_identity_attempt(request: Request, exam_code: str, *typed_identity: Op
             exceeded.append(left)
 
     # the provisional failure: taken atomically under the budget, given back on a match (EntryTicket.close)
-    added = []
+    added: list[str] = []
     for key, limit in zip(fail_keys, (FAILS_PER_MINUTE, FAILS_PER_HOUR)):
         status, _, left = counters.add_member(key, member, limit.window, limit.count)
         if status == FULL:
@@ -476,4 +527,4 @@ def admit_identity_attempt(request: Request, exam_code: str, *typed_identity: Op
             counters.remove_member(key, member)
         raise too_many_attempts(max(exceeded))
 
-    return EntryTicket(ip_scope, code_scope, member, fail_keys, code_fail_key)
+    return EntryTicket(ip_scope, member, tuple(added), code_fail_key, ok_key)
