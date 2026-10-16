@@ -43,10 +43,12 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+import anyio
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
+from fastapi.concurrency import run_in_threadpool
 import httpx
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, inspect as sa_inspect, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -773,7 +775,7 @@ async def _embed_print_figures(snapshot: dict[str, Any]) -> dict[str, Any]:
     return snapshot
 
 
-async def _build_print_preview_snapshot(exam: GeneratedExam) -> dict[str, Any]:
+async def _build_print_preview_snapshot(exam: GeneratedExam, db: Optional[Session] = None) -> dict[str, Any]:
     """Build a non-persistent PDF source for the print editor.
 
     Unlike a package snapshot it has no assigned lesson and is never written
@@ -799,6 +801,8 @@ async def _build_print_preview_snapshot(exam: GeneratedExam) -> dict[str, Any]:
         )
     except PrintLayoutValidationError as exc:
         raise HTTPException(422, str(exc)) from exc
+    if db is not None:
+        db.commit()  # the figures are fetched over the network below: do not sit «idle in transaction» meanwhile
     return await _embed_print_figures(snapshot)
 
 
@@ -1625,7 +1629,7 @@ async def get_lesson_exam_binding(
 
 
 @router.post("/internal/lesson-bindings/cancellation-check", summary="Internal: проверить отмену урока")
-async def check_lesson_cancellation(
+def check_lesson_cancellation(
     req: LessonCancellationSyncRequest,
     x_internal_service_token: Optional[str] = Header(None, alias="X-Internal-Service-Token"),
     db: Session = Depends(get_db),
@@ -1649,7 +1653,7 @@ async def check_lesson_cancellation(
 
 
 @router.post("/internal/lesson-bindings/release", summary="Internal: освободить экзамен при отмене урока")
-async def release_lesson_exam_binding(
+def release_lesson_exam_binding(
     req: LessonCancellationSyncRequest,
     x_internal_service_token: Optional[str] = Header(None, alias="X-Internal-Service-Token"),
     db: Session = Depends(get_db),
@@ -1705,7 +1709,7 @@ async def release_lesson_exam_binding(
     "/internal/lesson-bindings/recurring-end-impact",
     summary="Internal: последствия прекращения регулярных занятий",
 )
-async def get_recurring_lesson_end_impact(
+def get_recurring_lesson_end_impact(
     req: RecurringLessonEndSyncRequest,
     x_internal_service_token: Optional[str] = Header(None, alias="X-Internal-Service-Token"),
     db: Session = Depends(get_db),
@@ -1732,7 +1736,7 @@ async def get_recurring_lesson_end_impact(
     "/internal/lesson-bindings/recurring-end-release",
     summary="Internal: освободить будущие экзамены при прекращении регулярности",
 )
-async def release_recurring_lesson_exams(
+def release_recurring_lesson_exams(
     req: RecurringLessonEndSyncRequest,
     x_internal_service_token: Optional[str] = Header(None, alias="X-Internal-Service-Token"),
     db: Session = Depends(get_db),
@@ -1792,7 +1796,7 @@ async def release_recurring_lesson_exams(
 
 
 @router.post("/internal/lesson-bindings/rescheduled", summary="Internal: зафиксировать перенос занятия")
-async def record_lesson_reschedule(
+def record_lesson_reschedule(
     req: LessonRescheduleSyncRequest,
     x_internal_service_token: Optional[str] = Header(None, alias="X-Internal-Service-Token"),
     db: Session = Depends(get_db),
@@ -2094,6 +2098,7 @@ def _finalize_exam(db: Session, exam: GeneratedExam) -> int:
             db.query(ExamSession)
             .filter(ExamSession.exam_id == exam.id)
             .with_for_update()
+            .populate_existing()
             .all()
         )
         for session in sessions:
@@ -2138,28 +2143,50 @@ def _finalize_exam(db: Session, exam: GeneratedExam) -> int:
     return finalized_count
 
 
+def _exam_deadline_passed(db: Session, exam: GeneratedExam) -> bool:
+    """Has the common timer of an ACTIVE exam run out?  Read-only: takes no lock, writes nothing."""
+    if exam.status != "active":
+        return False
+    exam_started_at = _exam_started_at(db, exam)
+    if not exam_started_at:
+        return False
+    total_seconds = (exam.total_time_minutes or 45) * 60
+    return int((datetime.utcnow() - exam_started_at).total_seconds()) >= total_seconds
+
+
 def _check_and_auto_close_exam(db: Session, exam: Optional[GeneratedExam]) -> bool:
     """
     Checks if an active exam's total duration has expired.
     If expired, marks exam as closed, grades/auto-submits all in_progress/waiting sessions,
     and commits to DB.
     Returns True if exam was closed.
+
+    The exclusive row lock is taken ONLY when there is something to close.  Every student request calls this, so
+    locking the shared exam row on each call serialised a whole class on one row (ROADMAP #95); a timer that has
+    not run out needs no lock - the next call after the deadline finalizes, and the lock-protected re-check below
+    keeps the transition single and deterministic.  Lock order of every writer: exam -> sessions.
     """
     if not exam or exam.status != "active":
         return exam.status == "closed" if exam else False
+    if not _exam_deadline_passed(db, exam):
+        return False
     # Serialize timeout finalization against a manual close or a concurrent
     # submit.  PostgreSQL row locks make the state transition deterministic.
     locked_exam = (
         db.query(GeneratedExam)
         .filter(GeneratedExam.id == exam.id)
         .with_for_update()
+        .populate_existing()
         .first()
     )
     if not locked_exam or locked_exam.status != "active":
-        return bool(locked_exam and locked_exam.status == "closed")
+        closed = bool(locked_exam and locked_exam.status == "closed")
+        db.commit()  # nothing to do after all: do not keep the exclusive lock until the end of the request
+        return closed
 
     exam_started_at = _exam_started_at(db, locked_exam)
     if not exam_started_at:
+        db.commit()
         return False
 
     now_utc = datetime.utcnow()
@@ -2170,6 +2197,7 @@ def _check_and_auto_close_exam(db: Session, exam: Optional[GeneratedExam]) -> bo
         _finalize_exam(db, locked_exam)
         return True
 
+    db.commit()
     return False
 
 
@@ -2396,7 +2424,7 @@ def _monitor_summary(db: Session, exam: GeneratedExam, submitted_count: int) -> 
     response_model=AdminExamMonitorResponse,
     summary="Постраничный исторический мониторинг экзаменов организации",
 )
-async def get_admin_exam_monitor(
+def get_admin_exam_monitor(
     date_from: Optional[date] = Query(None),
     date_to: Optional[date] = Query(None),
     state: str = Query("all", pattern="^(all|active|lobby|closed|changes)$"),
@@ -3598,6 +3626,7 @@ async def prepare_print_package(
         )
     except PrintLayoutValidationError as exc:
         raise HTTPException(422, str(exc)) from exc
+    db.commit()  # nothing is written yet; the figures are fetched over the network: no «idle in transaction» meanwhile
     snapshot = await _embed_print_figures(snapshot)
 
     exam.group_id = str(canonical_group["id"])
@@ -3748,7 +3777,7 @@ async def preview_print_pdf(
     if _print_package_metadata(db, exam.id):
         raise HTTPException(409, "Печатный комплект уже зафиксирован. Скачайте его из карточки экзамена")
 
-    snapshot = await _build_print_preview_snapshot(exam)
+    snapshot = await _build_print_preview_snapshot(exam, db)
     try:
         pdf = (
             render_student_exam_pdf(snapshot, variant_number)
@@ -4023,10 +4052,60 @@ async def get_exam(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-@router.get("/exams/by-code/{code}", response_model=ExamInfoResponse,
-            summary="Информация об экзамене по коду (студент)")
-async def get_exam_by_code(code: str, db: Session = Depends(get_db)):
-    exam = ExamRepository(db).get_by_access_code(code)
+def _detached_exam_copy(exam: GeneratedExam, *, skip: tuple = ()) -> GeneratedExam:
+    """A snapshot of an exam row that belongs to NO session (``skip``: columns left out, e.g. the task JSON).
+
+    The public entry looks at the exam, then talks to auth-service, then writes.  Nothing may be held open across the
+    network call - not a row lock, not even a pooled connection sitting «idle in transaction» - so the first phase
+    copies the columns it needs, ends its transaction, and the awaiting helpers read the copy.  (``expunge`` would
+    detach the object from a session other code may still use; a copy touches nothing.)
+    """
+    return GeneratedExam(
+        **{attr.key: getattr(exam, attr.key) for attr in sa_inspect(GeneratedExam).column_attrs if attr.key not in skip}
+    )
+
+
+def _entry_exam_lookup(db: Session, code: str) -> GeneratedExam:
+    """Phase 1 of a public entry: the exam of a code, as a snapshot.  Read-only, the transaction ends here."""
+    exam = ExamRepository(db).get_by_access_code(code, without_tasks=True)
+    if not exam:
+        raise HTTPException(404, "Экзамен не найден")
+    if exam.delivery_mode == "print":
+        raise HTTPException(410, "Этот экзамен проводится по печатным бланкам в аудитории.")
+    snapshot = _detached_exam_copy(exam, skip=("variants",))
+    db.commit()
+    return snapshot
+
+
+def _entry_gate(db: Session, exam_id: str) -> GeneratedExam:
+    """What check-student and start verify about the exam BEFORE they call auth-service; a snapshot comes out.
+
+    Closing a timed-out exam (the only write) happens here, in its own transaction; a timer that has not run out
+    takes no lock.  The transaction ends before the caller awaits anything.
+    """
+    exam = ExamRepository(db).get_by_id(exam_id, without_tasks=True)
+    if not exam:
+        raise HTTPException(404, "Экзамен не найден")
+    _check_and_auto_close_exam(db, exam)
+    if exam.status not in ("active", "lobby"):
+        raise HTTPException(410, "Экзамен уже завершён. Повторное прохождение недоступно.")
+    try:
+        _require_bound_exam(exam)
+    except HTTPException as exc:
+        raise HTTPException(410, "Экзамен ещё не назначен на занятие") from exc
+    snapshot = _detached_exam_copy(exam, skip=("variants",))
+    db.commit()
+    return snapshot
+
+
+async def _close_ticket(ticket: EntryTicket) -> None:
+    """Give the provisional failure back.  Shielded: a client that hangs up must not keep its budget spent."""
+    with anyio.CancelScope(shield=True):
+        await run_in_threadpool(ticket.close)
+
+
+def _public_exam_precheck(db: Session, code: str) -> GeneratedExam:
+    exam = ExamRepository(db).get_by_access_code(code, without_tasks=True)
     if not exam:
         raise HTTPException(404, "Экзамен не найден")
 
@@ -4052,9 +4131,12 @@ async def get_exam_by_code(code: str, db: Session = Depends(get_db)):
         if exc.status_code == 409:
             raise HTTPException(410, "Экзамен ещё не назначен на занятие") from exc
         raise
-    if exam.status == "lobby":
-        await _require_public_lobby_available(exam)
+    snapshot = _detached_exam_copy(exam, skip=("variants",))
+    db.commit()
+    return snapshot
 
+
+def _exam_info_response(db: Session, exam: GeneratedExam) -> ExamInfoResponse:
     remaining_seconds = None
     started_at_str = None
     if exam.status == "active":
@@ -4097,6 +4179,16 @@ async def get_exam_by_code(code: str, db: Session = Depends(get_db)):
         time_remaining_seconds=remaining_seconds,
         started_at=started_at_str,
     )
+
+
+@router.get("/exams/by-code/{code}", response_model=ExamInfoResponse,
+            summary="Информация об экзамене по коду (студент)")
+async def get_exam_by_code(code: str, db: Session = Depends(get_db)):
+    # Database work runs in the thread pool and its transaction is over before the network call (ROADMAP #95).
+    exam = await run_in_threadpool(_public_exam_precheck, db, code)
+    if exam.status == "lobby":
+        await _require_public_lobby_available(exam)
+    return await run_in_threadpool(_exam_info_response, db, exam)
 
 
 def _norm_ident(value: Optional[str]) -> str:
@@ -4148,18 +4240,44 @@ async def check_student_for_exam(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    exam = ExamRepository(db).get_by_access_code(code)
-    if not exam:
-        raise HTTPException(404, "Экзамен не найден")
-    if exam.delivery_mode == "print":
-        raise HTTPException(410, "Этот экзамен проводится по печатным бланкам в аудитории.")
+    exam = await run_in_threadpool(_entry_exam_lookup, db, code)
     # #33: the answer carries the student's name on a match, so every lookup is rate limited (429 + Retry-After)
     # per exam code and client address; a distinct failed input is what spends the strict budget.
-    ticket = admit_identity_attempt(request, exam.access_code or code, req.student_id, req.student_name, req.identifier)
+    ticket = await run_in_threadpool(
+        admit_identity_attempt, request, exam.access_code or code, req.student_id, req.student_name, req.identifier
+    )
     try:
         return await _check_student_admitted(exam, req, ticket, db)
     finally:
-        ticket.close()  # gives the provisional failure back unless the lookup really failed
+        await _close_ticket(ticket)  # gives the provisional failure back unless the lookup really failed
+
+
+def _check_student_outcome(db: Session, exam: GeneratedExam, student: dict) -> CheckStudentExamResponse:
+    all_sessions = SessionRepository(db).list_by_exam(exam.id)
+    submitted_sess = _find_submitted_session(
+        all_sessions,
+        student.get("id"),
+        student.get("display_id"),
+    )
+    if submitted_sess:
+        response = CheckStudentExamResponse(
+            enrolled=False,
+            group_required=True,
+            group_name=exam.group_name,
+            student=student,
+            already_submitted=True,
+            session_id=submitted_sess.id,
+            message="Вы уже завершили этот экзамен. Повторное прохождение недоступно.",
+        )
+    else:
+        response = CheckStudentExamResponse(
+            enrolled=True,
+            group_required=True,
+            group_name=exam.group_name,
+            student=student,
+        )
+    db.commit()
+    return response
 
 
 async def _check_student_admitted(
@@ -4168,17 +4286,12 @@ async def _check_student_admitted(
     ticket: EntryTicket,
     db: Session,
 ) -> CheckStudentExamResponse:
-    _check_and_auto_close_exam(db, exam)
-    if exam.status not in ("active", "lobby"):
-        raise HTTPException(410, "Экзамен уже завершён. Повторное прохождение недоступно.")
-    try:
-        _require_bound_exam(exam)
-    except HTTPException as exc:
-        raise HTTPException(410, "Экзамен ещё не назначен на занятие") from exc
+    # Three phases, never a transaction across a network call: (1) database, in a thread, ends its transaction;
+    # (2) auth-service; (3) database again.  See _detached_exam_copy.
+    exam = await run_in_threadpool(_entry_gate, db, exam.id)
     if exam.status == "lobby":
         await _require_public_lobby_available(exam)
 
-    all_sessions = SessionRepository(db).list_by_exam(exam.id)
     try:
         student = await _canonical_student_for_exam(
             exam,
@@ -4188,7 +4301,7 @@ async def _check_student_admitted(
         )
     except HTTPException as exc:
         if exc.status_code == 403:
-            ticket.fail()
+            await run_in_threadpool(ticket.fail)
             return CheckStudentExamResponse(
                 enrolled=False,
                 group_required=True,
@@ -4197,29 +4310,8 @@ async def _check_student_admitted(
                 message=str(exc.detail),
             )
         raise
-    ticket.matched(student.get("id"))
-
-    submitted_sess = _find_submitted_session(
-        all_sessions,
-        student.get("id"),
-        student.get("display_id"),
-    )
-    if submitted_sess:
-        return CheckStudentExamResponse(
-            enrolled=False,
-            group_required=True,
-            group_name=exam.group_name,
-            student=student,
-            already_submitted=True,
-            session_id=submitted_sess.id,
-            message="Вы уже завершили этот экзамен. Повторное прохождение недоступно.",
-        )
-    return CheckStudentExamResponse(
-        enrolled=True,
-        group_required=True,
-        group_name=exam.group_name,
-        student=student,
-    )
+    await run_in_threadpool(ticket.matched, student.get("id"))
+    return await run_in_threadpool(_check_student_outcome, db, exam, student)
 
 
 @router.post("/exams/by-code/{code}/start", response_model=StartExamResponse,
@@ -4230,76 +4322,72 @@ async def start_exam(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    exam = ExamRepository(db).get_by_access_code(code)
-    if not exam:
-        raise HTTPException(404, "Экзамен не найден")
-    if exam.delivery_mode == "print":
-        raise HTTPException(410, "Этот экзамен проводится по печатным бланкам в аудитории.")
+    exam = await run_in_threadpool(_entry_exam_lookup, db, code)
     # #33: the same budget as check-student
-    ticket = admit_identity_attempt(
-        request, exam.access_code or code, req.student_id or req.display_id, req.student_name, req.display_id
+    ticket = await run_in_threadpool(
+        admit_identity_attempt, request, exam.access_code or code, req.student_id or req.display_id, req.student_name,
+        req.display_id,
     )
     try:
         return await _start_exam_admitted(exam, req, ticket, db)
     finally:
-        ticket.close()
+        await _close_ticket(ticket)
 
 
-async def _start_exam_admitted(
-    exam: GeneratedExam,
-    req: StartExamRequest,
-    ticket: EntryTicket,
+def _admit_student_to_exam(
     db: Session,
+    exam_id: str,
+    req: StartExamRequest,
+    canonical_student: dict,
 ) -> StartExamResponse:
-    # 0. Check and auto-close if time expired
-    _check_and_auto_close_exam(db, exam)
-    if exam.status not in ("active", "lobby"):
-        raise HTTPException(410, "Экзамен уже завершён. Повторное прохождение недоступно.")
-    try:
-        _require_bound_exam(exam)
-    except HTTPException as exc:
-        raise HTTPException(410, "Экзамен ещё не назначен на занятие") from exc
-    if exam.status == "lobby":
-        await _require_public_lobby_available(exam)
+    """The transactional core of ``start``: no network call, the whole thing runs in one thread.
 
-    variants = exam.variants or []
-    if not variants:
-        raise HTTPException(500, "Экзамен не содержит вариантов")
-
-    try:
-        canonical_student = await _canonical_student_for_exam(
-            exam,
-            student_id=req.student_id or req.display_id,
-            student_name=req.student_name,
-            identifier=req.display_id,
-        )
-    except HTTPException as exc:
-        if exc.status_code == 403:
-            ticket.fail()
-        raise
-    ticket.matched(canonical_student.get("id"))
+    A SHARED lock on the exam row (FOR SHARE) is taken first and held only until the session row is committed: it
+    keeps a finalize (FOR UPDATE, which flips the exam to «closed» and grades every attempt it can see) from running
+    between the status check and the INSERT - otherwise an attempt could appear in an already closed exam - while
+    students entering at the same moment do not wait for each other.
+    """
     canonical_student_id = str(canonical_student["id"])
     canonical_display_id = canonical_student.get("display_id")
     canonical_student_name = canonical_student.get("full_name") or req.student_name
     canonical_class_level = canonical_student.get("class_level") or req.class_level
 
-    all_sessions = SessionRepository(db).list_by_exam(exam.id)
+    exam = (
+        db.query(GeneratedExam)
+        .filter(GeneratedExam.id == exam_id)
+        .with_for_update(read=True)
+        .populate_existing()
+        .first()
+    )
+    if not exam:
+        raise HTTPException(404, "Экзамен не найден")
+    if exam.status not in ("active", "lobby"):  # closed between the gate and now (teacher, or the common timer)
+        raise HTTPException(410, "Экзамен уже завершён. Повторное прохождение недоступно.")
+    view = _detached_exam_copy(exam)  # what the response is built from, whatever the commits below expire
+    variants = view.variants or []
+    if not variants:
+        raise HTTPException(500, "Экзамен не содержит вариантов")
+    exam_is_lobby = view.status == "lobby"
+
+    all_sessions = SessionRepository(db).list_by_exam(exam_id)
 
     # 1. Single attempt guard: Check if already submitted
     submitted_sess = _find_submitted_session(
         all_sessions, canonical_student_id, canonical_display_id
     )
     if submitted_sess:
-        return StartExamResponse(
+        response = StartExamResponse(
             session_id=submitted_sess.id,
             variant_number=submitted_sess.variant_number,
-            time_minutes=exam.total_time_minutes,
+            time_minutes=view.total_time_minutes,
             time_remaining_seconds=0,
             tasks=[],
             status="submitted",
             already_submitted=True,
             message="Вы уже завершили этот экзамен. Повторное прохождение недоступно.",
         )
+        db.commit()
+        return response
 
     # 2. Check if student already has a session in progress or waiting
     existing_session = _find_active_session(
@@ -4308,7 +4396,7 @@ async def _start_exam_admitted(
 
     # Determine global exam start time
     exam_start_time = None
-    exam_started_at_str = (exam.settings or {}).get("started_at")
+    exam_started_at_str = (view.settings or {}).get("started_at")
     if exam_started_at_str:
         try:
             exam_start_time = _to_naive_utc(datetime.fromisoformat(exam_started_at_str))
@@ -4326,10 +4414,10 @@ async def _start_exam_admitted(
         variant = random.choice(variants)
         tasks_raw = variant.get("tasks", [])
         session_id = f"SES_{uuid4().hex[:16]}"
-        initial_status = "waiting" if exam.status == "lobby" else "in_progress"
+        initial_status = "waiting" if exam_is_lobby else "in_progress"
         session = ExamSession(
             id=session_id,
-            exam_id=exam.id,
+            exam_id=exam_id,
             student_id=canonical_student_id,
             display_id=canonical_display_id,
             student_name=canonical_student_name,
@@ -4348,7 +4436,7 @@ async def _start_exam_admitted(
             db.rollback()
             session = (
                 db.query(ExamSession)
-                .filter(ExamSession.exam_id == exam.id, ExamSession.student_id == canonical_student_id)
+                .filter(ExamSession.exam_id == exam_id, ExamSession.student_id == canonical_student_id)
                 .first()
             )
             if not session:
@@ -4361,38 +4449,55 @@ async def _start_exam_admitted(
         db.commit()
 
     # If session is waiting in lobby, do not return tasks yet
-    if exam.status == "lobby" or session.status == "waiting":
-        return StartExamResponse(
+    if exam_is_lobby or session.status == "waiting":
+        response = StartExamResponse(
             session_id=session.id,
             variant_number=session.variant_number,
-            time_minutes=exam.total_time_minutes,
-            time_remaining_seconds=exam.total_time_minutes * 60,
+            time_minutes=view.total_time_minutes,
+            time_remaining_seconds=view.total_time_minutes * 60,
             tasks=[],
             status="waiting",
             saved_answers=session.answers or {},
             session_token=session.session_token,
         )
+        db.commit()
+        return response
 
     # If exam is active and session is in_progress, calculate remaining time based on exam start time
     if not session.started_at:
         session.started_at = exam_start_time or now_utc
         db.commit()
 
-    total_seconds = (exam.total_time_minutes or 45) * 60
+    total_seconds = (view.total_time_minutes or 45) * 60
     base_start = exam_start_time or _to_naive_utc(session.started_at) or now_utc
     elapsed_seconds = max(0, int((now_utc - base_start).total_seconds()))
     remaining_seconds = max(0, total_seconds - elapsed_seconds)
 
     # If time has expired, auto-submit session and auto-close exam
     if remaining_seconds <= 0:
-        _grade_and_submit_session(
-            db, session, exam, session.answers or {}, total_seconds
+        # The attempt row is locked while it is graded: a save from a second tab must not interleave.  (The shared
+        # exam lock is gone with the commit above or just below - the finalizer needs the exclusive one.)
+        session_id_to_grade = session.id
+        db.commit()
+        locked = (
+            db.query(ExamSession)
+            .filter(ExamSession.id == session_id_to_grade)
+            .with_for_update()
+            .populate_existing()
+            .first()
         )
+        if locked is None:  # the teacher removed the attempt while auth-service was answering
+            raise HTTPException(404, "Сессия не найдена")
+        if locked.status in ("in_progress", "waiting"):
+            _grade_and_submit_session(db, locked, view, locked.answers or {}, total_seconds)
+        else:
+            db.commit()
         _check_and_auto_close_exam(db, exam)
+        session = locked
         return StartExamResponse(
             session_id=session.id,
             variant_number=session.variant_number,
-            time_minutes=exam.total_time_minutes,
+            time_minutes=view.total_time_minutes,
             time_remaining_seconds=0,
             tasks=[],
             status="submitted",
@@ -4405,12 +4510,12 @@ async def _start_exam_admitted(
     variant_idx = max(0, min(session.variant_number - 1, len(variants) - 1))
     variant = variants[variant_idx]
     tasks_raw = variant.get("tasks", [])
-    mc_mode = (exam.settings or {}).get("mc_mode", "auto")
+    mc_mode = (view.settings or {}).get("mc_mode", "auto")
 
     tasks_public = []
     for t in tasks_raw:
         show_mc = _should_show_mc(t, mc_mode)
-        options = _build_session_mc_options(exam, session, t) if show_mc else []
+        options = _build_session_mc_options(view, session, t) if show_mc else []
         answer_type = t.get("answer_type", "exact_number")
         if show_mc and options:
             answer_type = "multiple_choice"
@@ -4431,21 +4536,52 @@ async def _start_exam_admitted(
             points=10,
         ))
 
-    return StartExamResponse(
+    response = StartExamResponse(
         session_id=session.id,
         variant_number=session.variant_number,
-        time_minutes=exam.total_time_minutes,
+        time_minutes=view.total_time_minutes,
         time_remaining_seconds=remaining_seconds,
         tasks=tasks_public,
         status="in_progress",
         saved_answers=session.answers or {},
         session_token=session.session_token,
     )
+    db.commit()  # ends the read transaction (and with it the shared exam lock if no write above already did)
+    return response
+
+
+async def _start_exam_admitted(
+    exam: GeneratedExam,
+    req: StartExamRequest,
+    ticket: EntryTicket,
+    db: Session,
+) -> StartExamResponse:
+    # (1) database, in a thread: close a timed-out exam, check the state; the transaction ends before (2)
+    exam = await run_in_threadpool(_entry_gate, db, exam.id)
+    if exam.status == "lobby":
+        await _require_public_lobby_available(exam)
+
+    # (2) auth-service: no transaction, no lock, no pooled connection is held while we wait for it
+    try:
+        canonical_student = await _canonical_student_for_exam(
+            exam,
+            student_id=req.student_id or req.display_id,
+            student_name=req.student_name,
+            identifier=req.display_id,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            await run_in_threadpool(ticket.fail)
+        raise
+    await run_in_threadpool(ticket.matched, canonical_student.get("id"))
+
+    # (3) database again, in a thread: one short transaction
+    return await run_in_threadpool(_admit_student_to_exam, db, exam.id, req, canonical_student)
 
 
 @router.get("/exams/by-code/{code}/session-status/{session_id}",
             summary="Проверка статуса сессии / ожидание старта в лобби")
-async def get_session_status(
+def get_session_status(
     code: str,
     session_id: str,
     db: Session = Depends(get_db),
@@ -4504,8 +4640,13 @@ async def get_session_status(
 
         # If time expired while waiting/reconnecting
         if remaining_sec <= 0:
-            if session.status == "in_progress":
-                _grade_and_submit_session(db, session, exam, session.answers or {}, total_sec)
+            # the attempt row is locked while it is graded (a save of a second tab must not interleave); the grading
+            # commits, so the lock is gone before the finalizer takes its exam -> sessions locks
+            locked = _lock_attempt(db, session.id)
+            if locked is not None and locked.status == "in_progress":
+                _grade_and_submit_session(db, locked, exam, locked.answers or {}, total_sec)
+            else:
+                db.commit()
             _check_and_auto_close_exam(db, exam)
             return {
                 "status": "submitted",
@@ -4558,36 +4699,56 @@ async def get_session_status(
     }
 
 
+def _lock_attempt(db: Session, session_id: str) -> Optional[ExamSession]:
+    """The attempt's own row, locked FOR UPDATE and re-read: one student's writes serialize with each other (a double
+    click, a retry that overtakes the first try) and with a finalize - never with the other students of the class."""
+    return (
+        db.query(ExamSession)
+        .filter(ExamSession.id == session_id)
+        .with_for_update()
+        .populate_existing()
+        .first()
+    )
+
+
+def _exam_after_attempt_lock(db: Session, exam_id: str) -> Optional[GeneratedExam]:
+    """The exam, read PLAIN (no lock) and fresh, after the attempt row is locked.
+
+    Every writer that closes an exam locks exam -> sessions and holds all session locks until it commits, so an
+    attempt lock obtained here means either «the exam was closed before» (this read sees it) or «the finalize is
+    still waiting for this very lock and will grade what this transaction saves».  The shared exam row is never
+    locked by a save or a submit: 60 students writing at once do not queue on one row.
+    """
+    return (
+        db.query(GeneratedExam)
+        .filter(GeneratedExam.id == exam_id)
+        .populate_existing()
+        .first()
+    )
+
+
 @router.post("/exam-sessions/{session_id}/progress",
              summary="Промежуточное автосохранение ответов (студент)")
-async def save_exam_progress(
+def save_exam_progress(
     session_id: str,
     req: SaveProgressRequest,
     db: Session = Depends(get_db),
     session_token: Optional[str] = Header(None, alias="X-Exam-Session-Token"),
 ):
-    session_ref = SessionRepository(db).get_by_id(session_id)
-    if not session_ref:
-        raise HTTPException(404, "Сессия не найдена")
-    # Lock order is always exam → sessions, the same order used by close.
-    exam = (
-        db.query(GeneratedExam)
-        .filter(GeneratedExam.id == session_ref.exam_id)
-        .with_for_update()
-        .first()
-    )
-    session = (
-        db.query(ExamSession)
-        .filter(ExamSession.id == session_id)
-        .with_for_update()
-        .first()
-    )
+    # A plain ``def``: FastAPI runs it in the thread pool, so a wait for a row lock blocks one thread (bounded by the
+    # server's lock_timeout), never the event loop that every other student of the worker is served by.
+    session = _lock_attempt(db, session_id)
     if not session:
         raise HTTPException(404, "Сессия не найдена")
     _require_session_capability(session, session_token)
+    exam = _exam_after_attempt_lock(db, session.exam_id)
     if not exam:
         raise HTTPException(404, "Экзамен не найден")
-    if _check_and_auto_close_exam(db, exam) or exam.status != "active":
+    if _exam_deadline_passed(db, exam):
+        db.commit()  # let go of the attempt first: the finalizer locks exam -> sessions
+        _check_and_auto_close_exam(db, exam)
+        raise HTTPException(410, "Экзамен уже завершён; ответы больше не изменяются")
+    if exam.status != "active":
         raise HTTPException(410, "Экзамен уже завершён; ответы больше не изменяются")
     if session.status != "in_progress":
         return {"ok": False, "status": session.status, "message": "Сессия не активна"}
@@ -4614,35 +4775,27 @@ async def save_exam_progress(
 
 @router.post("/exam-sessions/{session_id}/submit", response_model=SubmitExamResponse,
              summary="Сдать экзамен (студент)")
-async def submit_exam(
+def submit_exam(
     session_id: str,
     req: SubmitExamRequest,
     db: Session = Depends(get_db),
     session_token: Optional[str] = Header(None, alias="X-Exam-Session-Token"),
 ):
-    session_ref = SessionRepository(db).get_by_id(session_id)
-    if not session_ref:
-        raise HTTPException(404, "Сессия не найдена")
-    exam = (
-        db.query(GeneratedExam)
-        .filter(GeneratedExam.id == session_ref.exam_id)
-        .with_for_update()
-        .first()
-    )
-    session = (
-        db.query(ExamSession)
-        .filter(ExamSession.id == session_id)
-        .with_for_update()
-        .first()
-    )
+    session = _lock_attempt(db, session_id)
     if not session:
         raise HTTPException(404, "Сессия не найдена")
     _require_session_capability(session, session_token)
     if session.status == "submitted":
+        # A retry that overtook (or followed) a submit that went through: the attempt is graded once, here.
         raise HTTPException(400, "Экзамен уже сдан")
+    exam = _exam_after_attempt_lock(db, session.exam_id)
     if not exam:
         raise HTTPException(404, "Экзамен не найден")
-    if _check_and_auto_close_exam(db, exam) or exam.status != "active":
+    if _exam_deadline_passed(db, exam):
+        db.commit()  # let go of the attempt first: the finalizer locks exam -> sessions
+        _check_and_auto_close_exam(db, exam)
+        raise HTTPException(410, "Экзамен уже завершён; сохранённые ответы отправлены на проверку")
+    if exam.status != "active":
         raise HTTPException(410, "Экзамен уже завершён; сохранённые ответы отправлены на проверку")
     if exam.status == "lobby" or session.status == "waiting":
         raise HTTPException(400, "Экзамен ещё не начат преподавателем")
@@ -4672,7 +4825,7 @@ async def submit_exam(
 
 @router.get("/exam-sessions/{session_id}/results", response_model=SessionResultResponse,
             summary="Результаты экзамена")
-async def get_results(
+def get_results(
     session_id: str,
     db: Session = Depends(get_db),
     session_token: Optional[str] = Header(None, alias="X-Exam-Session-Token"),
@@ -4775,7 +4928,7 @@ async def get_results(
 
 @router.get("/textbooks", response_model=List[TextbookInfo],
             summary="Список учебников")
-async def list_textbooks(
+def list_textbooks(
     class_level: Optional[int] = Query(None, ge=5, le=11),
 ):
     repo = TextbookRepository()
@@ -4785,7 +4938,7 @@ async def list_textbooks(
 
 @router.get("/textbooks/{textbook_id}/toc", response_model=List[TocNode],
             summary="Оглавление учебника")
-async def get_toc(textbook_id: str):
+def get_toc(textbook_id: str):
     rows = TextbookRepository().get_toc(textbook_id)
     if not rows:
         raise HTTPException(404, "Учебник не найден или пуст")
@@ -4794,14 +4947,14 @@ async def get_toc(textbook_id: str):
 
 @router.get("/textbooks/{textbook_id}/coverage", response_model=List[CoverageItem],
             summary="Покрытие учебника задачами")
-async def get_coverage(textbook_id: str):
+def get_coverage(textbook_id: str):
     rows = TextbookRepository().get_coverage(textbook_id)
     return [CoverageItem(**r) for r in rows]
 
 
 @router.get("/toc/{toc_id}/skills", response_model=List[SkillInParagraph],
             summary="Навыки параграфа")
-async def get_toc_skills(toc_id: int):
+def get_toc_skills(toc_id: int):
     rows = TextbookRepository().get_toc_skills(toc_id)
     return [SkillInParagraph(**r) for r in rows]
 
@@ -4810,7 +4963,7 @@ async def get_toc_skills(toc_id: int):
 
 @router.get("/textbooks/skills/tree", response_model=List[SkillTreeNode],
             summary="Дерево навыков (L1→L4) для режима «По программе»")
-async def get_skill_tree(
+def get_skill_tree(
     class_level: Optional[int] = Query(None, ge=5, le=11),
 ):
     rows = TextbookRepository().get_skill_tree(class_level)
@@ -4835,7 +4988,7 @@ async def get_skill_tree(
 
 @router.get("/textbooks/{textbook_id}", response_model=TextbookDetail,
             summary="Полная информация об учебнике")
-async def get_textbook(textbook_id: str):
+def get_textbook(textbook_id: str):
     row = TextbookRepository().get_by_id(textbook_id)
     if not row:
         raise HTTPException(404, "Учебник не найден")
@@ -4844,7 +4997,7 @@ async def get_textbook(textbook_id: str):
 
 @router.get("/textbooks/{textbook_id}/toc/tree", response_model=List[TocNode],
             summary="Оглавление учебника (вложенное дерево)")
-async def get_toc_tree(textbook_id: str):
+def get_toc_tree(textbook_id: str):
     rows = TextbookRepository().get_toc(textbook_id)
     if not rows:
         raise HTTPException(404, "Учебник не найден или пуст")
@@ -4861,7 +5014,7 @@ async def get_toc_tree(textbook_id: str):
 
 @router.get("/textbooks/{textbook_id}/tasks", response_model=List[TextbookTaskInfo],
             summary="Задачи учебника с фильтрацией")
-async def get_textbook_tasks(
+def get_textbook_tasks(
     textbook_id: str,
     toc_id: Optional[int] = Query(None, description="Фильтр по разделу TOC"),
     skill_id: Optional[str] = Query(None),

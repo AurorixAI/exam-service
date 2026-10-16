@@ -8,8 +8,10 @@ import os
 import subprocess
 import sys
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
+import anyio.to_thread
 import sqlalchemy
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,13 +22,17 @@ from src.core.config import get_settings
 from src.core.exceptions import ExamServiceError
 from src.core.middleware import RequestIDMiddleware, configure_logging
 from src.api.router import _check_and_auto_close_exam, router
-from src.core.database import SessionLocal
+from src.core.database import SessionLocal, transient_db_failure
 from src.models.exam_models import GeneratedExam
 
 settings = get_settings()
 configure_logging(is_development=settings.is_development)
 log = logging.getLogger("exam_service")
 _MIGRATION_LOCK_KEY = 41_027_003
+# Readiness probes get their OWN small pool of threads: /health must answer even when every request thread of the
+# worker is busy (it is what tells an operator that the service is stuck, so it cannot be stuck with it).
+_PROBE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="health-probe")
+_PROBE_TIMEOUT_SECONDS = 4.0
 
 
 def _apply_migrations_safely() -> None:
@@ -87,7 +93,10 @@ async def _close_expired_exams_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Run Alembic migrations on startup."""
+    """Size the request thread pool, run Alembic migrations on startup."""
+    # Every handler that touches the database is a plain ``def`` (or hops to a thread with run_in_threadpool), so the
+    # event loop only does I/O.  How many of them may block at once per worker is this limiter.
+    anyio.to_thread.current_default_thread_limiter().total_tokens = settings.worker_threads
     # In the test suite the schema is created by the conftest fixtures against
     # an in-memory SQLite DB; the Postgres-flavored migrations can't run there
     # (and would target a throwaway subprocess DB anyway). Skip them.
@@ -135,14 +144,24 @@ def create_app() -> FastAPI:
     async def exam_error_handler(req: Request, exc: ExamServiceError):
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    @app.exception_handler(sqlalchemy.exc.DBAPIError)
+    @app.exception_handler(sqlalchemy.exc.TimeoutError)
+    async def transient_db_error_handler(req: Request, exc: Exception):
+        """A lock/statement timeout, a killed idle transaction or an exhausted pool is «try again», never a bare 500."""
+        message = transient_db_failure(exc)
+        if message is None:
+            raise exc
+        log.warning("transient database failure on %s %s: %s", req.method, req.url.path, type(exc).__name__)
+        return JSONResponse(status_code=503, content={"detail": message}, headers={"Retry-After": "2"})
+
     app.include_router(router, prefix="/api/v1")
 
     # Prometheus metrics
     Instrumentator(excluded_handlers=["/metrics", "/health/live", "/health/ready"]).instrument(app).expose(app)
 
     @app.get("/health/live", tags=["System"], summary="Liveness probe")
-    def health_live():
-        """Always 200 — no dependency checks."""
+    async def health_live():
+        """Always 200 — no dependency checks, no thread, no database: answered by the event loop itself."""
         return {"status": "alive"}
 
     @app.get("/version", tags=["System"], summary="Deployed release metadata")
@@ -156,9 +175,7 @@ def create_app() -> FastAPI:
             "released_at": os.getenv("RELEASED_AT", "unknown"),
         }
 
-    @app.get("/health/ready", tags=["System"], summary="Readiness probe")
-    def health_ready():
-        """Returns 200 if DB + Redis reachable, 503 otherwise."""
+    def _probe_dependencies() -> tuple[bool, bool]:
         from src.core.database import engine
         from src.core.redis_client import get_redis_client
 
@@ -177,6 +194,19 @@ def create_app() -> FastAPI:
         except Exception as exc:
             log.warning("Readiness Redis check failed: %s", exc)
             redis_ok = False
+        return db_ok, redis_ok
+
+    @app.get("/health/ready", tags=["System"], summary="Readiness probe")
+    async def health_ready():
+        """Returns 200 if DB + Redis reachable, 503 otherwise (also when the check itself does not finish in time)."""
+        loop = asyncio.get_running_loop()
+        try:
+            db_ok, redis_ok = await asyncio.wait_for(
+                loop.run_in_executor(_PROBE_EXECUTOR, _probe_dependencies), _PROBE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            log.warning("Readiness check timed out after %ss", _PROBE_TIMEOUT_SECONDS)
+            db_ok = redis_ok = False
 
         ready = db_ok and redis_ok
         payload = {
@@ -188,8 +218,8 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=200 if ready else 503, content=payload)
 
     @app.get("/health", tags=["System"], summary="Health check (legacy)")
-    def health():
-        return health_ready()
+    async def health():
+        return await health_ready()
 
     return app
 

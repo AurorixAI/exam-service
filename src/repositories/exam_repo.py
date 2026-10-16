@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from src.models import GeneratedExam, ExamSession, ExamReport
 
@@ -22,13 +22,21 @@ class ExamRepository:
         self.db.refresh(exam)
         return exam
 
-    def get_by_id(self, exam_id: str) -> Optional[GeneratedExam]:
-        return self.db.query(GeneratedExam).filter(GeneratedExam.id == exam_id).first()
+    def _query(self, without_tasks: bool):
+        query = self.db.query(GeneratedExam)
+        if without_tasks:
+            # The task JSON of an exam is large (every variant, every task) and a public entry that only checks the
+            # state of the exam does not need it: it is read once, by the step that builds the student's tasks.
+            query = query.options(defer(GeneratedExam.variants))
+        return query
 
-    def get_by_access_code(self, code: str) -> Optional[GeneratedExam]:
+    def get_by_id(self, exam_id: str, *, without_tasks: bool = False) -> Optional[GeneratedExam]:
+        return self._query(without_tasks).filter(GeneratedExam.id == exam_id).first()
+
+    def get_by_access_code(self, code: str, *, without_tasks: bool = False) -> Optional[GeneratedExam]:
         clean = (code or "").strip().upper()
         return (
-            self.db.query(GeneratedExam)
+            self._query(without_tasks)
             .filter(func.upper(GeneratedExam.access_code) == clean)
             .first()
         )

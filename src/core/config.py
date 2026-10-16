@@ -24,6 +24,19 @@ class Settings(BaseSettings):
 
     # Database — own DB for exams/results
     database_url: str = "postgresql://algo:algo_password@localhost:5432/algo_v1"
+    # Database pool and server-side safety nets (ROADMAP #95).  Per uvicorn worker: a worker serves at most
+    # ``worker_threads`` blocking calls at once (every DB handler runs in the thread pool), so pool_size + max_overflow
+    # is sized to that, not to the 15 connections that starved a 30-student class.  The three timeouts are set on EVERY
+    # connection by the server: a lock wait, a statement and a transaction that does nothing are all bounded, so a
+    # stuck request turns into a 503 the student's browser retries instead of silence.
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    db_pool_timeout: int = 10  # seconds a request waits for a free connection before it gets a 503
+    db_lock_timeout_ms: int = 5000
+    db_statement_timeout_ms: int = 15000
+    db_idle_in_transaction_timeout_ms: int = 30000
+    # Size of the thread pool FastAPI/Starlette runs plain ``def`` handlers and ``run_in_threadpool`` in (per worker).
+    worker_threads: int = 40
     # Content Service — HTTP read API (replaces direct content-db connection)
     content_service_url: str = "http://content-service:8004"
     # Auth Service — HTTP API for group/student verification
