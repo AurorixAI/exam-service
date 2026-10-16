@@ -71,6 +71,16 @@ def create_tables():
     Base.metadata.drop_all(bind=engine)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_abuse_limits():
+    """Entry-rate counters are process-wide: every test starts (and leaves) them empty."""
+    from src.core.abuse_limit import counters
+
+    counters.reset()
+    yield
+    counters.reset()
+
+
 @pytest.fixture
 def db():
     """Fresh DB session per test, rolled back after."""

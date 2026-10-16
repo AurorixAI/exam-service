@@ -42,7 +42,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 import httpx
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_, select
@@ -56,6 +56,7 @@ from src.core.auth import (
     require_group_access,
     require_student_history_access,
 )
+from src.core.abuse_limit import admit_identity_attempt
 from src.core.config import get_settings
 from src.core.database import get_db
 from src.core.exceptions import (
@@ -657,6 +658,12 @@ def _business_today() -> date:
     return datetime.now(_BUSINESS_TIMEZONE).date()
 
 
+def _business_minutes_now() -> int:
+    """Minutes since midnight in business time (Asia/Tashkent)."""
+    now = datetime.now(_BUSINESS_TIMEZONE)
+    return now.hour * 60 + now.minute
+
+
 def _has_any_sessions(db: Session, exam_id: str) -> bool:
     """A started/waiting attempt makes the run historically immutable."""
     return db.query(ExamSession.id).filter(ExamSession.exam_id == exam_id).first() is not None
@@ -966,6 +973,69 @@ def _invalidate_unbound_open_exam(db: Session, exam: GeneratedExam) -> bool:
     return False
 
 
+LESSON_OVER_MESSAGE = "Занятие уже прошло или отменено — выберите другое"
+
+
+def _clock_minutes(value: Any) -> Optional[int]:
+    """«HH:MM» (seconds, if any, ignored) as minutes since midnight; None when it is not a time of day."""
+    try:
+        hours, minutes = str(value).strip().split(":")[:2]
+        hours, minutes = int(hours), int(minutes)
+    except (ValueError, TypeError):
+        return None
+    return hours * 60 + minutes if 0 <= hours <= 24 and 0 <= minutes < 60 else None
+
+
+def _lesson_is_bindable(
+    *,
+    lesson_date: str,
+    end_time: Any,
+    lesson_status: Optional[str],
+    today: date,
+    now_minutes: int,
+) -> bool:
+    """Whether an exam may still be bound to this occurrence - the rule of the frontend dialog.
+
+    Mirrors ``isLessonBindable`` in algo-front ``src/lib/exam-lessons.ts``: a completed or cancelled lesson, a lesson
+    of an earlier day, and a lesson of today whose planned end has passed without it being in progress are not
+    offered.  A lesson in progress stays bindable even past its planned end (the teacher may run over), a later
+    day is bindable, and a lesson without a readable end time is not judged over.
+    """
+    if lesson_status in ("completed", "cancelled"):
+        return False
+    lesson_day = date.fromisoformat(lesson_date)
+    if lesson_day < today:
+        return False
+    if lesson_day > today:
+        return True
+    if lesson_status == "in_progress":
+        return True
+    end_minutes = _clock_minutes(end_time)
+    if end_minutes is None:
+        return True
+    return now_minutes < end_minutes
+
+
+async def _lesson_attendance_status(
+    actor: ExamActor, *, group_id: str, lesson_id: str, lesson_date: str
+) -> Optional[str]:
+    """The attendance status of one occurrence at auth-service (None = the lesson was never started)."""
+    url = f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/groups/{group_id}/attendance"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                url,
+                params={"date_from": lesson_date, "date_to": lesson_date},
+                headers=dict(actor.auth_headers),
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, "Не удалось проверить статус урока. Повторите попытку.") from exc
+    if response.status_code != 200:
+        raise HTTPException(503, "Не удалось проверить статус урока")
+    statuses = response.json().get("statuses") or {}
+    return statuses.get(f"{lesson_date}_{lesson_id}")
+
+
 async def _resolve_lesson_occurrence(
     actor: ExamActor,
     *,
@@ -985,7 +1055,7 @@ async def _resolve_lesson_occurrence(
     except ValueError as exc:
         raise HTTPException(422, "Дата урока должна иметь формат YYYY-MM-DD") from exc
     if require_current_or_future and parsed_date < _business_today():
-        raise HTTPException(409, "Нельзя назначить экзамен на прошедший урок")
+        raise HTTPException(409, LESSON_OVER_MESSAGE)
 
     group = await require_group_access(actor, group_id)
     url = f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/schedule/occurrences"
@@ -1016,6 +1086,19 @@ async def _resolve_lesson_occurrence(
     )
     if not occurrence:
         raise HTTPException(400, "Выбранного занятия нет в расписании этой группы")
+    if require_current_or_future:
+        # #88: an exam is never bound to a lesson the dialog would not offer (completed, cancelled, or over).
+        status_of_lesson = await _lesson_attendance_status(
+            actor, group_id=str(group["id"]), lesson_id=lesson_id, lesson_date=lesson_date
+        )
+        if not _lesson_is_bindable(
+            lesson_date=lesson_date,
+            end_time=occurrence.get("endTime"),
+            lesson_status=status_of_lesson,
+            today=_business_today(),
+            now_minutes=_business_minutes_now(),
+        ):
+            raise HTTPException(409, LESSON_OVER_MESSAGE)
     return group, occurrence
 
 
@@ -1224,6 +1307,9 @@ def _recurring_end_exam_impact(
     return exams, details, blocked
 
 
+STUDENT_NOT_FOUND_MESSAGE = "Ученик не найден в этой группе — проверьте имя или ID"
+
+
 async def _canonical_student_for_exam(
     exam: GeneratedExam,
     *,
@@ -1272,7 +1358,9 @@ async def _canonical_student_for_exam(
     data = response.json()
     student = data.get("student")
     if not data.get("enrolled") or not isinstance(student, dict) or not student.get("id"):
-        raise HTTPException(403, data.get("message") or "Ученик не состоит в группе этого экзамена")
+        # One answer for every refusal (unknown ID, wrong name for an ID, a name shared by two students, an empty
+        # group): the text of auth-service's reason tells an outsider whether an ID exists or a name is taken.
+        raise HTTPException(403, STUDENT_NOT_FOUND_MESSAGE)
     return student
 
 
@@ -3997,6 +4085,7 @@ def _find_active_session(sessions: list, student_id: Optional[str], identifier: 
 async def check_student_for_exam(
     code: str,
     req: CheckStudentExamRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     exam = ExamRepository(db).get_by_access_code(code)
@@ -4004,6 +4093,9 @@ async def check_student_for_exam(
         raise HTTPException(404, "Экзамен не найден")
     if exam.delivery_mode == "print":
         raise HTTPException(410, "Этот экзамен проводится по печатным бланкам в аудитории.")
+    # #33: the answer carries the student's name on a match, so every lookup is rate limited (429 + Retry-After)
+    # per exam code and client address; a failed lookup is what spends the strict budget.
+    ticket = admit_identity_attempt(request, exam.access_code or code)
     _check_and_auto_close_exam(db, exam)
     if exam.status not in ("active", "lobby"):
         raise HTTPException(410, "Экзамен уже завершён. Повторное прохождение недоступно.")
@@ -4024,6 +4116,7 @@ async def check_student_for_exam(
         )
     except HTTPException as exc:
         if exc.status_code == 403:
+            ticket.fail()
             return CheckStudentExamResponse(
                 enrolled=False,
                 group_required=True,
@@ -4061,6 +4154,7 @@ async def check_student_for_exam(
 async def start_exam(
     code: str,
     req: StartExamRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     exam = ExamRepository(db).get_by_access_code(code)
@@ -4068,6 +4162,7 @@ async def start_exam(
         raise HTTPException(404, "Экзамен не найден")
     if exam.delivery_mode == "print":
         raise HTTPException(410, "Этот экзамен проводится по печатным бланкам в аудитории.")
+    ticket = admit_identity_attempt(request, exam.access_code or code)  # #33: same budget as check-student
 
     # 0. Check and auto-close if time expired
     _check_and_auto_close_exam(db, exam)
@@ -4084,12 +4179,17 @@ async def start_exam(
     if not variants:
         raise HTTPException(500, "Экзамен не содержит вариантов")
 
-    canonical_student = await _canonical_student_for_exam(
-        exam,
-        student_id=req.student_id or req.display_id,
-        student_name=req.student_name,
-        identifier=req.display_id,
-    )
+    try:
+        canonical_student = await _canonical_student_for_exam(
+            exam,
+            student_id=req.student_id or req.display_id,
+            student_name=req.student_name,
+            identifier=req.display_id,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            ticket.fail()
+        raise
     canonical_student_id = str(canonical_student["id"])
     canonical_display_id = canonical_student.get("display_id")
     canonical_student_name = canonical_student.get("full_name") or req.student_name
