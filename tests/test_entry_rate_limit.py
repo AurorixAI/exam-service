@@ -1,14 +1,16 @@
 """#33: the public exam entry must not be a roster oracle.
 
 Anyone holding an exam code can ask «is TE-031 in the group?» and gets a name back on a match.  The answer stays
-(the page shows the confirmed student) but walking the ID space is made expensive: strict budget for FAILED lookups
-per (exam code, client address), a per-code circuit breaker, a generic refusal text, 429 + Retry-After.  A whole
-class behind one school NAT must still get in.
+(the page shows the confirmed student) but walking the ID space is made expensive: a strict budget of DISTINCT
+FAILED inputs per (exam code, client address) taken atomically at admission and given back on a match, a per-code
+circuit breaker aimed at the address that walks, the teacher's reset, a generic refusal text, 429 + Retry-After.  A
+whole class behind one school NAT must still get in.
 """
 from __future__ import annotations
 
 import os
 import sys
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
@@ -23,24 +25,35 @@ from fastapi import HTTPException
 from src.api import router
 from src.core import abuse_limit
 from src.core.abuse_limit import (
+    ADDED,
     ATTEMPTS_PER_MINUTE,
+    BREAKER_MIN_DISTINCT_FAILS,
     CODE_FAILS_SOFT,
+    EXISTS,
     FAILS_PER_HOUR,
     FAILS_PER_MINUTE,
-    SUSPECT_IP_FAILS,
+    FULL,
+    admit_identity_attempt,
     client_ip,
     code_key,
     counters,
+    identity_key,
     limit_bucket,
+    reset_entry_limits,
 )
 from src.models.exam_models import GeneratedExam
-from tests.conftest import make_exam_in_db, make_task
+from tests.conftest import make_actor, make_exam_in_db, make_task
 
 CODE = "EXRATE0001"
 OTHER_CODE = "EXRATE0002"
 GENERIC = "Ученик не найден в этой группе — проверьте имя или ID"
 TOO_MANY = "Слишком много попыток. Подождите минуту и попробуйте снова."
 TASKS = [make_task(f"TASK_{i:03d}", answer=str(i)) for i in range(1, 3)]
+
+
+def miss(n: int) -> str:
+    """The n-th DISTINCT wrong ID (the budget counts distinct failed inputs)."""
+    return f"NOPE-{n:05d}"
 
 
 def _roster(n=40):
@@ -117,6 +130,11 @@ def start(client, student_id, *, ip="203.0.113.7", code=CODE):
     )
 
 
+def spend_minute_budget(client, ip="203.0.113.7", code=CODE):
+    for n in range(FAILS_PER_MINUTE.count):
+        assert check(client, miss(n), ip=ip, code=code).status_code == 200
+
+
 # ── the client address: only the header our proxy sets ───────────────────────────────────────────────────
 
 def _req(headers=None, peer="10.0.0.9"):
@@ -151,6 +169,13 @@ class TestClientAddress:
         assert code_key("EXABC12345") != code_key("EXABC12346")
         assert len(code_key("x" * 100_000)) == len(code_key("a"))
 
+    def test_retyping_the_same_input_is_the_same_key(self):
+        assert identity_key("TE-031", None, "TE-031") == identity_key(" te-031 ", None, "TE-031".lower())
+        assert identity_key("TE-031", "Иванов  Иван", "x") == identity_key("TE-031", "иванов иван", "x")
+        assert identity_key("TE-031", None, None) != identity_key("TE-032", None, None)
+        assert identity_key("a", "b", None) != identity_key("a", None, "b")  # which field the text was typed in matters
+        assert len(identity_key("x" * 100_000)) == len(identity_key("a"))
+
 
 # ── counters ──────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -178,26 +203,76 @@ class TestCounters:
         assert counters.peek("fresh") == (0, 0)
         assert counters.hit("fresh", 60)[0] == 1
 
+    def test_a_set_counts_distinct_members_up_to_its_limit(self, monkeypatch):
+        clock = _Clock(monkeypatch)
+        assert counters.add_member("s", "a", 60, 2) == (ADDED, 1, 60)
+        assert counters.add_member("s", "b", 60, 2)[0] == ADDED
+        assert counters.add_member("s", "a", 60, 2)[0] == EXISTS  # the same member counts once
+        status, size, left = counters.add_member("s", "c", 60, 2)
+        assert (status, size) == (FULL, 2) and left == 60
+        assert counters.count_members("s") == (2, 60)
+        counters.remove_member("s", "a")
+        assert counters.add_member("s", "c", 60, 2)[0] == ADDED
+        clock.now += 61
+        assert counters.count_members("s") == (0, 0)
+        assert counters.add_member("s", "z", 60, 2)[0] == ADDED  # a new window
+
+    def test_a_member_that_is_already_there_is_let_through_even_when_the_set_is_full(self):
+        counters.add_member("s", "a", 60, 1)
+        assert counters.add_member("s", "a", 60, 1)[0] == EXISTS
+        assert counters.add_member("s", "b", 60, 1)[0] == FULL
+
+    def test_epochs_start_at_zero_and_only_grow(self):
+        assert counters.epoch("scope") == 0
+        assert counters.bump_epoch("scope") == 1
+        assert counters.bump_epoch("scope") == 2
+        assert counters.epoch("scope") == 2 and counters.epoch("other") == 0
+
     def test_memory_does_not_grow_without_bound(self, monkeypatch):
         monkeypatch.setattr(abuse_limit, "_MEMORY_SOFT_LIMIT", 50)
         monkeypatch.setattr(abuse_limit, "_MEMORY_HARD_LIMIT", 100)
         for i in range(1000):
             counters.hit(f"flood:{i}", 3600)
-        assert len(counters._memory) <= 100
+            counters.add_member(f"flood-set:{i}", "m", 3600, 5)
+        assert len(counters._memory) <= 100 and len(counters._sets) <= 100
 
 
 class _FakeRedis:
-    """Just enough of redis-py for the limiter: eval (the INCR+EXPIRE script), get/ttl through a pipeline."""
+    """Just enough of redis-py for the limiter: eval of its two scripts, pipelines, srem, get/incr/expire."""
 
     def __init__(self):
-        self.values, self.ttls, self.evals = {}, {}, 0
+        self.values, self.sets, self.ttls, self.evals = {}, {}, {}, 0
 
-    def eval(self, script, numkeys, key, window):
+    def eval(self, script, numkeys, key, *args):
         self.evals += 1
+        if script is abuse_limit._HIT_LUA:
+            window = args[0]
+            self.values[key] = self.values.get(key, 0) + 1
+            if self.values[key] == 1:
+                self.ttls[key] = int(window)
+            return [self.values[key], self.ttls[key]]
+        member, window, limit = args
+        members = self.sets.setdefault(key, set())
+        if member in members:
+            return [0, len(members), self.ttls.get(key, -1)]
+        if len(members) >= int(limit):
+            return [2, len(members), self.ttls.get(key, -2)]
+        members.add(member)
+        self.ttls.setdefault(key, int(window))
+        return [1, len(members), self.ttls[key]]
+
+    def srem(self, key, member):
+        self.sets.get(key, set()).discard(member)
+
+    def get(self, key):
+        return str(self.values[key]) if key in self.values else None
+
+    def incr(self, key):
         self.values[key] = self.values.get(key, 0) + 1
-        if self.values[key] == 1:
-            self.ttls[key] = int(window)
-        return [self.values[key], self.ttls[key]]
+        return self.values[key]
+
+    def expire(self, key, seconds):
+        self.ttls[key] = seconds
 
     def pipeline(self):
         outer = self
@@ -209,14 +284,22 @@ class _FakeRedis:
             def get(self, key):
                 self.calls.append(("get", key))
 
+            def scard(self, key):
+                self.calls.append(("scard", key))
+
             def ttl(self, key):
                 self.calls.append(("ttl", key))
 
             def execute(self):
-                return [
-                    (str(outer.values[k]) if k in outer.values else None) if op == "get" else outer.ttls.get(k, -2)
-                    for op, k in self.calls
-                ]
+                out = []
+                for op, key in self.calls:
+                    if op == "get":
+                        out.append(outer.get(key))
+                    elif op == "scard":
+                        out.append(len(outer.sets.get(key, ())))
+                    else:
+                        out.append(outer.ttls.get(key, -2))
+                return out
 
         return _Pipe()
 
@@ -228,6 +311,9 @@ class _BrokenRedis:
     def pipeline(self):
         raise ConnectionError("redis is down")
 
+    def get(self, *args):
+        raise ConnectionError("redis is down")
+
 
 class TestRedisBackend:
     def test_counts_live_in_redis_when_it_is_there(self):
@@ -237,14 +323,25 @@ class TestRedisBackend:
         assert counters.hit("k", 60) == (2, 60)
         assert counters.peek("k") == (2, 60)
         assert counters.peek("absent") == (0, 0)
-        assert "k" not in counters._memory
+        assert counters.add_member("s", "a", 60, 2)[0] == ADDED
+        assert counters.add_member("s", "a", 60, 2)[0] == EXISTS
+        assert counters.add_member("s", "b", 60, 2)[0] == ADDED
+        assert counters.add_member("s", "c", 60, 2)[0] == FULL
+        assert counters.count_members("s") == (2, 60)
+        counters.remove_member("s", "b")
+        assert counters.count_members("s")[0] == 1
+        assert counters.bump_epoch("x") == 1 and counters.epoch("x") == 1
+        assert not counters._memory and not counters._sets and not counters._epochs
 
     def test_redis_down_falls_back_to_memory_with_one_warning(self, caplog):
         counters.use_redis(_BrokenRedis())
         with caplog.at_level("WARNING", logger="exam_service.abuse_limit"):
             for _ in range(5):
                 counters.hit("k", 60)
+            counters.add_member("s", "a", 60, 5)
+            counters.bump_epoch("x")
         assert counters.peek("k")[0] == 5  # still counted, in process memory
+        assert counters.epoch("x") == 1
         warnings = [r for r in caplog.records if "abuse_limit_redis_unavailable" in r.getMessage()]
         assert len(warnings) == 1
 
@@ -262,11 +359,12 @@ class TestRedisBackend:
         assert len(calls) == 2
 
     @pytest.mark.skipif(not os.getenv("RATE_LIMIT_REDIS_URL"), reason="set RATE_LIMIT_REDIS_URL to run against a real Redis")
-    def test_real_redis_script(self):
+    def test_real_redis_scripts(self):
         import redis
 
         client = redis.from_url(os.environ["RATE_LIMIT_REDIS_URL"], decode_responses=True)
-        client.delete("rlt:k")
+        keys = ["rlt:k", "rlt:s", "rlt:epoch"]
+        client.delete(*keys, "examepoch:rlt")
         counters.use_redis(client)
         try:
             assert counters.hit("rlt:k", 60)[0] == 1
@@ -274,8 +372,18 @@ class TestRedisBackend:
             assert count == 2 and 0 < ttl <= 60
             assert counters.peek("rlt:k")[0] == 2
             assert counters.peek("rlt:none") == (0, 0)
+            assert counters.add_member("rlt:s", "a", 60, 2)[0] == ADDED
+            assert counters.add_member("rlt:s", "a", 60, 2)[0] == EXISTS
+            assert counters.add_member("rlt:s", "b", 60, 2)[0] == ADDED
+            status, size, ttl = counters.add_member("rlt:s", "c", 60, 2)
+            assert (status, size) == (FULL, 2) and 0 < ttl <= 60
+            counters.remove_member("rlt:s", "a")
+            assert counters.count_members("rlt:s")[0] == 1
+            assert counters.count_members("rlt:nothing") == (0, 0)
+            assert counters.bump_epoch("rlt") == 1 and counters.epoch("rlt") == 1
+            assert 0 < client.ttl("examepoch:rlt") <= abuse_limit._EPOCH_TTL
         finally:
-            client.delete("rlt:k")
+            client.delete(*keys, "examepoch:rlt")
 
 
 # ── the endpoints ─────────────────────────────────────────────────────────────────────────────────────────
@@ -292,13 +400,23 @@ class TestLegitimateClassIsNotLockedOut:
             assert started.status_code == 200, (sid, started.text)
 
     def test_a_few_typos_in_the_class_do_not_hurt(self, client, db, exam, roster):
-        """A class has a handful of failed lookups (typos), far below the strict budget of its address."""
         for i in range(1, 6):
             assert check(client, f"TE-9{i:02d}").json()["enrolled"] is False  # 5 typos
         for i in range(1, 31):
             sid = f"TE-{i:03d}"
             assert check(client, sid).status_code == 200
             assert start(client, sid).status_code == 200
+
+    def test_every_student_of_a_class_mistyping_once_gets_in_when_the_minute_is_over(self, client, db, exam, roster, monkeypatch):
+        """30 distinct typos in one minute are exactly the budget: the retries wait out the minute, then all enter."""
+        clock = _Clock(monkeypatch)
+        for i in range(1, 31):
+            assert check(client, miss(i)).json()["enrolled"] is False
+        waiting = check(client, "TE-001")
+        assert waiting.status_code == 429 and int(waiting.headers["Retry-After"]) <= 60
+        clock.now += 61
+        for i in range(1, 31):
+            assert check(client, f"TE-{i:03d}").json()["enrolled"] is True  # and each success gives its provisional back
 
     def test_two_classes_with_different_codes_behind_one_nat_have_separate_budgets(self, client, db, exam, roster):
         second = GeneratedExam(
@@ -310,33 +428,46 @@ class TestLegitimateClassIsNotLockedOut:
         )
         db.add(second)
         db.commit()
-        for i in range(FAILS_PER_MINUTE.count):
-            assert check(client, f"TE-9{i:02d}").status_code == 200
-        assert check(client, "TE-001").status_code == 429  # the first class's budget at this address is spent...
+        spend_minute_budget(client)
+        assert check(client, miss(999)).status_code == 429  # the first class's budget at this address is spent...
         other = check(client, "TE-001", code=OTHER_CODE)  # ...the second class (same NAT) is untouched
         assert other.status_code == 200 and other.json()["enrolled"] is True
 
 
 class TestFailedLookupsAreBudgeted:
-    def test_the_sixteenth_failure_in_a_minute_is_refused_with_retry_after(self, client, db, exam, roster):
-        for i in range(FAILS_PER_MINUTE.count):
-            body = check(client, f"TE-9{i:02d}")
-            assert body.status_code == 200 and body.json()["enrolled"] is False
-        refused = check(client, "TE-001")  # even the right ID: the budget of this address is spent
+    def test_the_thirty_first_distinct_failure_in_a_minute_is_refused_with_retry_after(self, client, db, exam, roster):
+        spend_minute_budget(client)
+        refused = check(client, miss(500))
         assert refused.status_code == 429
         assert refused.json()["detail"] == TOO_MANY
         assert 1 <= int(refused.headers["Retry-After"]) <= 60
 
+    def test_retyping_the_same_wrong_input_counts_once(self, client, db, exam, roster):
+        for _ in range(60):
+            body = check(client, "TE-9999")
+            assert body.status_code == 200 and body.json()["enrolled"] is False
+        for n in range(FAILS_PER_MINUTE.count - 1):  # 29 more distinct ones fit beside the one that was retyped
+            assert check(client, miss(n)).status_code == 200
+        assert check(client, miss(900)).status_code == 429
+
+    def test_a_spelling_of_the_same_input_counts_once(self, client, db, exam, roster):
+        for spelling in ("TE-9999", " te-9999 ", "Te-9999"):
+            assert check(client, spelling).status_code == 200
+        counters_after = counters.count_members(f"examfail:60:{code_key(CODE)}:0:203.0.113.7")
+        assert counters_after[0] == 1
+
+    def test_the_right_id_is_refused_too_while_the_budget_is_spent(self, client, db, exam, roster):
+        spend_minute_budget(client)
+        assert check(client, "TE-001").status_code == 429
+
     def test_another_address_is_not_affected(self, client, db, exam, roster):
-        for i in range(FAILS_PER_MINUTE.count):
-            check(client, f"TE-9{i:02d}")
+        spend_minute_budget(client)
         assert check(client, "TE-001").status_code == 429
         assert check(client, "TE-001", ip="198.51.100.20").status_code == 200
 
     def test_the_budget_comes_back_after_the_window(self, client, db, exam, roster, monkeypatch):
         clock = _Clock(monkeypatch)
-        for i in range(FAILS_PER_MINUTE.count):
-            check(client, f"TE-9{i:02d}")
+        spend_minute_budget(client)
         assert check(client, "TE-001").status_code == 429
         clock.now += 61
         assert check(client, "TE-001").status_code == 200
@@ -348,19 +479,19 @@ class TestFailedLookupsAreBudgeted:
             for _ in range(FAILS_PER_MINUTE.count):
                 if spent == FAILS_PER_HOUR.count:
                     break
-                assert check(client, f"TE-9{spent % 99:02d}").status_code == 200
+                assert check(client, miss(spent)).status_code == 200
                 spent += 1
             clock.now += 61  # a fresh minute, the hour goes on
-        refused = check(client, "TE-001")
+        refused = check(client, miss(10_000))
         assert refused.status_code == 429
         assert int(refused.headers["Retry-After"]) > 60
         assert "мин" in refused.json()["detail"] and refused.json()["detail"] != TOO_MANY
 
     def test_a_walk_over_the_ids_is_stopped_after_the_budget(self, client, db, exam, roster):
-        """The attacker's currency is failed guesses: of 200 IDs only a handful are read before the 429."""
+        """The attacker's currency is distinct failed guesses: of 200 IDs only a handful are read before the 429."""
         read, refused = 0, False
         for n in range(1, 201):
-            response = check(client, f"TE-{n:03d}" if n <= 40 and n % 3 == 0 else f"TE-8{n:03d}")
+            response = check(client, f"TE-{n:03d}" if n <= 40 and n % 3 == 0 else miss(n))
             if response.status_code == 429:
                 refused = True
                 break
@@ -368,22 +499,34 @@ class TestFailedLookupsAreBudgeted:
         assert refused and read <= 13
 
     def test_start_failures_spend_the_same_budget(self, client, db, exam, roster):
-        for i in range(FAILS_PER_MINUTE.count):
-            assert start(client, f"TE-9{i:02d}").status_code == 403
+        for n in range(FAILS_PER_MINUTE.count):
+            assert start(client, miss(n)).status_code == 403
         assert start(client, "TE-001").status_code == 429
         assert check(client, "TE-001").status_code == 429
 
     def test_a_success_does_not_spend_the_failure_budget(self, client, db, exam, roster):
-        for _ in range(3):
-            for i in range(1, 11):
+        for _ in range(2):
+            for i in range(1, 31):
                 assert check(client, f"TE-{i:03d}").json()["enrolled"] is True
-        assert check(client, "TE-9").json()["enrolled"] is False  # one failure counts, nothing was spent before
+        for n in range(FAILS_PER_MINUTE.count):  # the whole budget is still there
+            assert check(client, miss(n)).status_code == 200
+
+    def test_a_410_does_not_spend_the_failure_budget(self, client, db, exam, roster):
+        exam.status = "closed"
+        db.commit()
+        for n in range(FAILS_PER_MINUTE.count * 2):
+            assert check(client, miss(n)).status_code == 410
+        exam.status = "active"
+        db.commit()
+        assert check(client, miss(0)).status_code == 200  # nothing was counted against the address
+        spend = [check(client, miss(n)).status_code for n in range(1, FAILS_PER_MINUTE.count)]
+        assert spend == [200] * (FAILS_PER_MINUTE.count - 1)
 
     def test_spoofed_forwarded_for_does_not_open_a_new_bucket(self, client, db, exam, roster):
         for i in range(FAILS_PER_MINUTE.count):
             response = client.post(
                 f"/api/v1/exams/by-code/{CODE}/check-student",
-                json={"student_id": f"TE-9{i:02d}"},
+                json={"student_id": miss(i)},
                 headers={"X-Real-IP": "203.0.113.7", "X-Forwarded-For": f"10.{i}.0.1, 10.{i}.0.2"},
             )
             assert response.status_code == 200
@@ -396,7 +539,7 @@ class TestFailedLookupsAreBudgeted:
 
     def test_ipv6_addresses_of_one_subscriber_share_a_bucket(self, client, db, exam, roster):
         for i in range(FAILS_PER_MINUTE.count):
-            check(client, f"TE-9{i:02d}", ip=f"2001:db8:5:6:{i:x}::1")
+            check(client, miss(i), ip=f"2001:db8:5:6:{i:x}::1")
         assert check(client, "TE-001", ip="2001:db8:5:6:ffff::9").status_code == 429
         assert check(client, "TE-001", ip="2001:db8:5:7::9").status_code == 200
 
@@ -411,29 +554,204 @@ class TestFailedLookupsAreBudgeted:
         assert response.status_code == 429 and "Retry-After" in response.headers
 
 
+class TestRetryAfterIsTheLongestWait:
+    def test_minute_and_hour_exceeded_together_answer_with_the_hour(self, client, db, exam, roster, monkeypatch):
+        clock = _Clock(monkeypatch)
+        spent = 0
+        while spent < FAILS_PER_HOUR.count:
+            for _ in range(FAILS_PER_MINUTE.count):
+                if spent == FAILS_PER_HOUR.count:
+                    break
+                check(client, miss(spent))
+                spent += 1
+            if spent < FAILS_PER_HOUR.count:
+                clock.now += 61
+        # the last minute is full (30 distinct) AND the hour is full (150): the wait is the hour's, not the minute's
+        refused = check(client, miss(20_000))
+        assert refused.status_code == 429
+        assert int(refused.headers["Retry-After"]) > 3000
+
+    def test_flood_and_failures_exceeded_together_answer_with_the_longer(self, monkeypatch):
+        clock = _Clock(monkeypatch)
+        request = _req({"X-Real-IP": "203.0.113.7"})
+        for n in range(FAILS_PER_MINUTE.count):
+            admit_identity_attempt(request, CODE, miss(n))
+        clock.now += 20
+        with pytest.raises(HTTPException) as caught:
+            admit_identity_attempt(request, CODE, miss(999))
+        assert caught.value.status_code == 429
+        assert int(caught.value.headers["Retry-After"]) == 40  # the minute window opened 20 s ago
+
+
+class TestTheProvisionalFailureIsAtomic:
+    def test_parallel_admissions_cannot_exceed_the_budget(self):
+        """200 threads with 200 distinct inputs against a budget of 30 per minute: exactly 30 are admitted."""
+        request = _req({"X-Real-IP": "203.0.113.7"})
+        admitted, refused, errors = [], [], []
+        barrier = threading.Barrier(50)
+
+        def worker(base):
+            try:
+                barrier.wait()
+                for n in range(base, base + 4):
+                    try:
+                        admitted.append(admit_identity_attempt(request, CODE, miss(n)))
+                    except HTTPException as exc:
+                        refused.append(exc.status_code)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i * 4,)) for i in range(50)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert not errors
+        assert len(admitted) == FAILS_PER_MINUTE.count and set(refused) == {429}
+        assert len(admitted) + len(refused) == 200
+
+    def test_a_match_gives_the_provisional_failure_back(self):
+        request = _req({"X-Real-IP": "203.0.113.7"})
+        key = f"examfail:60:{code_key(CODE)}:0:203.0.113.7"
+        ticket = admit_identity_attempt(request, CODE, "TE-001")
+        assert counters.count_members(key)[0] == 1  # taken at admission
+        ticket.close()  # the lookup found a student: no failure was called
+        assert counters.count_members(key) == (0, 0)
+        ticket.close()  # idempotent
+
+    def test_a_failure_stays_counted(self):
+        request = _req({"X-Real-IP": "203.0.113.7"})
+        key = f"examfail:60:{code_key(CODE)}:0:203.0.113.7"
+        ticket = admit_identity_attempt(request, CODE, "NOBODY")
+        ticket.fail()
+        ticket.close()
+        assert counters.count_members(key)[0] == 1
+
+    def test_a_refused_admission_leaves_nothing_behind(self):
+        request = _req({"X-Real-IP": "203.0.113.7"})
+        key_minute = f"examfail:60:{code_key(CODE)}:0:203.0.113.7"
+        key_hour = f"examfail:3600:{code_key(CODE)}:0:203.0.113.7"
+        for n in range(FAILS_PER_MINUTE.count):
+            admit_identity_attempt(request, CODE, miss(n)).fail()
+        with pytest.raises(HTTPException):
+            admit_identity_attempt(request, CODE, "one-more")
+        assert counters.count_members(key_minute)[0] == FAILS_PER_MINUTE.count
+        assert counters.count_members(key_hour)[0] == FAILS_PER_MINUTE.count  # not rolled forward by the refusal
+
+
 class TestCodeCircuitBreaker:
-    def _spend_code_budget(self, client):
-        """Many addresses, a few failures each: the distributed walk."""
-        n = 0
-        octet = 1
-        while n < CODE_FAILS_SOFT.count:
-            for k in range(5):
-                check(client, f"TE-9{k:02d}", ip=f"198.51.100.{octet}")
-                n += 1
-            octet += 1
+    def _arm(self, n=CODE_FAILS_SOFT.count + 5):
+        """A distributed walk: many addresses, a few distinct failures each."""
+        for k in range(n):
+            ticket = admit_identity_attempt(_req({"X-Real-IP": f"198.51.100.{k % 200 + 1}"}), CODE, miss(5000 + k))
+            ticket.fail()
 
-    def test_the_breaker_refuses_addresses_that_already_failed_but_not_new_ones(self, client, db, exam, roster):
-        for i in range(SUSPECT_IP_FAILS):
-            check(client, f"TE-9{i:02d}", ip="203.0.113.50")  # this address has failed 10 times
-        self._spend_code_budget(client)
-        assert check(client, "TE-001", ip="203.0.113.50").status_code == 429  # the suspect is refused
+    def test_an_address_that_is_walking_is_refused_once_the_code_is_under_attack(self, monkeypatch):
+        clock = _Clock(monkeypatch)
+        walker = _req({"X-Real-IP": "203.0.113.50"})
+        for n in range(BREAKER_MIN_DISTINCT_FAILS):
+            admit_identity_attempt(walker, CODE, miss(n)).fail()
+        clock.now += 61  # a fresh minute: the minute budget is out of the picture, only the breaker can refuse
+        admit_identity_attempt(walker, CODE, miss(900)).close()  # control: the code is not under attack, admitted
+        self._arm()
+        with pytest.raises(HTTPException) as caught:
+            admit_identity_attempt(walker, CODE, miss(901))  # 30 distinct failures out of 31 attempts
+        assert caught.value.status_code == 429
+        assert int(caught.value.headers["Retry-After"]) > 3000  # until its hour of failures runs out
+
+    def test_a_nat_with_a_few_typos_stays_in_even_when_the_code_is_under_attack(self, client, db, exam, roster):
+        self._arm()
+        for n in range(8):  # eight typos in the class
+            assert check(client, miss(n)).json()["enrolled"] is False
+        for i in range(1, 31):
+            assert check(client, f"TE-{i:03d}").status_code == 200
+            assert start(client, f"TE-{i:03d}").status_code == 200
+
+    def test_failing_a_lot_is_not_enough_when_most_attempts_succeed(self, client, db, exam, roster, monkeypatch):
+        clock = _Clock(monkeypatch)
+        self._arm()
+        for _ in range(3):  # 120 successful attempts of the class...
+            for i in range(1, 41):
+                assert check(client, f"TE-{i:03d}").status_code == 200
+            clock.now += 61
+        for n in range(BREAKER_MIN_DISTINCT_FAILS + 5):  # ...and 35 distinct failures: the failure share is 22%
+            assert check(client, miss(n)).status_code == 200
+            if n == 24:
+                clock.now += 61
+        assert check(client, "TE-001").status_code == 200
+
+    def test_a_fresh_address_enters_while_the_breaker_is_armed(self, client, db, exam, roster):
+        self._arm()
         fresh = check(client, "TE-001", ip="192.0.2.77")
-        assert fresh.status_code == 200 and fresh.json()["enrolled"] is True  # a class student still enters
+        assert fresh.status_code == 200 and fresh.json()["enrolled"] is True
 
-    def test_below_the_breaker_nobody_is_refused_for_ten_failures(self, client, db, exam, roster):
-        for i in range(SUSPECT_IP_FAILS):
-            check(client, f"TE-9{i:02d}", ip="203.0.113.50")
-        assert check(client, "TE-001", ip="203.0.113.50").status_code == 200
+    def test_the_breaker_is_not_armed_by_few_failures(self):
+        walker = _req({"X-Real-IP": "203.0.113.50"})
+        for n in range(25):
+            admit_identity_attempt(walker, CODE, miss(n)).fail()
+        admit_identity_attempt(walker, CODE, miss(900)).close()  # the code has far fewer failures than the breaker needs
+
+
+class TestTeacherResetsTheEntryLimits:
+    URL = "/api/v1/exams/EXAM_TEST01/entry-limits/reset"
+
+    def test_reset_clears_the_budget_of_the_address_and_the_breaker(self, client, db, exam, roster):
+        spend_minute_budget(client)
+        assert check(client, "TE-001").status_code == 429
+        reset = client.post(self.URL)
+        assert reset.status_code == 200 and reset.json() == {"exam_id": "EXAM_TEST01", "reset": True}
+        assert check(client, "TE-001").status_code == 200
+        spend_minute_budget(client)  # a full fresh budget, not what was left
+        assert check(client, "TE-002").status_code == 429
+
+    def test_reset_clears_every_address_of_the_code_but_not_another_code(self, client, db, exam, roster):
+        for ip in ("203.0.113.1", "203.0.113.2"):
+            spend_minute_budget(client, ip=ip)
+        other_code = admit_identity_attempt(_req({"X-Real-IP": "203.0.113.1"}), OTHER_CODE, "x")
+        other_code.fail()
+        client.post(self.URL)
+        for ip in ("203.0.113.1", "203.0.113.2"):
+            assert check(client, "TE-001", ip=ip).status_code == 200
+        epoch_other = counters.epoch(code_key(OTHER_CODE))
+        assert epoch_other == 0  # the other exam's keys were not touched
+
+    def test_reset_works_on_the_lobby_too_and_is_recorded(self, client, db, exam, roster):
+        exam.status = "lobby"
+        db.commit()
+        assert client.post(self.URL).status_code == 200
+        db.refresh(exam)
+        assert exam.settings["lifecycle_events"][-1]["type"] == "entry_limits_reset"
+
+    @pytest.mark.parametrize("status", ["draft", "variants_ready", "closed"])
+    def test_a_closed_or_unopened_exam_has_nothing_to_reset(self, client, db, exam, roster, status):
+        exam.status = status
+        db.commit()
+        assert client.post(self.URL).status_code == 409
+
+    def test_an_exam_without_a_code_has_nothing_to_reset(self, client, db, exam, roster):
+        exam.access_code = None
+        db.commit()
+        assert client.post(self.URL).status_code == 409
+
+    def test_only_the_teacher_of_the_group_may_reset(self, client, db, exam, roster):
+        from src.core.auth import require_exam_staff
+        from src.main import app
+
+        app.dependency_overrides[require_exam_staff] = lambda: make_actor("admin")
+        assert client.post(self.URL).status_code == 403
+
+    def test_an_unknown_exam_is_a_404(self, client, db, exam, roster):
+        assert client.post("/api/v1/exams/NO_SUCH/entry-limits/reset").status_code == 404
+
+    def test_reset_uses_a_new_epoch_so_old_keys_are_never_read(self):
+        request = _req({"X-Real-IP": "203.0.113.7"})
+        for n in range(FAILS_PER_MINUTE.count):
+            admit_identity_attempt(request, CODE, miss(n)).fail()
+        with pytest.raises(HTTPException):
+            admit_identity_attempt(request, CODE, miss(999))
+        assert reset_entry_limits(CODE) == 1
+        admit_identity_attempt(request, CODE, miss(999))  # admitted at once, nothing was scanned or deleted
+        assert counters.count_members(f"examfail:60:{code_key(CODE)}:0:203.0.113.7")[0] == FAILS_PER_MINUTE.count
 
 
 class TestNoNameLeakage:

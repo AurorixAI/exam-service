@@ -15,6 +15,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 os.environ.setdefault("APP_ENV", "testing")
 
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -78,14 +79,23 @@ class TestTheRule:
     def test_today_without_an_end_time_is_not_judged_over(self):
         assert bindable(TODAY_S, end=None, now="23:00") is True
         assert bindable(TODAY_S, end="", now="23:00") is True
-        assert bindable(TODAY_S, end="soon", now="23:00") is True
+        assert bindable(TODAY_S, end="   ", now="23:00") is True
 
-    def test_clock_minutes(self):
+    def test_a_malformed_end_time_is_over_like_in_the_dialog(self):
+        """The frontend reads «soon» as 0 minutes (``Number("soon") || 0``): the lesson is over and the dialog hides it."""
+        assert bindable(TODAY_S, end="soon", now="00:01") is False
+        assert bindable(TODAY_S, end="soon", now="23:00") is False
+        assert bindable(TODAY_S, end="soon", now="23:00", status="in_progress") is True  # in progress stays bindable
+        assert bindable(TOMORROW_S, end="soon", now="23:00") is True
+
+    def test_clock_minutes_reads_the_way_the_frontend_does(self):
         assert _clock_minutes("11:30") == 690
         assert _clock_minutes("09:05:00") == 545
         assert _clock_minutes("00:00") == 0
-        for bad in (None, "", "soon", "25:99", "11", "-1:00"):
-            assert _clock_minutes(bad) is None
+        assert _clock_minutes("11") == 660  # a missing minutes part is 0
+        assert _clock_minutes("25:99") == 25 * 60 + 99  # no range check, as in the dialog
+        assert _clock_minutes("soon") == 0 and _clock_minutes("x:y") == 0 and _clock_minutes(":") == 0
+        assert _clock_minutes(None) is None and _clock_minutes("") is None
 
 
 # ── resolve against a mocked auth-service ───────────────────────────────────────────────────────────────────
@@ -131,9 +141,10 @@ def auth(monkeypatch):
 
         monkeypatch.setattr(router.httpx, "AsyncClient", factory)
         monkeypatch.setattr(router, "require_group_access", group_access)
-        monkeypatch.setattr(router, "_business_today", lambda: TODAY)
         hours, minutes = now.split(":")
-        monkeypatch.setattr(router, "_business_minutes_now", lambda: int(hours) * 60 + int(minutes))
+        instant = datetime(TODAY.year, TODAY.month, TODAY.day, int(hours), int(minutes), tzinfo=ZoneInfo("Asia/Tashkent"))
+        monkeypatch.setattr(router, "_business_now", lambda: instant)
+        monkeypatch.setattr(router, "_business_today", lambda: TODAY)
         return spec
 
     return install
@@ -291,7 +302,7 @@ class TestEndpointsRefuseAnOverLesson:
         assert draft.status == "lobby" and draft.scheduled_lesson_date == TOMORROW_S
 
 
-def test_the_business_clock_is_read_in_tashkent(monkeypatch):
+def test_the_business_clock_is_read_in_tashkent_once(monkeypatch):
     seen = []
 
     class Fixed(datetime):
@@ -301,6 +312,23 @@ def test_the_business_clock_is_read_in_tashkent(monkeypatch):
             return datetime(2026, 10, 16, 13, 45, tzinfo=tz)
 
     monkeypatch.setattr(router, "datetime", Fixed)
-    assert router._business_minutes_now() == 13 * 60 + 45
+    instant = router._business_now()
+    assert (instant.date(), instant.hour * 60 + instant.minute) == (date(2026, 10, 16), 13 * 60 + 45)
     assert router._business_today() == date(2026, 10, 16)
     assert seen == ["Asia/Tashkent", "Asia/Tashkent"]
+
+
+def test_the_binding_check_reads_the_clock_once_for_the_date_and_the_minutes(auth, monkeypatch):
+    """Midnight race: a date taken from one reading and minutes from another could put 23:59 on the next day."""
+    spec = auth(_Auth(end="23:59"), now="23:58")
+    readings = []
+    real_now = router._business_now
+
+    def counting():
+        readings.append(1)
+        return real_now()
+
+    monkeypatch.setattr(router, "_business_now", counting)
+    resolve(TODAY_S)
+    assert len(readings) == 1
+    assert spec.requests

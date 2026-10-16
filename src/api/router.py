@@ -56,7 +56,7 @@ from src.core.auth import (
     require_group_access,
     require_student_history_access,
 )
-from src.core.abuse_limit import admit_identity_attempt
+from src.core.abuse_limit import EntryTicket, admit_identity_attempt, reset_entry_limits
 from src.core.config import get_settings
 from src.core.database import get_db
 from src.core.exceptions import (
@@ -654,14 +654,13 @@ async def _get_exam_for_teacher_operator(
 _BUSINESS_TIMEZONE = ZoneInfo("Asia/Tashkent")
 
 
+def _business_now() -> datetime:
+    """ONE clock reading in business time (Asia/Tashkent): take the date and the minutes from the same value."""
+    return datetime.now(_BUSINESS_TIMEZONE)
+
+
 def _business_today() -> date:
-    return datetime.now(_BUSINESS_TIMEZONE).date()
-
-
-def _business_minutes_now() -> int:
-    """Minutes since midnight in business time (Asia/Tashkent)."""
-    now = datetime.now(_BUSINESS_TIMEZONE)
-    return now.hour * 60 + now.minute
+    return _business_now().date()
 
 
 def _has_any_sessions(db: Session, exam_id: str) -> bool:
@@ -977,13 +976,25 @@ LESSON_OVER_MESSAGE = "Занятие уже прошло или отменен�
 
 
 def _clock_minutes(value: Any) -> Optional[int]:
-    """«HH:MM» (seconds, if any, ignored) as minutes since midnight; None when it is not a time of day."""
-    try:
-        hours, minutes = str(value).strip().split(":")[:2]
-        hours, minutes = int(hours), int(minutes)
-    except (ValueError, TypeError):
+    """Minutes since midnight of an «HH:MM» end time, read the way the frontend reads it (``clockMinutes``).
+
+    No end time at all (None / empty) is None: the lesson is not judged over.  A malformed one is read as 0 - the
+    frontend does the same (``Number("x") || 0``), so such a lesson is already over and the dialog hides it.
+    """
+    if value is None or str(value).strip() == "":
         return None
-    return hours * 60 + minutes if 0 <= hours <= 24 and 0 <= minutes < 60 else None
+
+    def number(part: Optional[str]) -> float:
+        try:
+            parsed = float(part) if part is not None and part.strip() != "" else 0.0
+        except ValueError:
+            return 0.0
+        return 0.0 if parsed != parsed else parsed  # NaN reads as 0
+
+    parts = str(value).split(":")
+    hours = number(parts[0])
+    minutes = number(parts[1]) if len(parts) > 1 else 0.0
+    return int(hours * 60 + minutes)
 
 
 def _lesson_is_bindable(
@@ -999,7 +1010,7 @@ def _lesson_is_bindable(
     Mirrors ``isLessonBindable`` in algo-front ``src/lib/exam-lessons.ts``: a completed or cancelled lesson, a lesson
     of an earlier day, and a lesson of today whose planned end has passed without it being in progress are not
     offered.  A lesson in progress stays bindable even past its planned end (the teacher may run over), a later
-    day is bindable, and a lesson without a readable end time is not judged over.
+    day is bindable, and a lesson without an end time is not judged over (a malformed one is read as 0: over).
     """
     if lesson_status in ("completed", "cancelled"):
         return False
@@ -1091,12 +1102,13 @@ async def _resolve_lesson_occurrence(
         status_of_lesson = await _lesson_attendance_status(
             actor, group_id=str(group["id"]), lesson_id=lesson_id, lesson_date=lesson_date
         )
+        now = _business_now()  # one reading: the date and the minutes must come from the same instant
         if not _lesson_is_bindable(
             lesson_date=lesson_date,
             end_time=occurrence.get("endTime"),
             lesson_status=status_of_lesson,
-            today=_business_today(),
-            now_minutes=_business_minutes_now(),
+            today=now.date(),
+            now_minutes=now.hour * 60 + now.minute,
         ):
             raise HTTPException(409, LESSON_OVER_MESSAGE)
     return group, occurrence
@@ -3115,6 +3127,35 @@ async def open_exam_lobby(
 
 
 @router.post(
+    "/exams/{exam_id}/entry-limits/reset",
+    summary="Сбросить ограничения входа учеников (после ошибочных попыток в классе)",
+)
+async def reset_exam_entry_limits(
+    exam_id: str,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    """Teacher's escape hatch from the entry rate limits (#33).
+
+    A classmate behind the same school address can use up the failure budget of the exam code on purpose.  The
+    teacher of the exam clears every counter of its code: the limits start again from zero, nothing else changes.
+    Only the group's teacher may do it, and only while the exam is open to students.
+    """
+    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    if not exam.access_code or exam.status not in ("lobby", "active"):
+        raise HTTPException(409, "Ограничения входа можно сбросить только для открытого экзамена")
+    reset_entry_limits(exam.access_code)
+    _record_exam_lifecycle_event(
+        db,
+        exam,
+        {"type": "entry_limits_reset", "details": {"operation": "entry_limits_reset"}},
+        actor_id=actor.user_id,
+    )
+    db.commit()
+    return {"exam_id": exam.id, "reset": True}
+
+
+@router.post(
     "/exams/{exam_id}/delivery/cancel",
     summary="Отменить непройденное проведение экзамена",
 )
@@ -4094,8 +4135,20 @@ async def check_student_for_exam(
     if exam.delivery_mode == "print":
         raise HTTPException(410, "Этот экзамен проводится по печатным бланкам в аудитории.")
     # #33: the answer carries the student's name on a match, so every lookup is rate limited (429 + Retry-After)
-    # per exam code and client address; a failed lookup is what spends the strict budget.
-    ticket = admit_identity_attempt(request, exam.access_code or code)
+    # per exam code and client address; a distinct failed input is what spends the strict budget.
+    ticket = admit_identity_attempt(request, exam.access_code or code, req.student_id, req.student_name, req.identifier)
+    try:
+        return await _check_student_admitted(exam, req, ticket, db)
+    finally:
+        ticket.close()  # gives the provisional failure back unless the lookup really failed
+
+
+async def _check_student_admitted(
+    exam: GeneratedExam,
+    req: CheckStudentExamRequest,
+    ticket: EntryTicket,
+    db: Session,
+) -> CheckStudentExamResponse:
     _check_and_auto_close_exam(db, exam)
     if exam.status not in ("active", "lobby"):
         raise HTTPException(410, "Экзамен уже завершён. Повторное прохождение недоступно.")
@@ -4162,8 +4215,22 @@ async def start_exam(
         raise HTTPException(404, "Экзамен не найден")
     if exam.delivery_mode == "print":
         raise HTTPException(410, "Этот экзамен проводится по печатным бланкам в аудитории.")
-    ticket = admit_identity_attempt(request, exam.access_code or code)  # #33: same budget as check-student
+    # #33: the same budget as check-student
+    ticket = admit_identity_attempt(
+        request, exam.access_code or code, req.student_id or req.display_id, req.student_name, req.display_id
+    )
+    try:
+        return await _start_exam_admitted(exam, req, ticket, db)
+    finally:
+        ticket.close()
 
+
+async def _start_exam_admitted(
+    exam: GeneratedExam,
+    req: StartExamRequest,
+    ticket: EntryTicket,
+    db: Session,
+) -> StartExamResponse:
     # 0. Check and auto-close if time expired
     _check_and_auto_close_exam(db, exam)
     if exam.status not in ("active", "lobby"):
