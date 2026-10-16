@@ -44,6 +44,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import anyio
+import anyio.from_thread
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 import httpx
@@ -616,11 +617,26 @@ def _generate_session_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-async def _get_exam_for_actor(db: Session, exam_id: str, actor: ExamActor) -> GeneratedExam:
+async def _run_awaitable(awaitable):
+    return await awaitable
+
+
+def _await(awaitable):
+    """Run a coroutine - a call to auth-service / content-service - on the event loop, from a worker thread.
+
+    The teacher and admin routes are plain ``def`` (FastAPI runs them in the thread pool), so their database work
+    never blocks the event loop; the few network calls they make are handed to the loop through this bridge.  The
+    rules that keep it safe (pinned by tests/test_concurrency_safety.py): nothing that takes a row lock or writes
+    precedes a bridged call in the same transaction, and a coroutine passed here does no database work itself.
+    """
+    return anyio.from_thread.run(_run_awaitable, awaitable)
+
+
+def _get_exam_for_actor(db: Session, exam_id: str, actor: ExamActor) -> GeneratedExam:
     exam = ExamRepository(db).get_by_id(exam_id)
     if not exam:
         raise HTTPException(404, "Экзамен не найден")
-    await require_exam_access(exam, actor)
+    _await(require_exam_access(exam, actor))
     return exam
 
 
@@ -645,13 +661,13 @@ def _require_exam_admin_observer(actor: ExamActor) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Просмотр мониторинга экзаменов доступен только администратору")
 
 
-async def _get_exam_for_teacher_operator(
+def _get_exam_for_teacher_operator(
     db: Session,
     exam_id: str,
     actor: ExamActor,
 ) -> GeneratedExam:
     _require_teacher_exam_operator(actor)
-    return await _get_exam_for_actor(db, exam_id, actor)
+    return _get_exam_for_actor(db, exam_id, actor)
 
 
 _BUSINESS_TIMEZONE = ZoneInfo("Asia/Tashkent")
@@ -775,7 +791,7 @@ async def _embed_print_figures(snapshot: dict[str, Any]) -> dict[str, Any]:
     return snapshot
 
 
-async def _build_print_preview_snapshot(exam: GeneratedExam, db: Optional[Session] = None) -> dict[str, Any]:
+def _build_print_preview_snapshot(exam: GeneratedExam) -> dict[str, Any]:
     """Build a non-persistent PDF source for the print editor.
 
     Unlike a package snapshot it has no assigned lesson and is never written
@@ -801,9 +817,7 @@ async def _build_print_preview_snapshot(exam: GeneratedExam, db: Optional[Sessio
         )
     except PrintLayoutValidationError as exc:
         raise HTTPException(422, str(exc)) from exc
-    if db is not None:
-        db.commit()  # the figures are fetched over the network below: do not sit «idle in transaction» meanwhile
-    return await _embed_print_figures(snapshot)
+    return snapshot
 
 
 def _event_payload(event: ExamLifecycleEvent) -> dict:
@@ -1594,7 +1608,7 @@ def _order_tasks_by_section(tasks: List[dict]) -> List[dict]:
 
 
 @router.get("/exams/lesson-binding", summary="Связанный экзамен конкретного занятия")
-async def get_lesson_exam_binding(
+def get_lesson_exam_binding(
     group_id: str = Query(..., min_length=1),
     lesson_id: str = Query(..., min_length=1),
     lesson_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
@@ -1602,7 +1616,7 @@ async def get_lesson_exam_binding(
     actor: ExamActor = Depends(require_exam_staff),
 ):
     """Return cancellation-safe operational state for a schedule modal."""
-    await require_group_access(actor, group_id)
+    _await(require_group_access(actor, group_id))
     exams, blocked = _lesson_cancellation_blocker(
         db,
         org_id=actor.org_id,
@@ -1845,7 +1859,7 @@ def record_lesson_reschedule(
 
 
 @router.post("/exams/generate", summary="Создать черновик экзамена")
-async def generate_exam(
+def generate_exam(
     req: GenerateExamRequest,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
@@ -1874,7 +1888,7 @@ async def generate_exam(
     exam_id = f"EXAM_{uuid4().hex[:8]}"
     skills_set = {t["skill_id"] for t in tasks if t["skill_id"]}
 
-    group = await require_group_access(actor, req.group_id) if req.group_id else None
+    group = _await(require_group_access(actor, req.group_id)) if req.group_id else None
     exam = GeneratedExam(
         id=exam_id,
         title=req.title,
@@ -2203,7 +2217,7 @@ def _check_and_auto_close_exam(db: Session, exam: Optional[GeneratedExam]) -> bo
 
 @router.get("/exams",
             summary="Список экзаменов (Библиотека учителя)")
-async def list_exams(
+def list_exams(
     group_id: Optional[str] = None,
     unassigned: Optional[bool] = None,   # True = only library templates (group_id IS NULL)
     status: Optional[str] = None,        # draft | active | closed | archived
@@ -2256,7 +2270,7 @@ async def list_exams(
                     visible.append(exam)
                 continue
             try:
-                await require_exam_access(exam, actor)
+                _await(require_exam_access(exam, actor))
                 visible.append(exam)
                 if group_id:
                     group_access[group_id] = True
@@ -2540,7 +2554,7 @@ def get_admin_exam_monitor(
     response_model=List[LiveExamDashboardResponse],
     summary="Оперативная сводка экзаменов для панели преподавателя",
 )
-async def get_live_exam_dashboard_summary(
+def get_live_exam_dashboard_summary(
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
@@ -2602,7 +2616,7 @@ async def get_live_exam_dashboard_summary(
                 continue
         else:
             try:
-                await require_exam_access(exam, actor)
+                _await(require_exam_access(exam, actor))
                 if needs_group_lookup and group_id:
                     group_access[group_id] = True
             except HTTPException as exc:
@@ -2632,14 +2646,14 @@ async def get_live_exam_dashboard_summary(
 
 @router.post("/exams/{exam_id}/pin",
              summary="Переключить закрепление (избранное)")
-async def toggle_pin_exam(
+def toggle_pin_exam(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
     """Toggle is_pinned on a teacher's exam."""
     exam_repo = ExamRepository(db)
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     exam.is_pinned = not bool(exam.is_pinned)
     db.commit()
     return {"exam_id": exam_id, "is_pinned": exam.is_pinned}
@@ -2695,7 +2709,7 @@ def _next_clone_title(db: Session, source: GeneratedExam, org_id: str) -> str:
 
 
 @router.patch("/exams/{exam_id}/title", summary="Переименовать черновик экзамена")
-async def rename_exam(
+def rename_exam(
     exam_id: str,
     req: RenameExamRequest,
     db: Session = Depends(get_db),
@@ -2708,7 +2722,7 @@ async def rename_exam(
     historical runs are intentionally immutable: create a clone to make a
     revised version instead.
     """
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     if exam.status not in {"draft", "variants_ready"}:
         raise HTTPException(
             409,
@@ -2742,7 +2756,7 @@ async def rename_exam(
 
 @router.post("/exams/{exam_id}/clone",
              summary="Клонировать экзамен (шаблон)")
-async def clone_exam(
+def clone_exam(
     exam_id: str,
     req: CloneExamRequest,
     db: Session = Depends(get_db),
@@ -2755,10 +2769,10 @@ async def clone_exam(
     - keeps a lineage link to the source, but never changes the source
     - optionally binds to a new group
     """
-    src = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    src = _get_exam_for_teacher_operator(db, exam_id, actor)
     if src.status == "archived":
         raise HTTPException(409, "Экзамен находится в архиве. Сначала восстановите его, затем создайте копию.")
-    group = await require_group_access(actor, req.group_id) if req.group_id else None
+    group = _await(require_group_access(actor, req.group_id)) if req.group_id else None
     requested_title = req.title.strip() if req.title is not None else None
     if requested_title is not None and not requested_title:
         raise HTTPException(422, "Название экзамена не может состоять только из пробелов")
@@ -2839,7 +2853,7 @@ class AssignExamRequest(BaseModel):
 
 @router.post("/exams/{exam_id}/assign",
              summary="Назначить экзамен группе")
-async def assign_exam(
+def assign_exam(
     exam_id: str,
     req: AssignExamRequest,
     db: Session = Depends(get_db),
@@ -2852,7 +2866,7 @@ async def assign_exam(
     Once a session exists, a copy is required so an earlier run is never
     silently repurposed for another lesson or group.
     """
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     # Print delivery has a different lifecycle from an online exam: it must
     # never receive an access code or enter an online lobby, including through
     # the legacy non-publishing assignment path.  A paper package is bound to
@@ -2862,7 +2876,7 @@ async def assign_exam(
             422,
             "Для формата «Печать» выберите занятие через подготовку печатного комплекта",
         )
-    group = await require_group_access(actor, req.group_id)
+    group = _await(require_group_access(actor, req.group_id))
     if _has_any_sessions(db, exam_id):
         raise HTTPException(
             409,
@@ -2891,12 +2905,12 @@ async def assign_exam(
 
     access_code = None
     if req.publish:
-        canonical_group, _ = await _resolve_lesson_occurrence(
+        canonical_group, _ = _await(_resolve_lesson_occurrence(
             actor,
             group_id=str(group["id"]),
             lesson_id=req.lesson_id,
             lesson_date=req.lesson_date,
-        )
+        ))
         _ensure_lesson_slot_is_available(
             db,
             exam,
@@ -2982,14 +2996,14 @@ async def assign_exam(
 
 @router.post("/exams/{exam_id}/publish", response_model=PublishExamResponse,
              summary="Опубликовать экзамен → получить access_code")
-async def publish_exam(
+def publish_exam(
     exam_id: str,
     req: PublishExamRequest,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
     exam_repo = ExamRepository(db)
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     if exam.delivery_mode == "print":
         raise HTTPException(409, "Печатный экзамен не публикуется в лобби. Подготовьте комплект для занятия.")
     if exam.status not in ("draft", "variants_ready", "lobby"):
@@ -3006,12 +3020,12 @@ async def publish_exam(
         raise HTTPException(422, "Для лобби выберите конкретное занятие в расписании")
     if _has_any_sessions(db, exam_id):
         raise HTTPException(409, "Экзамен уже имеет попытки. Для нового урока создайте его копию")
-    group, _ = await _resolve_lesson_occurrence(
+    group, _ = _await(_resolve_lesson_occurrence(
         actor,
         group_id=target_group_id,
         lesson_id=req.lesson_id,
         lesson_date=req.lesson_date,
-    )
+    ))
     _ensure_lesson_slot_is_available(
         db,
         exam,
@@ -3087,13 +3101,13 @@ async def publish_exam(
 
 
 @router.post("/exams/{exam_id}/open-lobby", summary="Запланировать экзамен и открыть лобби")
-async def open_exam_lobby(
+def open_exam_lobby(
     exam_id: str,
     req: LessonBindingRequest,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     if exam.delivery_mode == "print":
         raise HTTPException(409, "Печатный экзамен не использует лобби. Подготовьте печатный комплект.")
 
@@ -3111,12 +3125,12 @@ async def open_exam_lobby(
     previous_group_id = exam.group_id
     previous_lesson_id = exam.scheduled_lesson_id
     previous_lesson_date = exam.scheduled_lesson_date
-    group, _ = await _resolve_lesson_occurrence(
+    group, _ = _await(_resolve_lesson_occurrence(
         actor,
         group_id=str(exam.group_id),
         lesson_id=req.lesson_id,
         lesson_date=req.lesson_date,
-    )
+    ))
     _ensure_lesson_slot_is_available(
         db,
         exam,
@@ -3177,7 +3191,7 @@ async def open_exam_lobby(
     "/exams/{exam_id}/entry-limits/reset",
     summary="Сбросить ограничения входа учеников (после ошибочных попыток в классе)",
 )
-async def reset_exam_entry_limits(
+def reset_exam_entry_limits(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
@@ -3188,7 +3202,7 @@ async def reset_exam_entry_limits(
     teacher of the exam clears every counter of its code: the limits start again from zero, nothing else changes.
     Only the group's teacher may do it, and only while the exam is open to students.
     """
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     if not exam.access_code or exam.status not in ("lobby", "active"):
         raise HTTPException(409, "Ограничения входа можно сбросить только для открытого экзамена")
     reset_entry_limits(exam.access_code)
@@ -3206,7 +3220,7 @@ async def reset_exam_entry_limits(
     "/exams/{exam_id}/delivery/cancel",
     summary="Отменить непройденное проведение экзамена",
 )
-async def cancel_exam_delivery(
+def cancel_exam_delivery(
     exam_id: str,
     req: CancelExamDeliveryRequest,
     db: Session = Depends(get_db),
@@ -3219,7 +3233,7 @@ async def cancel_exam_delivery(
     the teacher must clone the exam for a future paper delivery.  Neither path
     can run after a student session/attempt exists.
     """
-    await _get_exam_for_teacher_operator(db, exam_id, actor)
+    _get_exam_for_teacher_operator(db, exam_id, actor)
     exam = (
         db.query(GeneratedExam)
         .filter(GeneratedExam.id == exam_id, GeneratedExam.org_id == actor.org_id)
@@ -3277,18 +3291,18 @@ async def cancel_exam_delivery(
 
 
 @router.post("/exams/{exam_id}/start-live", summary="Синхронный старт экзамена из лобби")
-async def start_exam_live(
+def start_exam_live(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     if exam.delivery_mode == "print":
         raise HTTPException(409, "Печатный экзамен запускается кнопкой «Начать печатный экзамен».")
 
     if exam.status != "lobby":
         raise HTTPException(409, "Начать можно только экзамен, открытый в лобби")
-    await _require_lesson_in_progress(exam, actor)
+    _await(_require_lesson_in_progress(_exam_view(exam), actor))
     exam.status = "active"
     sessions = SessionRepository(db).list_by_exam(exam_id)
     started_count = 0
@@ -3322,12 +3336,12 @@ async def start_exam_live(
 
 
 @router.get("/exams/{exam_id}/lobby-status", summary="Статус лобби и список подключенных учеников")
-async def get_exam_lobby_status(
+def get_exam_lobby_status(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = await _get_exam_for_actor(db, exam_id, actor)
+    exam = _get_exam_for_actor(db, exam_id, actor)
     if exam.delivery_mode == "print":
         raise HTTPException(409, "У печатного экзамена нет лобби и ученических онлайн-сессий.")
 
@@ -3404,13 +3418,13 @@ async def get_exam_lobby_status(
 
 
 @router.delete("/exams/{exam_id}/sessions/{session_id}", summary="Удалить ученика из сессии / лобби")
-async def kick_student_session(
+def kick_student_session(
     exam_id: str,
     session_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     if exam.delivery_mode == "print":
         raise HTTPException(409, "В печатном экзамене нет лобби и электронных сессий учеников")
     session = SessionRepository(db).get_by_id(session_id)
@@ -3425,14 +3439,14 @@ async def kick_student_session(
 
 
 @router.delete("/exams/{exam_id}", summary="Удалить экзамен (в архив или навсегда)")
-async def delete_exam(
+def delete_exam(
     exam_id: str,
     permanent: bool = False,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
     repo = ExamRepository(db)
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     if exam.status in ("active", "lobby", "print_ready"):
         raise HTTPException(409, "Сначала завершите экзамен, затем его можно архивировать")
     if permanent or exam.status == "archived":
@@ -3452,13 +3466,13 @@ async def delete_exam(
 
 
 @router.post("/exams/{exam_id}/restore", summary="Восстановить экзамен из архива")
-async def restore_exam(
+def restore_exam(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
     repo = ExamRepository(db)
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     if not exam.group_id:
         exam.status = "variants_ready" if (exam.variants and len(exam.variants) > 0) else "draft"
     else:
@@ -3477,12 +3491,12 @@ async def restore_exam(
 
 @router.get("/exams/{exam_id}/draft", response_model=DraftExamResponse,
             summary="Черновик экзамена с задачами (учитель)")
-async def get_exam_draft(
+def get_exam_draft(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
 
     _invalidate_unbound_open_exam(db, exam)
     variants_out: List[DraftVariant] = []
@@ -3541,14 +3555,14 @@ async def get_exam_draft(
     "/exams/{exam_id}/print-layout",
     summary="Настроить типы ответов и место для решения в печатном бланке",
 )
-async def update_print_layout(
+def update_print_layout(
     exam_id: str,
     req: UpdatePrintLayoutRequest,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
     """Persist only editable print layout; source tasks are never modified."""
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     _require_print_delivery(exam)
     if exam.status not in {"draft", "variants_ready"}:
         raise HTTPException(409, "Настройка бланка доступна только до подготовки печатного комплекта")
@@ -3573,7 +3587,7 @@ async def update_print_layout(
     "/exams/{exam_id}/print-package/prepare",
     summary="Зафиксировать печатный комплект для конкретного занятия",
 )
-async def prepare_print_package(
+def prepare_print_package(
     exam_id: str,
     req: PreparePrintPackageRequest,
     db: Session = Depends(get_db),
@@ -3585,7 +3599,7 @@ async def prepare_print_package(
     data can choose a lesson and a previously validated layout, but it cannot
     alter the final task content, correct answers or package hash.
     """
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     _require_print_delivery(exam)
     if exam.status not in {"draft", "variants_ready"}:
         raise HTTPException(409, "Печатный комплект можно подготовить только из черновика")
@@ -3594,12 +3608,12 @@ async def prepare_print_package(
     if db.query(ExamPrintPackage.id).filter(ExamPrintPackage.exam_id == exam.id).first():
         raise HTTPException(409, "Печатный комплект уже был создан. Для нового занятия создайте копию экзамена")
 
-    canonical_group, _ = await _resolve_lesson_occurrence(
+    canonical_group, _ = _await(_resolve_lesson_occurrence(
         actor,
         group_id=req.group_id,
         lesson_id=req.lesson_id,
         lesson_date=req.lesson_date,
-    )
+    ))
     _ensure_lesson_slot_is_available(
         db,
         exam,
@@ -3627,7 +3641,7 @@ async def prepare_print_package(
     except PrintLayoutValidationError as exc:
         raise HTTPException(422, str(exc)) from exc
     db.commit()  # nothing is written yet; the figures are fetched over the network: no «idle in transaction» meanwhile
-    snapshot = await _embed_print_figures(snapshot)
+    snapshot = _await(_embed_print_figures(snapshot))
 
     exam.group_id = str(canonical_group["id"])
     exam.group_name = canonical_group.get("name")
@@ -3689,20 +3703,20 @@ async def prepare_print_package(
     "/exams/{exam_id}/print-package/start",
     summary="Начать подготовленный печатный экзамен",
 )
-async def start_print_exam(
+def start_print_exam(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
     """Start only during the bound lesson; printing itself never opens a lobby."""
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     _require_print_delivery(exam)
     if exam.status != "print_ready":
         raise HTTPException(409, "Начать можно только подготовленный печатный экзамен")
     package = _get_print_package_or_404(db, exam.id)
     if package.status != "ready":
         raise HTTPException(409, "Печатный комплект недоступен для проведения")
-    await _require_lesson_in_progress(exam, actor)
+    _await(_require_lesson_in_progress(_exam_view(exam), actor))
 
     exam.status = "active"
     settings = deepcopy(exam.settings or {})
@@ -3728,12 +3742,12 @@ async def start_print_exam(
 
 
 @router.get("/exams/{exam_id}/print-package", summary="Статус печатного комплекта")
-async def get_print_package(
+def get_print_package(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = await _get_exam_for_actor(db, exam_id, actor)
+    exam = _get_exam_for_actor(db, exam_id, actor)
     _require_print_delivery(exam)
     _get_print_package_or_404(db, exam.id)
     return {"exam_id": exam.id, "status": exam.status, "print_package": _print_package_metadata(db, exam.id)}
@@ -3756,7 +3770,7 @@ def _pdf_download_response(content: bytes, filename: str) -> Response:
     "/exams/{exam_id}/print-preview/{kind}/{variant_number}.pdf",
     summary="Предпросмотр печатного бланка до привязки к занятию",
 )
-async def preview_print_pdf(
+def preview_print_pdf(
     exam_id: str,
     kind: Literal["student", "teacher-key"],
     variant_number: int,
@@ -3770,14 +3784,16 @@ async def preview_print_pdf(
     responsible for this draft, because the teacher-key preview contains the
     correct answers.
     """
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     _require_print_delivery(exam)
     if exam.status not in {"draft", "variants_ready"}:
         raise HTTPException(409, "Предпросмотр доступен только до подготовки печатного комплекта")
     if _print_package_metadata(db, exam.id):
         raise HTTPException(409, "Печатный комплект уже зафиксирован. Скачайте его из карточки экзамена")
 
-    snapshot = await _build_print_preview_snapshot(exam, db)
+    snapshot = _build_print_preview_snapshot(exam)
+    db.commit()  # the figures are fetched over the network below: do not sit «idle in transaction» meanwhile
+    snapshot = _await(_embed_print_figures(snapshot))
     try:
         pdf = (
             render_student_exam_pdf(snapshot, variant_number)
@@ -3797,13 +3813,13 @@ async def preview_print_pdf(
 
 
 @router.get("/exams/{exam_id}/print-package/student/{variant_number}.pdf", summary="Скачать бланк для ученика")
-async def download_print_student_pdf(
+def download_print_student_pdf(
     exam_id: str,
     variant_number: int,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = await _get_exam_for_actor(db, exam_id, actor)
+    exam = _get_exam_for_actor(db, exam_id, actor)
     _require_print_delivery(exam)
     package = _get_print_package_or_404(db, exam.id)
     if package.status not in {"ready", "released", "completed"}:
@@ -3817,13 +3833,13 @@ async def download_print_student_pdf(
 
 
 @router.get("/exams/{exam_id}/print-package/teacher-key/{variant_number}.pdf", summary="Скачать ключ преподавателя")
-async def download_print_teacher_key_pdf(
+def download_print_teacher_key_pdf(
     exam_id: str,
     variant_number: int,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = await _get_exam_for_actor(db, exam_id, actor)
+    exam = _get_exam_for_actor(db, exam_id, actor)
     _require_print_delivery(exam)
     if actor.role != "teacher" and exam.status not in {"closed", "archived"}:
         raise HTTPException(403, "Ключ доступен администратору только после завершения экзамена")
@@ -3843,7 +3859,7 @@ async def download_print_teacher_key_pdf(
     response_model=AdminExamViewResponse,
     summary="Read-only профиль экзамена для администратора",
 )
-async def get_admin_exam_view(
+def get_admin_exam_view(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
@@ -3855,7 +3871,7 @@ async def get_admin_exam_view(
     live answer key is not returned before the run is closed.
     """
     _require_exam_admin_observer(actor)
-    exam = await _get_exam_for_actor(db, exam_id, actor)
+    exam = _get_exam_for_actor(db, exam_id, actor)
     _check_and_auto_close_exam(db, exam)
 
     answer_key_available = exam.status in {"closed", "archived"}
@@ -3904,14 +3920,14 @@ async def get_admin_exam_view(
 
 @router.get("/exams/{exam_id}/draft/alternatives",
             summary="Альтернативные задачи для замены (учитель)")
-async def get_task_alternatives(
+def get_task_alternatives(
     exam_id: str,
     variant_number: int = Query(1),
     task_id: str = Query(...),
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     variant = next(
         (v for v in (exam.variants or []) if v.get("variant_number") == variant_number),
         None,
@@ -3937,14 +3953,14 @@ async def get_task_alternatives(
 
 @router.post("/exams/{exam_id}/draft/replace-task",
              summary="Заменить задачу в черновике (учитель)")
-async def replace_task(
+def replace_task(
     exam_id: str,
     req: ReplaceTaskRequest,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
     import copy
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     if exam.status not in ("draft", "variants_ready"):
         raise HTTPException(400, "Замена задач возможна только в черновике")
 
@@ -4017,12 +4033,12 @@ async def replace_task(
 
 @router.get("/exams/{exam_id}", response_model=ExamSummaryResponse,
             summary="Информация об экзамене (учитель)")
-async def get_exam(
+def get_exam(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = await _get_exam_for_actor(db, exam_id, actor)
+    exam = _get_exam_for_actor(db, exam_id, actor)
 
     # Check and auto-close if exam duration expired
     _check_and_auto_close_exam(db, exam)
@@ -4063,6 +4079,11 @@ def _detached_exam_copy(exam: GeneratedExam, *, skip: tuple = ()) -> GeneratedEx
     return GeneratedExam(
         **{attr.key: getattr(exam, attr.key) for attr in sa_inspect(GeneratedExam).column_attrs if attr.key not in skip}
     )
+
+
+def _exam_view(exam: GeneratedExam) -> GeneratedExam:
+    """What a coroutine handed to ``_await`` may read: a copy, so it never triggers a lazy load on the event loop."""
+    return _detached_exam_copy(exam, skip=("variants",))
 
 
 def _entry_exam_lookup(db: Session, code: str) -> GeneratedExam:
@@ -4773,6 +4794,21 @@ def save_exam_progress(
     return {"ok": True, "answered_count": len(curr_answers)}
 
 
+def _stored_submit_result(session: ExamSession) -> SubmitExamResponse:
+    """The body of the submit that graded this attempt, rebuilt from what that submit stored."""
+    max_score = session.max_score or 0
+    score = session.score or 0
+    return SubmitExamResponse(
+        session_id=session.id,
+        score=score,
+        max_score=max_score,
+        answered_count=len(session.answers or {}),
+        correct_count=session.correct_count or 0,
+        total_tasks=session.total_tasks or 0,
+        percentage=round(score / max_score * 100, 1) if max_score else 0.0,
+    )
+
+
 @router.post("/exam-sessions/{session_id}/submit", response_model=SubmitExamResponse,
              summary="Сдать экзамен (студент)")
 def submit_exam(
@@ -4786,8 +4822,12 @@ def submit_exam(
         raise HTTPException(404, "Сессия не найдена")
     _require_session_capability(session, session_token)
     if session.status == "submitted":
-        # A retry that overtook (or followed) a submit that went through: the attempt is graded once, here.
-        raise HTTPException(400, "Экзамен уже сдан")
+        # A retry that overtook (or followed) a submit that went through - a double click, a response lost on the way,
+        # a timer that graded the attempt a moment before: the attempt was graded ONCE; answer with that result, the
+        # same body the first submit returned.  The late request's answers are not taken - the attempt is final.
+        result = _stored_submit_result(session)
+        db.commit()
+        return result
     exam = _exam_after_attempt_lock(db, session.exam_id)
     if not exam:
         raise HTTPException(404, "Экзамен не найден")
@@ -5074,7 +5114,7 @@ class StudentExamHistoryItem(BaseModel):
     response_model=List[StudentExamHistoryItem],
     summary="История завершённых экзаменов ученика",
 )
-async def list_student_exam_history(
+def list_student_exam_history(
     student_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
@@ -5085,7 +5125,7 @@ async def list_student_exam_history(
     Printed exams are intentionally absent until a future marking workflow
     stores per-student results in ``exam_sessions``.
     """
-    await require_student_history_access(actor, student_id)
+    _await(require_student_history_access(actor, student_id))
     rows = (
         db.query(ExamSession, GeneratedExam)
         .join(GeneratedExam, GeneratedExam.id == ExamSession.exam_id)
@@ -5118,12 +5158,12 @@ async def list_student_exam_history(
 
 @router.get("/exams/{exam_id}/sessions", response_model=List[SessionSummary],
             summary="Список сессий экзамена (учитель)")
-async def list_exam_sessions(
+def list_exam_sessions(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    await _get_exam_for_actor(db, exam_id, actor)
+    _get_exam_for_actor(db, exam_id, actor)
     sessions = (
         db.query(ExamSession)
         .filter(ExamSession.exam_id == exam_id)
@@ -5151,16 +5191,17 @@ async def list_exam_sessions(
 
 
 @router.post("/exams/{exam_id}/close", summary="Закрыть экзамен")
-async def close_exam(
+def close_exam(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    await _get_exam_for_teacher_operator(db, exam_id, actor)
+    _get_exam_for_teacher_operator(db, exam_id, actor)
     exam = (
         db.query(GeneratedExam)
         .filter(GeneratedExam.id == exam_id)
         .with_for_update()
+        .populate_existing()  # re-read under the lock: a timer finalize may have closed it a moment ago
         .first()
     )
     if not exam:
@@ -5175,13 +5216,13 @@ async def close_exam(
 
 @router.post("/exams/{exam_id}/generate-variants",
              summary="Запустить генерацию вариантов для экзамена")
-async def generate_variants(
+def generate_variants(
     exam_id: str,
     variants_count: int = Query(5, ge=2, le=30),
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     if exam.status not in ("draft", "variants_ready"):
         raise HTTPException(400, "Генерация вариантов возможна только для черновиков")
 
@@ -5226,12 +5267,12 @@ class ExamAnalyticsResponse(BaseModel):
 
 @router.get("/exams/{exam_id}/analytics", response_model=ExamAnalyticsResponse,
             summary="Аналитика экзамена (учитель)")
-async def get_exam_analytics(
+def get_exam_analytics(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = await _get_exam_for_actor(db, exam_id, actor)
+    exam = _get_exam_for_actor(db, exam_id, actor)
 
     sessions = (
         db.query(ExamSession)
@@ -5429,7 +5470,7 @@ class ExamReportResponse(BaseModel):
     response_model=ExamReportResponse,
     summary="Сгенерировать / обновить LLM-отчёт по экзамену (учитель)",
 )
-async def generate_exam_report_endpoint(
+def generate_exam_report_endpoint(
     exam_id: str,
     force: bool = Query(False, description="Перегенерировать даже если отчёт уже есть"),
     db: Session = Depends(get_db),
@@ -5442,7 +5483,7 @@ async def generate_exam_report_endpoint(
     """
     from src.domain.report_generator import generate_exam_report
 
-    exam = await _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
 
     sessions = (
         db.query(ExamSession).filter(ExamSession.exam_id == exam_id).all()
@@ -5476,7 +5517,7 @@ async def generate_exam_report_endpoint(
     response_model=ExamReportResponse,
     summary="Получить сохранённый LLM-отчёт по экзамену (учитель)",
 )
-async def get_exam_report_endpoint(
+def get_exam_report_endpoint(
     exam_id: str,
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
@@ -5485,7 +5526,7 @@ async def get_exam_report_endpoint(
     Возвращает ранее сгенерированный отчёт.
     Если отчёта ещё нет — 404, учитель должен сначала вызвать POST /exams/{id}/report.
     """
-    exam = await _get_exam_for_actor(db, exam_id, actor)
+    exam = _get_exam_for_actor(db, exam_id, actor)
 
     report = ExamReportRepository(db).get_by_exam(exam_id)
     if not report:

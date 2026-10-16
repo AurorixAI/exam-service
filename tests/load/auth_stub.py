@@ -38,6 +38,19 @@ async def verify_student(group_id: str, student_id: str = "", student_name: str 
     }
 
 
+@app.get("/api/v1/auth/me")
+async def me():
+    """The teacher of the load test (exam-service's staff dependency)."""
+    await _latency()
+    return {"id": "USR_LOAD", "org_role": "teacher", "default_org_id": "ORG_LOAD01"}
+
+
+@app.get("/api/v1/auth/org/groups/{group_id}")
+async def group(group_id: str):
+    await _latency()
+    return {"id": group_id, "name": "8А", "class_level": 8, "teacher_id": "USR_LOAD", "teacher_name": "Учитель"}
+
+
 @app.get("/api/v1/internal/org/{org_id}/groups/{group_id}/lessons/{lesson_id}/attendance")
 async def attendance(org_id: str, group_id: str, lesson_id: str, lesson_date: str = ""):
     await _latency()

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
+from fastapi.concurrency import run_in_threadpool
 
 import src.api.router as router
 from src.api.router import AssignExamRequest
@@ -29,7 +31,7 @@ def test_legacy_assignment_can_never_open_a_lobby_for_print_delivery(monkeypatch
         status="draft",
     )
 
-    async def get_print_exam(*_args, **_kwargs):
+    def get_print_exam(*_args, **_kwargs):
         return exam
 
     monkeypatch.setattr(router, "_get_exam_for_teacher_operator", get_print_exam)
@@ -42,7 +44,8 @@ def test_legacy_assignment_can_never_open_a_lobby_for_print_delivery(monkeypatch
 
     async def attempt_assignment() -> None:
         with pytest.raises(HTTPException) as error:
-            await router.assign_exam(
+            await run_in_threadpool(
+                router.assign_exam,
                 exam.id,
                 AssignExamRequest(group_id="any-group", publish=False),
                 MagicMock(),

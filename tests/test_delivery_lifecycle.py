@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+
 from datetime import date
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
+from fastapi.concurrency import run_in_threadpool
 
 import src.api.router as router
 from src.api.router import AssignExamRequest, CancelExamDeliveryRequest
@@ -63,7 +65,7 @@ def test_online_rebind_rotates_the_public_access_code(monkeypatch) -> None:
     db = MagicMock()
     actor = _actor()
 
-    async def get_exam(*_args, **_kwargs):
+    def get_exam(*_args, **_kwargs):
         return exam
 
     async def group_access(*_args, **_kwargs):
@@ -80,7 +82,9 @@ def test_online_rebind_rotates_the_public_access_code(monkeypatch) -> None:
     monkeypatch.setattr(router, "_generate_access_code", lambda: "NEW-CODE")
 
     async def move() -> None:
-        result = await router.assign_exam(
+        # the teacher routes are plain ``def``: FastAPI runs them in a worker thread, so the test does the same
+        result = await run_in_threadpool(
+            router.assign_exam,
             exam.id,
             AssignExamRequest(
                 group_id="group-1",
@@ -105,14 +109,15 @@ def test_cancelling_an_unstarted_online_delivery_revokes_public_access(monkeypat
     db = MagicMock()
     db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = exam
 
-    async def get_exam(*_args, **_kwargs):
+    def get_exam(*_args, **_kwargs):
         return exam
 
     monkeypatch.setattr(router, "_get_exam_for_teacher_operator", get_exam)
     monkeypatch.setattr(router, "_has_any_sessions", lambda *_args, **_kwargs: False)
 
     async def cancel() -> None:
-        result = await router.cancel_exam_delivery(
+        result = await run_in_threadpool(
+            router.cancel_exam_delivery,
             exam.id,
             CancelExamDeliveryRequest(reason="Урок отменён преподавателем"),
             db,

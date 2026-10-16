@@ -21,6 +21,7 @@ import ast
 import asyncio
 import inspect
 import time
+from pathlib import Path
 from datetime import datetime, timedelta
 
 import anyio.to_thread
@@ -41,16 +42,97 @@ AWAITS = (ast.Await, ast.AsyncWith, ast.AsyncFor)
 
 
 # ── 1 + 2: the shape of the code ───────────────────────────────────────────────────────────────────────────────
+SRC = Path(router_module.__file__).resolve().parents[1]
+
+# The ONLY async functions that may touch the sync SQLAlchemy session, each with the reason it is safe.  Anything else
+# that is ``async def`` and receives or uses a session fails the test below: make it a plain ``def`` (FastAPI runs it in
+# the thread pool; its few network calls go through ``_await``) or move the database work into ``run_in_threadpool``.
+ASYNC_SESSION_ALLOWLIST = {
+    "get_exam_by_code": "public entry: DB only inside run_in_threadpool phases; the lobby check awaits with no transaction",
+    "check_student_for_exam": "public entry: DB only inside run_in_threadpool phases; auth-service awaited with no transaction",
+    "start_exam": "public entry: DB only inside run_in_threadpool phases; auth-service awaited with no transaction",
+    "_check_student_admitted": "phase driver of check_student_for_exam: every db use is a run_in_threadpool argument",
+    "_start_exam_admitted": "phase driver of start_exam: every db use is a run_in_threadpool argument",
+}
+
+
+def _all_async_functions():
+    for path in sorted(SRC.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.AsyncFunctionDef):
+                yield path.relative_to(SRC).as_posix(), node
+
+
+def _touches_session(func: ast.AsyncFunctionDef) -> bool:
+    for arg in func.args.args + func.args.kwonlyargs:
+        annotation = ast.unparse(arg.annotation) if arg.annotation else ""
+        if arg.arg == "db" or "Session" in annotation:
+            return True
+    names = {n.id for n in ast.walk(func) if isinstance(n, ast.Name)}
+    return bool(names & {"db", "get_db", "SessionLocal", "db_session"})
+
+
 def test_an_async_function_has_something_to_await():
     """``async def`` + a blocking session + nothing to await is the defect itself: it must be a plain ``def``."""
     useless = [n.name for n in ASYNC_FUNCTIONS if not any(isinstance(x, AWAITS) for x in ast.walk(n))]
     assert useless == []
 
 
+def test_no_async_function_touches_the_sync_session_unless_allowlisted():
+    """The rule behind ROADMAP #95/#98: a blocking SQLAlchemy call on the event loop stops every request of the worker."""
+    offenders = [
+        f"{path}:{func.lineno} {func.name}"
+        for path, func in _all_async_functions()
+        if _touches_session(func) and func.name not in ASYNC_SESSION_ALLOWLIST
+    ]
+    assert offenders == [], (
+        "an async function must not use the sync session; make it a plain def, or allowlist it (with the reason) "
+        "in ASYNC_SESSION_ALLOWLIST if every database call in it runs through run_in_threadpool"
+    )
+
+
+def test_the_allowlist_has_no_stale_entries():
+    present = {func.name for _, func in _all_async_functions() if _touches_session(func)}
+    assert set(ASYNC_SESSION_ALLOWLIST) <= present
+
+
+def test_allowlisted_async_functions_use_the_session_only_inside_a_thread_hop():
+    """In an allowlisted function every ``db`` is an argument of run_in_threadpool (or of another allowlisted driver)."""
+    allowed_callees = {"run_in_threadpool"} | set(ASYNC_SESSION_ALLOWLIST)
+    bad = []
+    for path, func in _all_async_functions():
+        if func.name not in ASYNC_SESSION_ALLOWLIST:
+            continue
+        parents = {child: parent for parent in ast.walk(func) for child in ast.iter_child_nodes(parent)}
+        for node in ast.walk(func):
+            if isinstance(node, ast.Name) and node.id == "db":
+                parent = parents.get(node)
+                while parent is not None and not isinstance(parent, ast.Call):
+                    parent = parents.get(parent)
+                callee = getattr(getattr(parent, "func", None), "id", None)
+                if callee not in allowed_callees:
+                    bad.append(f"{func.name}:{node.lineno}")
+    assert bad == []
+
+
+def test_every_teacher_and_admin_route_is_a_threadpool_function():
+    """Routes are plain ``def`` except the allowlisted public-entry ones (which have their own phase tests below)."""
+    routed = []
+    for node in ROUTER_TREE.body:
+        if isinstance(node, ast.AsyncFunctionDef) and any(
+            isinstance(d, ast.Call) and getattr(d.func, "value", None) is not None and getattr(d.func.value, "id", "") == "router"
+            for d in node.decorator_list
+        ):
+            routed.append(node.name)
+    assert sorted(routed) == sorted(["get_exam_by_code", "check_student_for_exam", "start_exam"])
+
+
 @pytest.mark.parametrize(
-    "name", ["save_exam_progress", "submit_exam", "get_session_status", "get_results", "list_textbooks"]
+    "name",
+    ["save_exam_progress", "submit_exam", "get_session_status", "get_results", "list_textbooks", "close_exam",
+     "get_exam_lobby_status", "get_live_exam_dashboard_summary", "get_admin_exam_monitor", "assign_exam"],
 )
-def test_database_routes_without_network_calls_are_threadpool_functions(name):
+def test_database_routes_are_threadpool_functions(name):
     assert not inspect.iscoroutinefunction(getattr(router_module, name))
 
 
@@ -70,6 +152,28 @@ def test_no_async_function_takes_a_lock_and_then_awaits():
         events.sort()
         kinds = [kind for _, kind in events]
         if "lock" in kinds and "await" in kinds[kinds.index("lock"):]:
+            offenders.append(func.name)
+    assert offenders == []
+
+
+def test_nothing_that_locks_or_flushes_precedes_a_bridged_network_call():
+    """The plain-``def`` routes reach auth-service through ``_await``: no row lock and no write is taken before it."""
+    bridges = {"_await", "_get_exam_for_actor", "_get_exam_for_teacher_operator"}
+    writers = {"with_for_update", "flush"}
+    offenders = []
+    for func in [n for n in ast.walk(ROUTER_TREE) if isinstance(n, ast.FunctionDef)]:
+        calls = []
+        for node in ast.walk(func):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "id", getattr(node.func, "attr", ""))
+                if name in bridges:
+                    calls.append((node.lineno, "bridge"))
+                elif name in writers:
+                    calls.append((node.lineno, "write"))
+            elif isinstance(node, ast.Attribute) and node.attr in writers:
+                calls.append((node.lineno, "write"))
+        kinds = [kind for _, kind in sorted(calls)]
+        if "write" in kinds and "bridge" in kinds[kinds.index("write"):]:
             offenders.append(func.name)
     assert offenders == []
 
@@ -279,8 +383,8 @@ def test_a_timed_out_submit_graded_nothing_and_its_retry_grades_once(client, db,
     db.refresh(session)
     submitted_at, score = session.submitted_at, session.score
 
-    dup = client.post(url, json=body)  # a late duplicate of the retry
-    assert dup.status_code == 400 and dup.json()["detail"] == "Экзамен уже сдан"
+    dup = client.post(url, json=body)  # a late duplicate of the retry: the same answer, nothing graded twice
+    assert dup.status_code == 200 and dup.json() == ok.json()
     db.refresh(session)
     assert (session.submitted_at, session.score, session.answers) == (submitted_at, score, body["answers"])
 
@@ -297,9 +401,13 @@ def test_a_save_after_the_timer_ran_out_is_refused_and_keeps_what_was_saved(clie
     assert exam.status == "closed" and session.status == "submitted"
     assert session.answers == {"TASK_001": "3"}  # the late answer was not taken; the saved one was graded
     late_submit = client.post(f"{API}/exam-sessions/{session.id}/submit", json={"answers": {"TASK_002": "5"}})
-    assert late_submit.status_code == 400  # the finalizer already graded this attempt: «already submitted»
+    assert late_submit.status_code == 200  # the finalizer already graded this attempt: its stored result comes back
+    assert late_submit.json() == {
+        "session_id": session.id, "score": 10, "max_score": 20, "answered_count": 1, "correct_count": 1,
+        "total_tasks": 2, "percentage": 50.0,
+    }
     db.refresh(session)
-    assert session.answers == {"TASK_001": "3"}
+    assert session.answers == {"TASK_001": "3"}  # the late answer is not taken
 
 
 def test_a_submit_after_the_timer_ran_out_grades_what_was_saved_not_what_arrives_late(client, db):
@@ -313,12 +421,26 @@ def test_a_submit_after_the_timer_ran_out_grades_what_was_saved_not_what_arrives
     assert session.status == "submitted" and session.answers == {"TASK_001": "3"} and session.correct_count == 1
 
 
-def test_a_second_submit_of_a_graded_attempt_is_refused_before_the_exam_is_even_read(client, db, monkeypatch):
+def test_a_second_submit_of_a_graded_attempt_returns_the_first_result_without_reading_the_exam(client, db, monkeypatch):
     exam = _open_exam(db, "RETRY004")
     session = make_session_in_db(db, exam)
-    assert client.post(f"{API}/exam-sessions/{session.id}/submit", json={"answers": {"TASK_001": "3"}}).status_code == 200
+    first = client.post(f"{API}/exam-sessions/{session.id}/submit", json={"answers": {"TASK_001": "3"}})
+    assert first.status_code == 200
     monkeypatch.setattr(router_module, "_exam_after_attempt_lock", lambda *a, **k: pytest.fail("exam read"))
-    assert client.post(f"{API}/exam-sessions/{session.id}/submit", json={"answers": {}}).status_code == 400
+    again = client.post(f"{API}/exam-sessions/{session.id}/submit", json={"answers": {"TASK_001": "3"}})
+    assert again.status_code == 200 and again.json() == first.json()  # the same body, field for field
+    other = client.post(f"{API}/exam-sessions/{session.id}/submit", json={"answers": {"TASK_001": "9", "TASK_002": "5"}})
+    assert other.json() == first.json()  # answers that arrive after the grading change nothing
+    db.refresh(session)
+    assert session.answers == {"TASK_001": "3"}
+
+
+def test_a_second_submit_still_needs_the_attempts_capability(client, db):
+    exam = _open_exam(db, "RETRY006")
+    session = make_session_in_db(db, exam)
+    assert client.post(f"{API}/exam-sessions/{session.id}/submit", json={"answers": {}}).status_code == 200
+    stranger = client.post(f"{API}/exam-sessions/{session.id}/submit", json={"answers": {}}, headers={"X-Exam-Session-Token": "wrong"})
+    assert stranger.status_code == 403  # a duplicate is answered only to the owner of the attempt
 
 
 # ── engine safety nets and the thread pool ────────────────────────────────────────────────────────────────────

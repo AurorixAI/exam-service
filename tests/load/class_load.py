@@ -16,6 +16,9 @@ Exit code 1 on any failure, hang included.
 
 Scenarios:  --mode active|lobby   the exam is running when the class arrives / the class waits in the lobby first
             --expire-after S      the exam's timer runs out S seconds into the run: the finalizer races the saves
+            --teacher             a teacher polls lobby-status / live-summary / sessions the whole time
+            --close-after S       ... and presses «close» S seconds after the exam started, while students submit
+            --same-ip             the whole class behind ONE address (a school NAT)
 
 A pytest wrapper (``tests/test_class_load_pg.py``) runs it when EXAM_LOAD_PG_URL / EXAM_LOAD_REDIS_URL are set.
 """
@@ -68,7 +71,7 @@ class LoadReport:
     students: int
     mode: str
     workers: int
-    expiry: bool = False  # the exam's timer runs out during the run: finalize races the saves
+    expiry: bool = False  # the exam is closed under the students' hands (timer or teacher): finalize races the saves
     wall_seconds: float = 0.0
     hung: bool = False
     samples: list = field(default_factory=list)
@@ -236,6 +239,12 @@ def _drop_other_connections(pg_url: str) -> None:
     engine.dispose()
 
 
+def _flush_redis(redis_url: str) -> None:
+    import redis
+
+    redis.from_url(redis_url).flushdb()  # a throwaway Redis of the load test, never a shared one
+
+
 def _seed(pg_url: str, mode: str, expire_after: Optional[float] = None) -> None:
     engine = sa.create_engine(pg_url)
     today = datetime.now(ZoneInfo("Asia/Tashkent")).date().isoformat()
@@ -299,7 +308,7 @@ def _pg_activity(pg_url: str) -> list:
     return [f"{r.state} wait={r.wait_event_type} xact_age={r.xact_age}s {r.q}" for r in rows]
 
 
-def _final_state(pg_url: str, ledger: dict, expiry: bool) -> list:
+def _final_state(pg_url: str, ledger: dict, expiry: bool, expect_closed: bool = False) -> list:
     """Every attempt exists once, is submitted exactly once, and no acknowledged answer is missing."""
     engine = sa.create_engine(pg_url)
     problems: list = []
@@ -308,7 +317,10 @@ def _final_state(pg_url: str, ledger: dict, expiry: bool) -> list:
             sa.text("SELECT id, student_id, status, answers, submitted_at FROM exam_sessions WHERE exam_id = :e"),
             {"e": EXAM_ID},
         ).all()
+        exam_status = conn.execute(sa.text("SELECT status FROM generated_exams WHERE id = :e"), {"e": EXAM_ID}).scalar()
     engine.dispose()
+    if expect_closed and exam_status != "closed":
+        problems.append(f"db: the teacher closed the exam but it is {exam_status}")
     by_student = {r.student_id: r for r in rows}
     if len(rows) != len(by_student):
         problems.append("db: several attempts for one student")
@@ -341,6 +353,8 @@ class _Run:
         self.joined = 0
         self.ledger: dict = {}
         self.all_joined = asyncio.Event()
+        self.started = asyncio.Event()  # the exam is running (set at once unless the class waits in the lobby)
+        self.closed_sessions = None
         self.rng = random.Random(95)
 
     async def call(
@@ -362,7 +376,8 @@ class _Run:
     async def student(self, index: int, client: httpx.AsyncClient) -> None:
         cfg = self.cfg
         # the exam may run out under the student's hands in the expiry scenario: «finished» answers are then fine
-        late = (200, 410) if cfg.expire_after is not None else (200,)
+        closing = cfg.expire_after is not None or cfg.close_after is not None
+        late = (200, 410) if closing else (200,)
         student_id = str(uuid.uuid5(_NAMESPACE, f"student-{index}"))
         name = f"Ученик {index:03d}"
         entry = self.ledger[student_id] = {"session_id": None, "acked": {}, "submitted": None}
@@ -427,7 +442,7 @@ class _Run:
         answers["TASK_009"] = "3"
         body = {"answers": answers, "time_spent_seconds": 60}
         # a double click: the same submit twice at once.  Exactly one of them grades the attempt.
-        accept = (200, 400, 410) if cfg.expire_after is not None else (200, 400)
+        accept = (200, 410) if closing else (200,)
         first, second = await asyncio.gather(
             self.call(client, "submit", "POST", f"/exam-sessions/{session_id}/submit", json=body, headers=auth,
                       accept=accept),
@@ -435,15 +450,53 @@ class _Run:
                       accept=accept),
         )
         codes = sorted(str(getattr(x, "status_code", None)) for x in (first, second))
-        if cfg.expire_after is None and codes != ["200", "400"]:
-            self.student_errors.append(f"{name}: a double submit answered {codes}, not one 200 and one 400")
+        if not closing:
+            if codes != ["200", "200"] or first.json() != second.json():
+                self.student_errors.append(f"{name}: a double submit answered {codes} / different bodies, not twice the same 200")
+                return
+        elif "200" in codes and codes != ["200", "200"] and "410" not in codes:
+            self.student_errors.append(f"{name}: a double submit answered {codes}")
             return
-        if "200" in codes:
+        if codes == ["200", "200"] and first.json() != second.json():
+            self.student_errors.append(f"{name}: the two answers to a double submit differ")
+            return
+        winner = first if getattr(first, "status_code", None) == 200 else second
+        # a 200 is also the STORED result of an attempt the teacher's close / the timer had graded a moment earlier
+        # (it saved fewer answers than this submit carries: TASK_009 is never autosaved): only a submit that graded
+        # the attempt itself pins the answers in the database
+        if getattr(winner, "status_code", None) == 200 and winner.json()["answered_count"] == len(answers):
             entry["submitted"] = dict(answers)
         r = await self.call(client, "results", "GET", f"/exam-sessions/{session_id}/results", headers=auth)
         if r is None or r.status_code != 200:
             return
         self.finished += 1
+
+    async def teacher(self, client: httpx.AsyncClient, stop: asyncio.Event, started: asyncio.Event) -> None:
+        """A teacher watching the class: three panels polled all the time; «close» when asked, under the load."""
+        headers = {"Authorization": "Bearer teacher-load"}
+
+        async def poll(name: str, path: str, every: float) -> None:
+            while not stop.is_set():
+                await self.call(client, name, "GET", path, headers=headers)
+                await asyncio.sleep(every)
+
+        pollers = [
+            asyncio.create_task(poll("t-lobby-status", f"/exams/{EXAM_ID}/lobby-status", 0.25)),
+            asyncio.create_task(poll("t-live-summary", "/exams/live-summary", 0.5)),
+            asyncio.create_task(poll("t-sessions", f"/exams/{EXAM_ID}/sessions", 0.7)),
+        ]
+        try:
+            if self.cfg.close_after is not None:
+                await started.wait()
+                await asyncio.sleep(self.cfg.close_after)
+                r = await self.call(client, "t-close", "POST", f"/exams/{EXAM_ID}/close", headers=headers)
+                if r is not None and r.status_code == 200:
+                    self.closed_sessions = r.json().get("finalized_sessions")
+            await stop.wait()
+        finally:
+            for task in pollers:
+                task.cancel()
+            await asyncio.gather(*pollers, return_exceptions=True)
 
     async def lobby_flipper(self, pg_url: str) -> None:
         try:
@@ -452,6 +505,7 @@ class _Run:
             pass
         await asyncio.sleep(0.3)
         await asyncio.to_thread(_start_the_lesson, pg_url)
+        self.started.set()
 
 
 async def _prober(base: str, stop: asyncio.Event, health: list) -> None:
@@ -487,6 +541,7 @@ async def running_stack(
 ):
     """auth stub + exam-service (uvicorn, `workers` processes) + one seeded exam; everything is stopped on exit."""
     await asyncio.to_thread(_drop_other_connections, pg_url)  # a crashed earlier run must not leave its locks behind
+    await asyncio.to_thread(_flush_redis, redis_url)  # the entry counters of an earlier run (same code, same IP)
     stub_port, app_port = _free_port(), _free_port()
     logfile = tempfile.NamedTemporaryFile("w+", suffix=".log", prefix="exam-load-", delete=False)
     stub = app = None
@@ -551,19 +606,27 @@ async def run_load(
     ramp: float = 3.0,
     same_ip: bool = False,
     expire_after: Optional[float] = None,
+    teacher: bool = False,
+    close_after: Optional[float] = None,
     extra_env: Optional[dict] = None,
 ) -> LoadReport:
+    teacher = teacher or close_after is not None
     cfg = argparse.Namespace(
         students=students, progress_saves=progress_saves, reload_ratio=reload_ratio, ramp=ramp, same_ip=same_ip,
-        deadline=deadline, expire_after=expire_after,
+        deadline=deadline, expire_after=expire_after, close_after=close_after,
     )
-    report = LoadReport(students=students, mode=mode, workers=workers, expiry=expire_after is not None)
+    report = LoadReport(
+        students=students, mode=mode, workers=workers, expiry=expire_after is not None or close_after is not None
+    )
     async with running_stack(
         pg_url, redis_url, mode=mode, workers=workers, latency_ms=latency_ms, expire_after=expire_after,
         extra_env=extra_env,
     ) as stack:
         run = _Run(cfg)
+        if mode != "lobby":
+            run.started.set()
         stop_probe = asyncio.Event()
+        stop_teacher = asyncio.Event()
         probe = asyncio.create_task(_prober(stack.base, stop_probe, report.health))
         limits = httpx.Limits(max_connections=students * 3 + 10)
         started = time.monotonic()
@@ -572,6 +635,7 @@ async def run_load(
                 tasks = [asyncio.create_task(run.student(i, client)) for i in range(students)]
                 if mode == "lobby":
                     tasks.append(asyncio.create_task(run.lobby_flipper(pg_url)))
+                teacher_task = asyncio.create_task(run.teacher(client, stop_teacher, run.started)) if teacher else None
                 done, pending = await asyncio.wait(tasks, timeout=deadline)
                 if pending:
                     report.hung = True
@@ -581,6 +645,9 @@ async def run_load(
                 for task in done:
                     if task.exception():
                         report.student_errors.append(repr(task.exception()))
+                stop_teacher.set()
+                if teacher_task is not None:
+                    await asyncio.gather(teacher_task, return_exceptions=True)
             report.wall_seconds = time.monotonic() - started
             if report.hung:  # a few more probes while it is stuck, so the picture is complete
                 await asyncio.sleep(3)
@@ -592,7 +659,9 @@ async def run_load(
         report.student_errors += run.student_errors
         report.finished_students = run.finished
         if not report.hung:
-            report.db_problems = await asyncio.to_thread(_final_state, pg_url, run.ledger, report.expiry)
+            report.db_problems = await asyncio.to_thread(
+                _final_state, pg_url, run.ledger, report.expiry, close_after is not None
+            )
         report.server_log_tail = _log_tail(stack.logfile)
     return report
 
@@ -612,6 +681,8 @@ def main() -> int:
     parser.add_argument("--ramp", type=float, default=3.0, help="students arrive within this many seconds")
     parser.add_argument("--same-ip", action="store_true", help="every student behind one NAT address")
     parser.add_argument("--expire-after", type=float, default=None, help="the exam timer runs out this many seconds in")
+    parser.add_argument("--teacher", action="store_true", help="a teacher polls the monitoring panels all the time")
+    parser.add_argument("--close-after", type=float, default=None, help="the teacher closes the exam this many seconds after it started")
     parser.add_argument("--show-log", action="store_true", help="print the server log (without the per-request lines)")
     args = parser.parse_args()
     low, high = (int(x) for x in args.latency.split(","))
@@ -619,6 +690,7 @@ def main() -> int:
         args.students, args.pg, args.redis, mode=args.mode, workers=args.workers, latency_ms=(low, high),
         progress_saves=args.saves, reload_ratio=args.reload_ratio, request_timeout=args.timeout,
         deadline=args.deadline, ramp=args.ramp, same_ip=args.same_ip, expire_after=args.expire_after,
+        teacher=args.teacher, close_after=args.close_after,
     ))
     print(report.render())
     if args.show_log and not report.failures():

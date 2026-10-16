@@ -61,9 +61,12 @@ class Limit:
 
 
 # ── the policy (per exam code AND client address unless noted) ─────────────────────────────────────────────
-# All identity attempts (check-student + start).  A class of 40 does ~80 per minute, ~120 per hour with reloads.
-ATTEMPTS_PER_MINUTE = Limit(120, 60)
-ATTEMPTS_PER_HOUR = Limit(400, 3600)
+# All identity attempts (check-student + start): only a FLOOD brake.  A whole class sits behind ONE school NAT and joins
+# within a second or two: 60 students do 2 attempts each (+ page reloads) = ~130 in that minute, a 100-student lecture
+# hall ~250.  The cap is far above that (ROADMAP #95 follow-up: 120/min refused the last students of a class of 60);
+# the real brake against a walk over the ID space is the DISTINCT-failure budget below, not the volume.
+ATTEMPTS_PER_MINUTE = Limit(600, 60)
+ATTEMPTS_PER_HOUR = Limit(3000, 3600)
 # DISTINCT failed inputs.  A legitimate class has a handful (typos, retyped once); a walk has one per guess.
 FAILS_PER_MINUTE = Limit(30, 60)
 FAILS_PER_HOUR = Limit(150, 3600)

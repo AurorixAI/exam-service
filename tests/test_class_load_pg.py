@@ -50,6 +50,32 @@ def test_a_class_waiting_in_the_lobby_is_started_together():
     assert report.failures() == [] and report.finished_students == 60
 
 
+def test_a_class_of_60_behind_one_nat_joins_within_a_second_without_a_single_429():
+    """#33's volume cap must not turn the last students of a real class away (it was 120/min: 60 x check + start)."""
+    report = asyncio.run(load.run_load(
+        60, PG_URL, REDIS_URL, same_ip=True, ramp=1.0, progress_saves=4, reload_ratio=0.5, request_timeout=15,
+        deadline=90,
+    ))
+    print("\n" + report.render())
+    assert report.failures() == []
+    assert not any(sample.status == "429" for sample in report.samples)
+    assert report.finished_students == 60
+
+
+@pytest.mark.parametrize("mode,close_after", [("active", 2.0), ("lobby", 1.0)])
+def test_a_teacher_watching_the_class_and_closing_the_exam_while_60_students_submit(mode, close_after):
+    """The teacher panels (lobby-status, live-summary, sessions) polled the whole time, then «close» under load."""
+    report = asyncio.run(load.run_load(
+        60, PG_URL, REDIS_URL, mode=mode, teacher=True, close_after=close_after, progress_saves=8, reload_ratio=0.5,
+        request_timeout=15, deadline=90,
+    ))
+    print("\n" + report.render())
+    assert report.failures() == []  # teacher answers all 200, no acknowledged save lost, every attempt graded once
+    teacher = {name: row for name, row in report.by_endpoint().items() if name.startswith("t-")}
+    assert set(teacher) == {"t-close", "t-lobby-status", "t-live-summary", "t-sessions"}
+    assert all(row["max"] < 2.0 for row in teacher.values())  # no panel waits for the class
+
+
 def test_the_timer_running_out_under_the_students_hands_loses_no_acknowledged_answer():
     report = asyncio.run(load.run_load(
         60, PG_URL, REDIS_URL, progress_saves=8, reload_ratio=0.5, expire_after=3, request_timeout=15, deadline=90,
@@ -159,12 +185,13 @@ async def _lock_wait_scenario():
             second = await http.post(f"/exam-sessions/{sid_a}/progress", json={"answers": {"TASK_000": "0"}}, headers=auth_a)
             assert first.json() == second.json() == {"ok": True, "answered_count": 1}
 
-            # a submit that races its own retry is graded once
+            # a submit that races its own retry is graded once, and both are answered with that one result
             body = {"answers": {"TASK_000": "0", "TASK_009": "3"}, "time_spent_seconds": 30}
             one, two = await asyncio.gather(
                 http.post(f"/exam-sessions/{sid_a}/submit", json=body, headers=auth_a),
                 http.post(f"/exam-sessions/{sid_a}/submit", json=body, headers=auth_a),
             )
-            assert sorted([one.status_code, two.status_code]) == [200, 400]
+            assert one.status_code == two.status_code == 200 and one.json() == two.json()
+            assert one.json()["answered_count"] == 2 and one.json()["correct_count"] == 1
         blocker.close()
         engine.dispose()

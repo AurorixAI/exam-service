@@ -332,14 +332,27 @@ class TestSubmitExam:
         })
         assert resp.json()["correct_count"] == 1
 
-    def test_submit_twice_returns_400(self, client, db):
+    def test_submit_twice_returns_the_first_result(self, client, db):
+        """ROADMAP #95: a repeated submit (double click, lost response) is answered with the stored result, 200."""
+        tasks = [make_task("TASK_001", answer="42"), make_task("TASK_002", answer="7")]
+        exam = make_exam_in_db(db, tasks=tasks)
+        session = make_session_in_db(db, exam)
+        body = {"answers": {"TASK_001": "42", "TASK_002": "0"}, "time_spent_seconds": 30}
+
+        first = client.post(f"/api/v1/exam-sessions/{session.id}/submit", json=body)
+        second = client.post(f"/api/v1/exam-sessions/{session.id}/submit", json=body)
+        assert first.status_code == 200 and second.status_code == 200
+        assert second.json() == first.json()
+        assert first.json()["correct_count"] == 1 and first.json()["answered_count"] == 2
+
+    def test_submit_of_an_attempt_graded_elsewhere_returns_its_stored_result(self, client, db):
         exam = make_exam_in_db(db)
         session = make_session_in_db(db, exam, status="submitted")
 
         resp = client.post(f"/api/v1/exam-sessions/{session.id}/submit", json={
             "answers": {},
         })
-        assert resp.status_code == 400
+        assert resp.status_code == 200 and resp.json()["session_id"] == session.id
 
     def test_submit_requires_the_attempt_capability(self, client, db):
         """A session id alone must never be enough to submit for a student."""

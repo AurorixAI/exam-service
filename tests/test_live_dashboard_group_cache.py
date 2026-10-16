@@ -2,6 +2,8 @@
 import asyncio
 from unittest.mock import AsyncMock
 
+from fastapi.concurrency import run_in_threadpool
+
 from src.api import router
 from src.core import auth
 from tests.conftest import TEST_GROUP, TEST_GROUP_ID, make_actor, make_exam_in_db
@@ -29,7 +31,7 @@ def test_own_grouped_exams_do_not_trigger_per_exam_auth_call(db, monkeypatch):
     guard = AsyncMock(return_value=dict(TEST_GROUP))
     monkeypatch.setattr(auth, "require_group_access", guard)
 
-    result = asyncio.run(router.get_live_exam_dashboard_summary(db=db, actor=actor))
+    result = asyncio.run(run_in_threadpool(router.get_live_exam_dashboard_summary, db=db, actor=actor))
 
     assert len(result) == 3  # own exams still visible
     assert guard.await_count == 1  # one lookup for the group, not one per exam
@@ -48,7 +50,7 @@ def test_own_exam_still_hidden_when_group_access_is_lost(db, monkeypatch):
     guard = AsyncMock(side_effect=HTTPException(403, "Group has another teacher"))
     monkeypatch.setattr(auth, "require_group_access", guard)
 
-    result = asyncio.run(router.get_live_exam_dashboard_summary(db=db, actor=actor))
+    result = asyncio.run(run_in_threadpool(router.get_live_exam_dashboard_summary, db=db, actor=actor))
 
     assert result == []  # authorization semantics unchanged: author loses access
     assert guard.await_count == 1  # negative result cached per group too
