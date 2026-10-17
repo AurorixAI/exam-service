@@ -20,3 +20,6 @@ reportlab==4.2.5
 # fractions, roots and multi-level expressions the same professional shape as
 # their verified LaTeX source instead of flattening them to a/b text.
 matplotlib==3.9.2
+
+# Time zones: pure-Python IANA database for zoneinfo (Asia/Tashkent) when the OS image has none
+tzdata==2026.5

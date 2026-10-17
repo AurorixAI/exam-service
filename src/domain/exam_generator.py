@@ -15,7 +15,7 @@ import json
 import random
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 import uuid
 
@@ -139,6 +139,11 @@ class ExamConfig:
     total_points: int = 100
 
 
+def _utc_now() -> datetime:
+    """Creation stamp of a generated exam/variant: explicit UTC, never the container's local clock (ROADMAP #49)."""
+    return datetime.now(timezone.utc)
+
+
 @dataclass
 class ExamVariant:
     """Вариант теста"""
@@ -151,7 +156,7 @@ class ExamVariant:
     total_points: int
     time_minutes: int
 
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=_utc_now)
 
     # Метаданные
     seed: Optional[int] = None  # Для воспроизводимости
@@ -166,7 +171,7 @@ class GeneratedExam:
 
     variants: List[ExamVariant]
 
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=_utc_now)
     created_by: Optional[str] = None
 
     # Статистика

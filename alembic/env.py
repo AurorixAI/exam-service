@@ -10,6 +10,7 @@ from sqlalchemy import engine_from_config, pool
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.core.db_timezone import utc_connect_args  # noqa: E402  (migrations run in the same UTC session as the service)
 from src.models.exam_models import Base, ExamLifecycleEvent, GeneratedExam, ExamSession  # noqa: F401
 
 config = context.config
@@ -52,6 +53,7 @@ def run_migrations_online() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args=utc_connect_args(config.get_main_option("sqlalchemy.url")),
     )
     with connectable.connect() as connection:
         context.configure(

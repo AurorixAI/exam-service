@@ -45,6 +45,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import sqlalchemy as sa
+from src.core.db_timezone import utc_connect_args
 
 REPO = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -234,7 +235,7 @@ def _tasks() -> list:
 
 
 def _drop_other_connections(pg_url: str) -> None:
-    engine = sa.create_engine(pg_url, isolation_level="AUTOCOMMIT")
+    engine = sa.create_engine(pg_url, isolation_level="AUTOCOMMIT", connect_args=utc_connect_args(pg_url))
     with engine.connect() as conn:
         conn.execute(sa.text(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database()"
@@ -250,7 +251,7 @@ def _flush_redis(redis_url: str) -> None:
 
 
 def _seed(pg_url: str, mode: str, expire_after: Optional[float] = None) -> None:
-    engine = sa.create_engine(pg_url)
+    engine = sa.create_engine(pg_url, connect_args=utc_connect_args(pg_url))
     today = datetime.now(ZoneInfo("Asia/Tashkent")).date().isoformat()
     status = "lobby" if mode == "lobby" else "active"
     minutes = 45
@@ -287,7 +288,7 @@ def _seed(pg_url: str, mode: str, expire_after: Optional[float] = None) -> None:
 
 def _start_the_lesson(pg_url: str) -> None:
     """What the teacher's «start» does to the row: lobby -> active with the common start time."""
-    engine = sa.create_engine(pg_url)
+    engine = sa.create_engine(pg_url, connect_args=utc_connect_args(pg_url))
     started = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
     with engine.begin() as conn:
         conn.execute(
@@ -302,7 +303,7 @@ def _start_the_lesson(pg_url: str) -> None:
 
 def _pg_activity(pg_url: str) -> list:
     """Sessions that wait for a lock or sit idle in a transaction: the signature of the self-deadlock."""
-    engine = sa.create_engine(pg_url)
+    engine = sa.create_engine(pg_url, connect_args=utc_connect_args(pg_url))
     with engine.connect() as conn:
         rows = conn.execute(sa.text(
             "SELECT state, wait_event_type, COALESCE(EXTRACT(EPOCH FROM now() - xact_start), 0)::int AS xact_age,"
@@ -315,7 +316,7 @@ def _pg_activity(pg_url: str) -> list:
 
 def _final_state(pg_url: str, ledger: dict, expiry: bool, expect_closed: bool = False) -> list:
     """Every attempt exists once, is submitted exactly once, and no acknowledged answer is missing."""
-    engine = sa.create_engine(pg_url)
+    engine = sa.create_engine(pg_url, connect_args=utc_connect_args(pg_url))
     problems: list = []
     with engine.connect() as conn:
         rows = conn.execute(

@@ -23,6 +23,7 @@ from src.core.exceptions import ExamServiceError
 from src.core.middleware import RequestIDMiddleware, configure_logging
 from src.api.router import _check_and_auto_close_exam, router
 from src.core.database import SessionLocal, transient_db_failure
+from src.core.db_timezone import utc_connect_args, verify_database_timezone
 from src.models.exam_models import GeneratedExam
 
 settings = get_settings()
@@ -43,7 +44,9 @@ def _apply_migrations_safely() -> None:
     PostgreSQL advisory locks are scoped to the whole database, unlike an
     in-process mutex, so they also protect a rolling deployment.
     """
-    migration_engine = sqlalchemy.create_engine(settings.database_url, pool_pre_ping=True)
+    migration_engine = sqlalchemy.create_engine(
+        settings.database_url, pool_pre_ping=True, connect_args=utc_connect_args(settings.database_url)
+    )
     try:
         with migration_engine.connect() as connection:
             is_postgres = connection.dialect.name == "postgresql"
@@ -103,6 +106,11 @@ async def lifespan(app: FastAPI):
     if settings.app_env == "testing":
         yield
         return
+    # Every database session must run in UTC (ROADMAP #49).  Checked before the first migration: on any other zone the
+    # service raises here and does not start, instead of writing shifted timestamps.
+    from src.core.database import engine  # looked up at start so the check sees the live engine
+
+    verify_database_timezone(engine)
     try:
         _apply_migrations_safely()
     except RuntimeError as exc:

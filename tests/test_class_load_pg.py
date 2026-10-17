@@ -22,6 +22,7 @@ import pytest
 import sqlalchemy as sa
 
 from src.core.database import LOCK_BUSY_MESSAGE
+from src.core.db_timezone import utc_connect_args
 from tests.load import class_load as load
 
 PG_URL = os.getenv("EXAM_LOAD_PG_URL")
@@ -146,7 +147,7 @@ async def _lock_wait_scenario():
                 sessions.append((r.json()["session_id"], {"X-Exam-Session-Token": r.json()["session_token"]}))
             (sid_a, auth_a), (sid_b, auth_b) = sessions
 
-            engine = sa.create_engine(PG_URL)
+            engine = sa.create_engine(PG_URL, connect_args=utc_connect_args(PG_URL))
             blocker = engine.connect()
             blocker.execute(sa.text("SELECT id FROM exam_sessions WHERE id = :s FOR UPDATE"), {"s": sid_a})  # held open
 
@@ -246,7 +247,7 @@ async def _graded_students(http, count=3):
 
 
 def _reports_in_db():
-    engine = sa.create_engine(PG_URL)
+    engine = sa.create_engine(PG_URL, connect_args=utc_connect_args(PG_URL))
     with engine.connect() as conn:
         count = conn.execute(sa.text("SELECT count(*) FROM exam_reports WHERE exam_id = :e"), {"e": load.EXAM_ID}).scalar()
     engine.dispose()
@@ -284,7 +285,7 @@ async def _double_click_scenario():
         teacher = {"Authorization": "Bearer teacher-load"}
         async with httpx.AsyncClient(base_url=stack.base + API, timeout=60) as http:
             await _graded_students(http)
-            engine = sa.create_engine(PG_URL, isolation_level="AUTOCOMMIT")
+            engine = sa.create_engine(PG_URL, isolation_level="AUTOCOMMIT", connect_args=utc_connect_args(PG_URL))
             with engine.connect() as conn:  # widen the window between «no report yet» and the INSERT, to hit it every time
                 conn.execute(sa.text(
                     "CREATE OR REPLACE FUNCTION slow_report_insert() RETURNS trigger AS $$ BEGIN PERFORM pg_sleep(0.6);"

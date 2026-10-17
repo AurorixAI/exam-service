@@ -9,6 +9,7 @@ from sqlalchemy.exc import DBAPIError, OperationalError, TimeoutError as PoolTim
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.core.config import get_settings
+from src.core.db_timezone import utc_connect_args
 
 
 def _make_engine():
@@ -25,7 +26,10 @@ def _make_engine():
         max_overflow=s.db_max_overflow,
         pool_timeout=s.db_pool_timeout,
         pool_recycle=1800,
-        connect_args={
+        # ``utc_connect_args`` appends ``-c timezone=UTC`` to ``options``: the session time zone is pinned on every
+        # connection, so ``now()`` / aware values land in the naive columns as UTC whatever the server default is
+        # (ROADMAP #49).
+        connect_args=utc_connect_args(url, {
             "connect_timeout": 5,
             # Server-side safety nets, in force from the first statement of every connection (ROADMAP #95): a row-lock
             # wait, a statement and an idle open transaction can no longer last forever.
@@ -34,7 +38,7 @@ def _make_engine():
                 f" -c statement_timeout={int(s.db_statement_timeout_ms)}"
                 f" -c idle_in_transaction_session_timeout={int(s.db_idle_in_transaction_timeout_ms)}"
             ),
-        },
+        }),
     )
 
 
