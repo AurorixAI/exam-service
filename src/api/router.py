@@ -582,6 +582,23 @@ class LessonCancellationSyncRequest(LessonBindingRequest):
     reason: Optional[str] = Field(default=None, max_length=500)
 
 
+class LessonCompletionSyncRequest(LessonBindingRequest):
+    """Internal: auth-service asks about / reports the END of a lesson (LOGIC-B O8)."""
+
+    org_id: str = Field(..., min_length=1, max_length=36)
+    group_id: str = Field(..., min_length=1, max_length=36)
+    actor_id: Optional[str] = Field(default=None, max_length=100)
+
+
+class GroupBindingSyncRequest(BaseModel):
+    """Internal: auth-service archives a group (LOGIC-B O4); the exams of the group are looked at / released."""
+
+    org_id: str = Field(..., min_length=1, max_length=36)
+    group_id: str = Field(..., min_length=1, max_length=36)
+    actor_id: Optional[str] = Field(default=None, max_length=100)
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
 class RecurringLessonEndSyncRequest(BaseModel):
     """Internal request to stop one recurring schedule from a future date."""
 
@@ -1476,28 +1493,61 @@ async def _canonical_student_for_exam(
         f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/public/groups/"
         f"{exam.group_id}/verify-student"
     )
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(
-                url,
-                params=params,
-                headers={"X-Internal-Service-Token": get_settings().internal_service_token},
-            )
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            503,
-            "Не удалось проверить принадлежность к группе. Повторите попытку.",
-        ) from exc
 
-    if response.status_code != 200:
-        raise HTTPException(503, "Не удалось проверить принадлежность к группе")
-    data = response.json()
-    student = data.get("student")
-    if not data.get("enrolled") or not isinstance(student, dict) or not student.get("id"):
+    async def ask(extra: Optional[dict[str, str]] = None) -> dict:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(
+                    url,
+                    params={**params, **(extra or {})},
+                    headers={"X-Internal-Service-Token": get_settings().internal_service_token},
+                )
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                503,
+                "Не удалось проверить принадлежность к группе. Повторите попытку.",
+            ) from exc
+        if response.status_code != 200:
+            raise HTTPException(503, "Не удалось проверить принадлежность к группе")
+        return response.json()
+
+    def enrolled(data: dict) -> bool:
+        student = data.get("student")
+        return bool(data.get("enrolled")) and isinstance(student, dict) and bool(student.get("id"))
+
+    data = await ask()
+    if not enrolled(data):
+        # LOGIC-B O17: an exam that is RUNNING stays reachable for a student who was in the group when it began and was moved / archived
+        # afterwards - but only to RESUME the attempt he already has (the caller checks that: ``_resume_only``).  Nobody who was not
+        # enrolled at the common start of the exam gets in.
+        started_at = _exam_started_at_of_snapshot(exam)
+        if getattr(exam, "status", None) == "active" and started_at is not None:
+            retry = await ask({"as_of": started_at.isoformat()})
+            if enrolled(retry):
+                return {**retry["student"], "_resume_only": True}
         # One answer for every refusal (unknown ID, wrong name for an ID, a name shared by two students, an empty
         # group): the text of auth-service's reason tells an outsider whether an ID exists or a name is taken.
         raise HTTPException(403, STUDENT_NOT_FOUND_MESSAGE)
-    return student
+    return data["student"]
+
+
+def _exam_started_at_of_snapshot(exam: GeneratedExam) -> Optional[datetime]:
+    """``settings.started_at`` of a detached exam copy as naive UTC (no database access: the entry runs without a transaction)."""
+    raw = (getattr(exam, "settings", None) or {}).get("started_at")
+    if not raw:
+        return None
+    try:
+        return _to_naive_utc(datetime.fromisoformat(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _has_resumable_session(db: Session, exam_id: str, student: dict) -> bool:
+    """O17: the student has an attempt IN PROGRESS in this exam (the only thing a student who left the group may come back to)."""
+    sessions = SessionRepository(db).list_by_exam(exam_id)
+    found = _find_student_session(sessions, ("in_progress",), student.get("id"), student.get("display_id"))
+    db.commit()  # ends the read transaction
+    return found is not None
 
 
 def _require_session_capability(session: ExamSession, session_token: Optional[str]) -> None:
@@ -1804,6 +1854,201 @@ def release_lesson_exam_binding(
         released.append(exam.id)
     db.commit()
     return {"ok": True, "released_exam_ids": released}
+
+
+def _exam_remaining_seconds(db: Session, exam: GeneratedExam) -> Optional[int]:
+    """Seconds left on the common timer of an ACTIVE exam (UTC); ``None`` when it has not started."""
+    started_at = _exam_started_at(db, exam)
+    if exam.status != "active" or not started_at:
+        return None
+    total_seconds = (exam.total_time_minutes or 45) * 60
+    return max(0, total_seconds - max(0, int((datetime.utcnow() - started_at).total_seconds())))
+
+
+def _waiting_session_count(db: Session, exam_id: str) -> int:
+    return db.query(ExamSession.id).filter(ExamSession.exam_id == exam_id, ExamSession.status == "waiting").count()
+
+
+def _has_started_attempt(db: Session, exam_id: str) -> bool:
+    """An attempt that is not just a name in the lobby: it has (or may have) answers and is part of the history."""
+    return db.query(ExamSession.id).filter(ExamSession.exam_id == exam_id, ExamSession.status != "waiting").first() is not None
+
+
+def _release_untouched_exam(db: Session, exam: GeneratedExam, *, event_type: str, reason: str, actor_id: Optional[str], lesson_event: dict) -> None:
+    """Return a lobby / print-ready exam without started attempts to a reusable draft; the people waiting in its lobby are removed
+    (they have no answers)."""
+    db.query(ExamSession).filter(ExamSession.exam_id == exam.id, ExamSession.status == "waiting").delete(synchronize_session=False)
+    if exam.delivery_mode == "print":
+        package = db.query(ExamPrintPackage).filter(ExamPrintPackage.exam_id == exam.id).first()
+        if package:
+            package.status = "voided"
+    _reset_lobby_to_draft(
+        db,
+        exam,
+        actor_id=actor_id or "schedule-service",
+        lifecycle_event={"type": event_type, "reason": reason, **lesson_event},
+    )
+
+
+@router.post("/internal/lesson-bindings/completion-check", summary="Internal: экзамены урока перед его завершением")
+def check_lesson_completion(
+    req: LessonCompletionSyncRequest,
+    x_internal_service_token: Optional[str] = Header(None, alias="X-Internal-Service-Token"),
+    db: Session = Depends(get_db),
+):
+    """What is still live when the teacher ends the lesson: an exam that runs on its own timer, or one that has not started.
+
+    Read-only.  An exam whose time has already run out does not count (the first request after the deadline closes it).
+    """
+    _require_internal_service_token(x_internal_service_token)
+    exams = (
+        db.query(GeneratedExam)
+        .filter(
+            GeneratedExam.org_id == req.org_id,
+            GeneratedExam.group_id == req.group_id,
+            GeneratedExam.scheduled_lesson_id == req.lesson_id,
+            GeneratedExam.scheduled_lesson_date == req.lesson_date,
+            GeneratedExam.status.in_(["lobby", "print_ready", "active"]),
+        )
+        .order_by(GeneratedExam.created_at)
+        .all()
+    )
+    items = []
+    for exam in exams:
+        remaining = _exam_remaining_seconds(db, exam)
+        if exam.status == "active" and remaining is not None and remaining <= 0:
+            continue
+        started_at = _exam_started_at(db, exam) if exam.status == "active" else None
+        ends_at = (started_at + timedelta(minutes=exam.total_time_minutes or 45)).isoformat() if started_at else None
+        items.append(
+            {
+                "examId": exam.id,
+                "title": exam.title,
+                "status": exam.status,
+                "deliveryMode": exam.delivery_mode or "online",
+                "remainingSeconds": remaining,
+                "waitingCount": _waiting_session_count(db, exam.id),
+                "endsAt": ends_at,
+            }
+        )
+    db.commit()  # ends the read transaction
+    return {"ok": True, "exams": items}
+
+
+@router.post("/internal/lesson-bindings/completed", summary="Internal: урок завершён - освободить нетронутые экзамены")
+def lesson_completed(
+    req: LessonCompletionSyncRequest,
+    x_internal_service_token: Optional[str] = Header(None, alias="X-Internal-Service-Token"),
+    db: Session = Depends(get_db),
+):
+    """The lesson is over.  An ACTIVE exam is left alone: it runs by its own timer and closes itself.  A lobby / print-ready exam without
+    started attempts can never start now (starting needs a lesson in progress): it goes back to a draft (event ``lesson_completed``) and
+    its waiting sessions are deleted.  The exams are locked and re-read, so a student who entered the lobby a moment ago is judged on
+    the state at this very instant.  Idempotent."""
+    _require_internal_service_token(x_internal_service_token)
+    exams = (
+        db.query(GeneratedExam)
+        .filter(
+            GeneratedExam.org_id == req.org_id,
+            GeneratedExam.group_id == req.group_id,
+            GeneratedExam.scheduled_lesson_id == req.lesson_id,
+            GeneratedExam.scheduled_lesson_date == req.lesson_date,
+            GeneratedExam.status.in_(["lobby", "print_ready", "active"]),
+        )
+        .order_by(GeneratedExam.id)
+        .with_for_update()
+        .populate_existing()
+        .all()
+    )
+    released: list[str] = []
+    left_running: list[str] = []
+    for exam in exams:
+        if exam.status == "active":
+            remaining = _exam_remaining_seconds(db, exam)
+            if remaining is None or remaining > 0:
+                left_running.append(exam.id)
+            continue
+        if _has_started_attempt(db, exam.id):
+            left_running.append(exam.id)
+            continue
+        _release_untouched_exam(
+            db, exam, event_type="lesson_completed", reason="Урок завершён", actor_id=req.actor_id,
+            lesson_event={"group_id": req.group_id, "group_name": exam.group_name, "lesson_id": req.lesson_id, "lesson_date": req.lesson_date},
+        )
+        released.append(exam.id)
+    db.commit()
+    return {"ok": True, "released": released, "leftRunning": left_running}
+
+
+def _group_exams(db: Session, org_id: str, group_id: str, *, lock: bool = False) -> list[GeneratedExam]:
+    query = db.query(GeneratedExam).filter(
+        GeneratedExam.org_id == org_id,
+        GeneratedExam.group_id == group_id,
+        GeneratedExam.status.in_(["lobby", "print_ready", "active"]),
+    )
+    if lock:
+        query = query.order_by(GeneratedExam.id).with_for_update().populate_existing()
+    return query.all()
+
+
+def _archive_blocker_reason(db: Session, exam: GeneratedExam) -> Optional[str]:
+    if exam.status == "active":
+        return "Экзамен уже идёт"
+    if _has_started_attempt(db, exam.id):
+        return "У учеников уже есть попытки"
+    return None
+
+
+@router.post("/internal/group-bindings/archive-impact", summary="Internal: экзамены группы перед архивацией")
+def group_archive_impact(
+    req: GroupBindingSyncRequest,
+    x_internal_service_token: Optional[str] = Header(None, alias="X-Internal-Service-Token"),
+    db: Session = Depends(get_db),
+):
+    """Every operational exam of the group and whether it can be released (back to a draft)."""
+    _require_internal_service_token(x_internal_service_token)
+    items = []
+    for exam in sorted(_group_exams(db, req.org_id, req.group_id), key=lambda e: (e.scheduled_lesson_date or "", e.id)):
+        reason = _archive_blocker_reason(db, exam)
+        items.append(
+            {
+                "examId": exam.id,
+                "title": exam.title,
+                "status": exam.status,
+                "lessonDate": exam.scheduled_lesson_date,
+                "canRelease": reason is None,
+                "blockerReason": reason,
+            }
+        )
+    db.commit()  # ends the read transaction
+    return {"exams": items}
+
+
+@router.post("/internal/group-bindings/archive-release", summary="Internal: освободить экзамены архивируемой группы (всё или ничего)")
+def group_archive_release(
+    req: GroupBindingSyncRequest,
+    x_internal_service_token: Optional[str] = Header(None, alias="X-Internal-Service-Token"),
+    db: Session = Depends(get_db),
+):
+    """All or nothing: if any exam of the group is active or has started attempts (e.g. it started after the preview) the whole call is
+    refused (409) and nothing changes; otherwise every exam goes back to a draft and the group's lobby sessions are removed."""
+    _require_internal_service_token(x_internal_service_token)
+    exams = _group_exams(db, req.org_id, req.group_id, lock=True)
+    blocked = [exam for exam in exams if _archive_blocker_reason(db, exam)]
+    if blocked:
+        db.commit()  # nothing was changed: only ends the transaction and drops the row locks
+        names = ", ".join(f"«{exam.title}»" for exam in blocked[:2])
+        raise HTTPException(409, f"Нельзя архивировать группу: экзамен {names} уже идёт или имеет попытки учеников")
+    released: list[str] = []
+    for exam in exams:
+        _release_untouched_exam(
+            db, exam, event_type="group_archived", reason=req.reason or "Группа архивирована", actor_id=req.actor_id,
+            lesson_event={"group_id": req.group_id, "group_name": exam.group_name, "lesson_id": exam.scheduled_lesson_id,
+                          "lesson_date": exam.scheduled_lesson_date},
+        )
+        released.append(exam.id)
+    db.commit()
+    return {"ok": True, "releasedExamIds": released}
 
 
 @router.post(
@@ -4395,6 +4640,11 @@ async def _check_student_admitted(
                 message=str(exc.detail),
             )
         raise
+    if student.pop("_resume_only", False) and not await run_in_threadpool(_has_resumable_session, db, exam.id, student):
+        await run_in_threadpool(ticket.fail)
+        return CheckStudentExamResponse(
+            enrolled=False, group_required=True, group_name=exam.group_name, student=None, message=STUDENT_NOT_FOUND_MESSAGE
+        )
     await run_in_threadpool(ticket.matched, student.get("id"))
     return await run_in_threadpool(_check_student_outcome, db, exam, student)
 
@@ -4424,6 +4674,7 @@ def _admit_student_to_exam(
     exam_id: str,
     req: StartExamRequest,
     canonical_student: dict,
+    resume_only: bool = False,
 ) -> StartExamResponse:
     """The transactional core of ``start``: no network call, the whole thing runs in one thread.
 
@@ -4478,6 +4729,9 @@ def _admit_student_to_exam(
     existing_session = _find_active_session(
         all_sessions, canonical_student_id, canonical_display_id
     )
+    if resume_only and (existing_session is None or existing_session.status != "in_progress"):
+        # O17: a student who is no longer in the group may only resume the attempt he had; never open a new one
+        raise HTTPException(403, STUDENT_NOT_FOUND_MESSAGE)
 
     # Determine global exam start time
     exam_start_time = None
@@ -4658,10 +4912,14 @@ async def _start_exam_admitted(
         if exc.status_code == 403:
             await run_in_threadpool(ticket.fail)
         raise
+    resume_only = bool(canonical_student.pop("_resume_only", False))
+    if resume_only and not await run_in_threadpool(_has_resumable_session, db, exam.id, canonical_student):
+        await run_in_threadpool(ticket.fail)
+        raise HTTPException(403, STUDENT_NOT_FOUND_MESSAGE)
     await run_in_threadpool(ticket.matched, canonical_student.get("id"))
 
     # (3) database again, in a thread: one short transaction
-    return await run_in_threadpool(_admit_student_to_exam, db, exam.id, req, canonical_student)
+    return await run_in_threadpool(_admit_student_to_exam, db, exam.id, req, canonical_student, resume_only)
 
 
 @router.get("/exams/by-code/{code}/session-status/{session_id}",
