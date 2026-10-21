@@ -722,17 +722,26 @@ def _exam_access_decisions(db: Session, exams: list, actor: ExamActor) -> dict[s
             by_group.setdefault(group_id, []).append(exam.id)
     if by_group:
         outcomes = _await(_group_access_batch(actor, list(by_group)), db)
+        by_id = {exam.id: exam for exam in exams}
         for group_id, outcome in outcomes.items():
+            substitute_lessons = None
             if isinstance(outcome, HTTPException):
                 if outcome.status_code not in {403, 404}:
                     raise outcome
                 allowed = False
+                if outcome.status_code == 403 and actor.role == "teacher":
+                    # LOGIC-B2 (D-1): a substitute is refused on the group but may see the exam of the lesson he substitutes in
+                    substitute_lessons = _await(core_auth.substitute_lessons(actor, group_id), db)
             elif isinstance(outcome, BaseException):
                 raise outcome
             else:
                 allowed = True
             for exam_id in by_group[group_id]:
-                decisions[exam_id] = allowed
+                if not allowed and substitute_lessons:
+                    key = core_auth.exam_lesson_key(by_id.get(exam_id))
+                    decisions[exam_id] = bool(key and key in substitute_lessons)
+                else:
+                    decisions[exam_id] = allowed
     return decisions
 
 
@@ -1209,7 +1218,15 @@ async def _resolve_lesson_occurrence(
     if require_current_or_future and parsed_date < _business_today():
         raise HTTPException(409, LESSON_OVER_MESSAGE)
 
-    group = await require_group_access(actor, group_id)
+    try:
+        group = await require_group_access(actor, group_id)
+    except HTTPException as exc:
+        # LOGIC-B2 (D-1): the check "is the lesson of this exam in progress" (``require_current_or_future=False``, the start of a lesson exam) is open to the teacher who
+        # SUBSTITUTES in exactly this lesson; nothing else of the group is.
+        access = None if (require_current_or_future or exc.status_code != 403 or actor.role != "teacher") else await core_auth.lesson_access(actor, group_id)
+        if not access or (lesson_id, lesson_date) not in {(str(l.get("lessonId")), str(l.get("lessonDate"))) for l in access.get("lessons") or []}:
+            raise
+        group = access
     url = f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/schedule/occurrences"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:

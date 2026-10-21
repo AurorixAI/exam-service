@@ -310,8 +310,62 @@ def exam_access_group(exam: object, actor: ExamActor) -> Optional[str]:
     raise HTTPException(status.HTTP_403_FORBIDDEN, "Нет доступа к этому экзамену")
 
 
+def exam_lesson_key(exam: object) -> Optional[tuple]:
+    """``(lesson_id, lesson_date)`` the exam is bound to, or ``None`` for an exam that is not tied to one lesson."""
+    lesson_id = getattr(exam, "scheduled_lesson_id", None)
+    lesson_date = getattr(exam, "scheduled_lesson_date", None)
+    return (str(lesson_id), str(lesson_date)) if lesson_id and lesson_date else None
+
+
+async def lesson_access(actor: ExamActor, group_id: str) -> Optional[dict]:
+    """LOGIC-B2 (D-1): auth-service's ``lesson-access`` of ``group_id`` for the actor: the group (id, name, class_level, ...) and ONLY the lessons he SUBSTITUTES in
+    (``lessons: [{lessonId, lessonDate}]``).  A substitute has no access to the group page (no roster, no journal); what he may touch is the exam of the lesson he leads.
+    Anything but a clear 200 for a substitution of this centre is "no access" (fail closed)."""
+    try:
+        UUID(str(group_id))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    url = f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/groups/{group_id}/lesson-access"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(url, headers=dict(actor.auth_headers))
+    except httpx.HTTPError:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or str(data.get("org_id") or actor.org_id) != actor.org_id or not data.get("substitution"):
+        return None
+    return data
+
+
+async def substitute_lessons(actor: ExamActor, group_id: str) -> Optional[set]:
+    """``{(lesson_id, lesson_date)}`` of the group the actor substitutes in, or ``None`` (he does not)."""
+    data = await lesson_access(actor, group_id)
+    if data is None:
+        return None
+    return {(str(l.get("lessonId")), str(l.get("lessonDate"))) for l in data.get("lessons") or [] if l.get("lessonId") and l.get("lessonDate")}
+
+
+async def _substitutes_exam_lesson(actor: ExamActor, group_id: str, exam: object) -> bool:
+    """A teacher refused on the group may still work the exam that is bound to the lesson he substitutes in (read / run, nothing else of the group)."""
+    key = exam_lesson_key(exam)
+    if actor.role != "teacher" or key is None:
+        return False
+    lessons = await substitute_lessons(actor, group_id)
+    return bool(lessons) and key in lessons
+
+
 async def require_exam_access(exam: object, actor: ExamActor) -> None:
     """Enforce organisation and teacher ownership for one exam."""
     group_id = exam_access_group(exam, actor)
     if group_id:
-        await require_group_access(actor, group_id)
+        try:
+            await require_group_access(actor, group_id)
+        except HTTPException as exc:
+            if exc.status_code == 403 and await _substitutes_exam_lesson(actor, group_id, exam):
+                return
+            raise
