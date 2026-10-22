@@ -170,7 +170,7 @@ def stub_auth_service(monkeypatch):
         return dict(TEST_GROUP)
 
     async def fake_resolve_lesson_occurrence(
-        actor, *, group_id, lesson_id, lesson_date, require_current_or_future=True
+        actor, *, group_id, lesson_id, lesson_date, require_current_or_future=True, substitute_bound_lesson=None
     ):
         group = await fake_require_group_access(actor, group_id)
         return group, {

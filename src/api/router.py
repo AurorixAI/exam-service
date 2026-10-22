@@ -699,6 +699,18 @@ async def _group_access_batch(actor: ExamActor, group_ids: list[str]) -> dict:
     return dict(zip(group_ids, results))
 
 
+async def _substitute_lessons_batch(actor: ExamActor, group_ids: list[str]) -> dict:
+    """{group_id: {(lesson_id, lesson_date)} | None}: auth-service's lesson-access of several groups at once, a few at a time."""
+    gate = asyncio.Semaphore(8)
+
+    async def one(group_id: str):
+        async with gate:
+            return await core_auth.substitute_lessons(actor, group_id)
+
+    results = await asyncio.gather(*(one(group_id) for group_id in group_ids))
+    return dict(zip(group_ids, results))
+
+
 def _exam_access_decisions(db: Session, exams: list, actor: ExamActor) -> dict[str, bool]:
     """{exam id: may this actor see it} for a LIST of exams, with ONE concurrent round of group lookups.
 
@@ -723,33 +735,39 @@ def _exam_access_decisions(db: Session, exams: list, actor: ExamActor) -> dict[s
     if by_group:
         outcomes = _await(_group_access_batch(actor, list(by_group)), db)
         by_id = {exam.id: exam for exam in exams}
+        refused: dict[str, bool] = {}
         for group_id, outcome in outcomes.items():
-            substitute_lessons = None
             if isinstance(outcome, HTTPException):
                 if outcome.status_code not in {403, 404}:
                     raise outcome
-                allowed = False
-                if outcome.status_code == 403 and actor.role == "teacher":
-                    # LOGIC-B2 (D-1): a substitute is refused on the group but may see the exam of the lesson he substitutes in
-                    substitute_lessons = _await(core_auth.substitute_lessons(actor, group_id), db)
+                refused[group_id] = outcome.status_code == 403
             elif isinstance(outcome, BaseException):
                 raise outcome
-            else:
-                allowed = True
+        # LOGIC-B2 (D-1): a substitute is refused on the group but may see the exam of the lesson he substitutes in.  Ask auth-service only for the refused
+        # groups that hold at least one exam bound to a lesson, all at once (bounded), not one 5 s call after another.
+        to_check = [
+            group_id for group_id, forbidden in refused.items()
+            if forbidden and actor.role == "teacher" and any(core_auth.exam_lesson_key(by_id.get(exam_id)) for exam_id in by_group[group_id])
+        ]
+        substituted = _await(_substitute_lessons_batch(actor, to_check), db) if to_check else {}
+        for group_id in outcomes:
+            allowed = group_id not in refused
+            lessons = substituted.get(group_id)
             for exam_id in by_group[group_id]:
-                if not allowed and substitute_lessons:
+                if not allowed and lessons:
                     key = core_auth.exam_lesson_key(by_id.get(exam_id))
-                    decisions[exam_id] = bool(key and key in substitute_lessons)
+                    decisions[exam_id] = bool(key and key in lessons)
                 else:
                     decisions[exam_id] = allowed
     return decisions
 
 
-def _get_exam_for_actor(db: Session, exam_id: str, actor: ExamActor) -> GeneratedExam:
+def _get_exam_for_actor(db: Session, exam_id: str, actor: ExamActor, op: Optional[str] = None) -> GeneratedExam:
+    """``op`` names the operation for the substitute allow-list (``core.auth.SUBSTITUTE_EXAM_OPS``); a route that does not name one is closed to a substitute."""
     exam = ExamRepository(db).get_by_id(exam_id)
     if not exam:
         raise HTTPException(404, "Экзамен не найден")
-    _await(require_exam_access(_exam_view(exam), actor), db)
+    _await(require_exam_access(_exam_view(exam), actor, op), db)
     return exam
 
 
@@ -778,9 +796,10 @@ def _get_exam_for_teacher_operator(
     db: Session,
     exam_id: str,
     actor: ExamActor,
+    op: Optional[str] = None,
 ) -> GeneratedExam:
     _require_teacher_exam_operator(actor)
-    return _get_exam_for_actor(db, exam_id, actor)
+    return _get_exam_for_actor(db, exam_id, actor, op)
 
 
 _BUSINESS_TIMEZONE = ZoneInfo("Asia/Tashkent")
@@ -1204,8 +1223,12 @@ async def _resolve_lesson_occurrence(
     lesson_id: str,
     lesson_date: str,
     require_current_or_future: bool = True,
+    substitute_bound_lesson: Optional[tuple] = None,
 ) -> tuple[dict, dict]:
     """Return a canonical, accessible occurrence from auth-service.
+
+    ``substitute_bound_lesson`` = ``(lesson_id, lesson_date)`` the exam is ALREADY bound to: only then may the substitute of that very lesson open its lobby
+    (a future/current lesson); he can neither bind an exam to a lesson nor move it to another one.
 
     The browser may choose an item, but it cannot invent its group, date or
     schedule id.  A transferred lesson keeps the same id/date pair, so this
@@ -1223,7 +1246,8 @@ async def _resolve_lesson_occurrence(
     except HTTPException as exc:
         # LOGIC-B2 (D-1): the check "is the lesson of this exam in progress" (``require_current_or_future=False``, the start of a lesson exam) is open to the teacher who
         # SUBSTITUTES in exactly this lesson; nothing else of the group is.
-        access = None if (require_current_or_future or exc.status_code != 403 or actor.role != "teacher") else await core_auth.lesson_access(actor, group_id)
+        own_lesson = substitute_bound_lesson is not None and tuple(map(str, substitute_bound_lesson)) == (str(lesson_id), str(lesson_date))
+        access = None if ((require_current_or_future and not own_lesson) or exc.status_code != 403 or actor.role != "teacher") else await core_auth.lesson_access(actor, group_id)
         if not access or (lesson_id, lesson_date) not in {(str(l.get("lessonId")), str(l.get("lessonDate"))) for l in access.get("lessons") or []}:
             raise
         group = access
@@ -3430,7 +3454,7 @@ def open_exam_lobby(
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor, "open-lobby")
     if exam.delivery_mode == "print":
         raise HTTPException(409, "Печатный экзамен не использует лобби. Подготовьте печатный комплект.")
 
@@ -3453,6 +3477,7 @@ def open_exam_lobby(
         group_id=str(exam.group_id),
         lesson_id=req.lesson_id,
         lesson_date=req.lesson_date,
+        substitute_bound_lesson=(previous_lesson_id, previous_lesson_date) if previous_lesson_id and previous_lesson_date else None,
     ), db)
     _ensure_lesson_slot_is_available(
         db,
@@ -3556,7 +3581,7 @@ def cancel_exam_delivery(
     the teacher must clone the exam for a future paper delivery.  Neither path
     can run after a student session/attempt exists.
     """
-    _get_exam_for_teacher_operator(db, exam_id, actor)
+    _get_exam_for_teacher_operator(db, exam_id, actor, "cancel-delivery")
     exam = (
         db.query(GeneratedExam)
         .filter(GeneratedExam.id == exam_id, GeneratedExam.org_id == actor.org_id)
@@ -3620,7 +3645,7 @@ def start_exam_live(
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor, "start-live")
     if exam.delivery_mode == "print":
         raise HTTPException(409, "Печатный экзамен запускается кнопкой «Начать печатный экзамен».")
 
@@ -3665,7 +3690,7 @@ def get_exam_lobby_status(
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = _get_exam_for_actor(db, exam_id, actor)
+    exam = _get_exam_for_actor(db, exam_id, actor, "lobby-status")
     if exam.delivery_mode == "print":
         raise HTTPException(409, "У печатного экзамена нет лобби и ученических онлайн-сессий.")
 
@@ -3748,7 +3773,7 @@ def kick_student_session(
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor, "kick")
     if exam.delivery_mode == "print":
         raise HTTPException(409, "В печатном экзамене нет лобби и электронных сессий учеников")
     session = SessionRepository(db).get_by_id(session_id)
@@ -4364,7 +4389,7 @@ def get_exam(
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam = _get_exam_for_actor(db, exam_id, actor)
+    exam = _get_exam_for_actor(db, exam_id, actor, "get")
 
     # Check and auto-close if exam duration expired
     _check_and_auto_close_exam(db, exam)
@@ -5502,7 +5527,7 @@ def list_exam_sessions(
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    _get_exam_for_actor(db, exam_id, actor)
+    _get_exam_for_actor(db, exam_id, actor, "sessions")
     sessions = (
         db.query(ExamSession)
         .filter(ExamSession.exam_id == exam_id)
@@ -5535,7 +5560,7 @@ def close_exam(
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    _get_exam_for_teacher_operator(db, exam_id, actor)
+    _get_exam_for_teacher_operator(db, exam_id, actor, "close")
     exam = (
         db.query(GeneratedExam)
         .filter(GeneratedExam.id == exam_id)
@@ -5865,7 +5890,7 @@ def get_exam_report_endpoint(
     Возвращает ранее сгенерированный отчёт.
     Если отчёта ещё нет — 404, учитель должен сначала вызвать POST /exams/{id}/report.
     """
-    exam = _get_exam_for_actor(db, exam_id, actor)
+    exam = _get_exam_for_actor(db, exam_id, actor, "report")
 
     report = ExamReportRepository(db).get_by_exam(exam_id)
     if not report:

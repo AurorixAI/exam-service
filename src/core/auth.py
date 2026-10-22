@@ -350,6 +350,36 @@ async def substitute_lessons(actor: ExamActor, group_id: str) -> Optional[set]:
     return {(str(l.get("lessonId")), str(l.get("lessonDate"))) for l in data.get("lessons") or [] if l.get("lessonId") and l.get("lessonDate")}
 
 
+# LOGIC-B2 (D-1, lead's ruling 21.10): a substitute RUNS the exam of the lesson he substitutes in and nothing else.  Capability list, per route: every route
+# that reaches an exam through ``require_exam_access`` names its operation; a substitute passes only the operations below, any other (or unnamed) one is 403.
+SUBSTITUTE_EXAM_OPS = frozenset({
+    "get",             # GET  /exams/{id}                 read the exam
+    "open-lobby",      # POST /exams/{id}/open-lobby      (only for the lesson the exam is already bound to)
+    "lobby-status",    # GET  /exams/{id}/lobby-status
+    "start-live",      # POST /exams/{id}/start-live
+    "close",           # POST /exams/{id}/close
+    "sessions",        # GET  /exams/{id}/sessions        list of the attempts
+    "kick",            # DELETE /exams/{id}/sessions/{sid}
+    "cancel-delivery", # POST /exams/{id}/delivery/cancel
+    "report",          # GET  /exams/{id}/report          the SAVED results report, read-only (generating one, analytics, keys, PDFs are not his)
+})
+
+
+@dataclass(frozen=True)
+class ExamAccess:
+    """The decision of ``require_exam_access``: ``kind`` is ``"full"`` (org admin / the group's teacher / the author) or ``"substitute"``
+    (granted only by auth-service's lesson-access for the lesson this exam is bound to)."""
+
+    kind: str = "full"
+
+    @property
+    def is_substitute(self) -> bool:
+        return self.kind == "substitute"
+
+    def allows(self, op: Optional[str]) -> bool:
+        return not self.is_substitute or op in SUBSTITUTE_EXAM_OPS
+
+
 async def _substitutes_exam_lesson(actor: ExamActor, group_id: str, exam: object) -> bool:
     """A teacher refused on the group may still work the exam that is bound to the lesson he substitutes in (read / run, nothing else of the group)."""
     key = exam_lesson_key(exam)
@@ -359,13 +389,21 @@ async def _substitutes_exam_lesson(actor: ExamActor, group_id: str, exam: object
     return bool(lessons) and key in lessons
 
 
-async def require_exam_access(exam: object, actor: ExamActor) -> None:
-    """Enforce organisation and teacher ownership for one exam."""
+async def require_exam_access(exam: object, actor: ExamActor, op: Optional[str] = None) -> ExamAccess:
+    """Enforce organisation and teacher ownership for one exam; return the access decision.
+
+    ``op`` names the operation (see ``SUBSTITUTE_EXAM_OPS``).  A substitute is refused (403) on every operation that is not in the allow-list,
+    including an unnamed one (default deny); the group's teacher and the managers are not affected by ``op``.
+    """
     group_id = exam_access_group(exam, actor)
     if group_id:
         try:
             await require_group_access(actor, group_id)
         except HTTPException as exc:
             if exc.status_code == 403 and await _substitutes_exam_lesson(actor, group_id, exam):
-                return
+                access = ExamAccess("substitute")
+                if not access.allows(op):
+                    raise HTTPException(status.HTTP_403_FORBIDDEN, "Заменяющий преподаватель может только проводить экзамен своего урока") from exc
+                return access
             raise
+    return ExamAccess("full")

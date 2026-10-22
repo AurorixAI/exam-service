@@ -36,10 +36,10 @@ def test_the_substitute_opens_the_exam_of_his_lesson_only(monkeypatch):
     _refuse(monkeypatch)
     monkeypatch.setattr(core_auth, "lesson_access", AsyncMock(return_value=dict(ACCESS)))
     teacher = make_actor("teacher")
-    asyncio.run(core_auth.require_exam_access(_exam("E1"), teacher))
+    asyncio.run(core_auth.require_exam_access(_exam("E1"), teacher, "get"))
     for other in (_exam("E2", lesson="lesson-l2", date="2026-10-28"), _exam("E3", date="2026-11-02"), _exam("E4", lesson=None, date=None)):
         with pytest.raises(HTTPException) as caught:
-            asyncio.run(core_auth.require_exam_access(other, teacher))
+            asyncio.run(core_auth.require_exam_access(other, teacher, "get"))
         assert caught.value.status_code == 403
 
 
