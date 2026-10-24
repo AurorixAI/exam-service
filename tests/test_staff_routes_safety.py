@@ -180,7 +180,10 @@ class _Statements:
         self.calls = []  # (thread ident, first words of the statement)
 
     def __call__(self, conn, cursor, statement, parameters, context, executemany):
-        self.calls.append((threading.get_ident(), statement.split("\n")[0][:60]))
+        first = statement.split("\n")[0][:60]
+        if first.startswith(("SAVEPOINT", "RELEASE SAVEPOINT", "ROLLBACK TO SAVEPOINT", "BEGIN")):
+            return  # transaction control of the test fixture (savepoint mode), not a query
+        self.calls.append((threading.get_ident(), first))
 
 
 @pytest.fixture

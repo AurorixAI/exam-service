@@ -878,10 +878,10 @@ def _lock_exam_for_transition(
     """
     locked = _lock_exam_row(db, exam)
     if locked.status not in allowed_statuses:
-        db.commit()  # let go of the lock at once
+        db.rollback()  # nothing changed: rollback releases the row lock
         raise HTTPException(409, refusal)
     if no_sessions_refusal and _has_any_sessions(db, locked.id):
-        db.commit()
+        db.rollback()
         raise HTTPException(409, no_sessions_refusal)
     return locked
 
@@ -3959,18 +3959,18 @@ def delete_exam(
     exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     exam = _lock_exam_row(db, exam)
     if exam.status in ("active", "lobby", "print_ready"):
-        db.commit()  # nothing changed: release the row lock
+        db.rollback()  # nothing changed: rollback releases the row lock
         raise HTTPException(409, "Сначала завершите экзамен, затем его можно архивировать")
     if permanent:
         if _exam_has_results(db, exam.id):
-            db.commit()  # nothing changed: release the row lock
+            db.rollback()  # nothing changed: rollback releases the row lock
             raise CodedHTTPException(
                 409,
                 "EXAM_HAS_RESULTS",
                 "У экзамена есть результаты учеников — его можно только отправить в архив",
             )
         if exam.status != "archived":
-            db.commit()  # nothing changed: release the row lock
+            db.rollback()  # nothing changed: rollback releases the row lock
             raise CodedHTTPException(
                 409,
                 "EXAM_NOT_ARCHIVED",
@@ -3989,7 +3989,7 @@ def delete_exam(
         repo.delete(exam)  # the trace row and the removal are ONE commit
         return {"ok": True, "action": "deleted_permanently", "id": exam_id}
     if exam.status == "archived":
-        db.commit()  # nothing changed: release the row lock
+        db.rollback()  # nothing changed: rollback releases the row lock
         return {"ok": True, "action": "archived", "id": exam_id, "already_archived": True}
     exam.status = "archived"
     exam.is_pinned = False
@@ -4017,7 +4017,7 @@ def restore_exam(
     exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     exam = _lock_exam_row(db, exam)
     if exam.status != "archived":
-        db.commit()  # nothing changed: release the row lock
+        db.rollback()  # nothing changed: rollback releases the row lock
         raise CodedHTTPException(409, "EXAM_NOT_ARCHIVED", "Восстановить можно только экзамен из архива")
     held = False
     if exam.delivery_mode == "print":
@@ -4202,7 +4202,7 @@ def prepare_print_package(
         no_sessions_refusal="Экзамен уже имеет попытки. Для нового проведения создайте копию",
     )
     if db.query(ExamPrintPackage.id).filter(ExamPrintPackage.exam_id == exam.id).first():
-        db.commit()
+        db.rollback()
         raise HTTPException(409, "Печатный комплект уже был создан. Для нового занятия создайте копию экзамена")
     exam.group_id = str(canonical_group["id"])
     exam.group_name = canonical_group.get("name")
@@ -4281,7 +4281,7 @@ def start_print_exam(
     exam = _lock_exam_for_transition(db, exam, {"print_ready"}, "Печатный экзамен уже начат или больше не готов к началу")
     package = _get_print_package_or_404(db, exam.id)
     if package.status != "ready":
-        db.commit()
+        db.rollback()
         raise HTTPException(409, "Печатный комплект недоступен для проведения")
 
     exam.status = "active"

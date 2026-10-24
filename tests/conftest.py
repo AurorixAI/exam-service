@@ -55,9 +55,17 @@ engine = create_engine(
 # Enable foreign keys in SQLite
 @event.listens_for(engine, "connect")
 def set_sqlite_pragma(dbapi_conn, connection_record):
+    # pysqlite starts transactions lazily and would swallow SAVEPOINTs; take transaction control away from the driver
+    # (SQLAlchemy documents this recipe) so savepoints and rollbacks behave as on PostgreSQL.
+    dbapi_conn.isolation_level = None
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
+
+
+@event.listens_for(engine, "begin")
+def _emit_begin(conn):
+    conn.exec_driver_sql("BEGIN")
 
 
 TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -86,7 +94,10 @@ def db():
     """Fresh DB session per test, rolled back after."""
     connection = engine.connect()
     transaction = connection.begin()
-    session = TestSessionLocal(bind=connection)
+    # ``create_savepoint``: a ``commit()`` of the code under test releases a SAVEPOINT (data stays visible, the outer
+    # transaction is rolled back after the test) and a ``rollback()`` undoes only what was not committed - as on a
+    # real database - instead of wiping the whole test transaction.
+    session = TestSessionLocal(bind=connection, join_transaction_mode="create_savepoint")
     try:
         yield session
     finally:
