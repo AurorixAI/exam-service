@@ -623,3 +623,183 @@ def test_ex56_publishing_gives_a_code_that_is_not_in_use(client, db, monkeypatch
     resp = client.post(f"{API}/exams/{mine.id}/open-lobby", json=body)
     assert resp.status_code == 200 and resp.json()["access_code"] == "EXFRESH02"
 
+
+
+# ═══ fix round after R3 ═══════════════════════════════════════════════════════════════════════════════════════
+def test_round_refusals_roll_back_so_the_row_lock_is_released(client, db, monkeypatch):
+    """A refusal changed nothing: it ends the transaction with a ROLLBACK (which also drops the row lock)."""
+    ended = []
+    real_rollback, real_commit = db.rollback, db.commit
+    monkeypatch.setattr(db, "rollback", lambda: (ended.append("rollback"), real_rollback())[1])
+    monkeypatch.setattr(db, "commit", lambda: (ended.append("commit"), real_commit())[1])
+
+    results = _exam(db, "archived", exam_id="EXAM_R1")
+    _session(db, results, "submitted")
+    running = _exam(db, "variants_ready", exam_id="EXAM_R2")
+    twice = _exam(db, "archived", exam_id="EXAM_R3")
+    last = []  # how each request ended its transaction (earlier entries are the bridge ending its read transaction)
+    assert client.delete(f"{API}/exams/{results.id}?permanent=true").status_code == 409
+    last.append(ended[-1])
+    assert client.post(f"{API}/exams/{running.id}/restore").status_code == 409
+    last.append(ended[-1])
+    assert client.delete(f"{API}/exams/{twice.id}").json()["already_archived"] is True
+    last.append(ended[-1])
+    assert last == ["rollback"] * 3
+
+
+def _bound(exam):
+    return {"lesson_id": "LSN_TEST01", "lesson_date": exam.scheduled_lesson_date}
+
+
+def test_round_prepare_refuses_a_draft_that_changed_while_the_snapshot_was_built(client, db, monkeypatch):
+    exam = _exam(db, "variants_ready", delivery="print")
+    body = {"group_id": TEST_GROUP_ID, **_bound(exam)}
+
+    async def replaced_meanwhile(snapshot):  # a concurrent replace_task commits while the figures are fetched
+        variants = [{"variant_number": 1, "tasks": [make_task("T1", answer="3"), make_task("T9", answer="1")]}]
+        db.query(GeneratedExam).filter(GeneratedExam.id == exam.id).update({"variants": variants})
+        db.commit()
+        return snapshot
+
+    monkeypatch.setattr(router_module, "_embed_print_figures", replaced_meanwhile)
+    resp = client.post(f"{API}/exams/{exam.id}/print-package/prepare", json=body)
+    assert resp.status_code == 409 and resp.json()["detail"] == "Черновик изменился, повторите"
+    assert db.query(ExamPrintPackage).count() == 0
+    assert _fresh(db, exam.id).status == "variants_ready"
+
+
+def test_round_assign_repeats_the_lobby_rule_on_the_locked_row(client, db, monkeypatch):
+    exam = _exam(db, "variants_ready")
+    real = router_module.require_group_access
+
+    async def lobby_meanwhile(actor, group_id):  # a twin request opened the lobby while this one asked auth-service
+        db.query(GeneratedExam).filter(GeneratedExam.id == exam.id).update({"status": "lobby", "access_code": "TWIN0001"})
+        db.commit()
+        return await real(actor, group_id)
+
+    monkeypatch.setattr(router_module, "require_group_access", lobby_meanwhile)
+    resp = client.post(f"{API}/exams/{exam.id}/assign", json={"group_id": TEST_GROUP_ID, "publish": False})
+    assert resp.status_code == 409 and "подтвердите перенос" in resp.json()["detail"]
+    assert _fresh(db, exam.id).access_code == "TWIN0001"  # the twin's lobby was not torn down by the unpublished assign
+
+
+def test_round_open_lobby_refuses_when_the_group_changed_during_the_lookup(client, db, monkeypatch):
+    exam = _exam(db, "variants_ready")
+    real = router_module._resolve_lesson_occurrence
+
+    async def moved_meanwhile(actor, **kwargs):
+        db.query(GeneratedExam).filter(GeneratedExam.id == exam.id).update({"group_id": "99999999-2222-3333-4444-555555555555"})
+        db.commit()
+        return await real(actor, **kwargs)
+
+    monkeypatch.setattr(router_module, "_resolve_lesson_occurrence", moved_meanwhile)
+    resp = client.post(f"{API}/exams/{exam.id}/open-lobby", json=_bound(exam))
+    assert resp.status_code == 409 and "Группа экзамена изменилась" in resp.json()["detail"]
+    assert _fresh(db, exam.id).status == "variants_ready"
+
+
+class _Report:
+    total_variants, tasks_templatized, tasks_fallback = 2, 1, 1
+
+    class _Variant:
+        def to_dict(self):
+            return {"variant_number": 1, "tasks": []}
+
+    variants = [_Variant(), _Variant()]
+
+
+@pytest.mark.parametrize("change", [{"status": "closed"}, {"variants": [{"variant_number": 1, "tasks": [{"task_id": "OTHER"}]}]}])
+def test_round_generate_variants_writes_nothing_when_the_exam_changed_meanwhile(client, db, monkeypatch, change):
+    exam = _exam(db, "variants_ready")
+
+    class Orchestrator:
+        def __init__(self, db):
+            pass
+
+        def generate_variants(self, tasks, count, seed):
+            db.query(GeneratedExam).filter(GeneratedExam.id == exam.id).update(change)
+            db.commit()
+            return _Report()
+
+    monkeypatch.setattr(router_module, "VariantOrchestrator", Orchestrator)
+    before = _fresh(db, exam.id).variants_count
+    resp = client.post(f"{API}/exams/{exam.id}/generate-variants?variants_count=2")
+    assert resp.status_code in (400, 409), resp.text
+    stored = _fresh(db, exam.id)
+    assert stored.variants_count == before and stored.status == change.get("status", "variants_ready")
+
+
+def test_round_print_start_reads_the_package_state_after_the_lock(client, db, monkeypatch):
+    exam = _exam(db, "print_ready", delivery="print")
+    _package(db, exam, "ready")
+
+    async def package_voided_meanwhile(exam_view, actor):  # bypasses the session: its identity map still says «ready»
+        db.execute(ExamPrintPackage.__table__.update().values(status="voided"))
+        db.commit()
+
+    monkeypatch.setattr(router_module, "_require_lesson_in_progress", package_voided_meanwhile)
+    resp = client.post(f"{API}/exams/{exam.id}/print-package/start")
+    assert resp.status_code == 409
+    assert _fresh(db, exam.id).status == "print_ready"
+
+
+def test_round_the_coded_error_handler_keeps_the_exception_headers():
+    import asyncio
+
+    exc = router_module.CodedHTTPException(409, "X_CODE", "text", headers={"Retry-After": "3"})
+    response = asyncio.run(main_module.app.exception_handlers[router_module.CodedHTTPException](None, exc))
+    assert response.status_code == 409 and response.headers["retry-after"] == "3"
+    assert response.body == '{"detail":"text","code":"X_CODE"}'.encode()
+
+
+# sweeper backoff
+@pytest.fixture
+def broken_sweep(real_sessions, monkeypatch):
+    main_module._sweep_failures.clear()
+    now = {"t": 1000.0}
+    monkeypatch.setattr(main_module, "_sweep_clock", lambda: now["t"])
+    calls = []
+    real = main_module._check_and_auto_close_exam
+
+    def counting(db, exam):
+        calls.append(exam.id)
+        return real(db, exam)
+
+    monkeypatch.setattr(main_module, "_check_and_auto_close_exam", counting)
+    _expired(real_sessions, "EXAM_WA1_POISON", delivery="print")
+    yield now, calls
+    main_module._sweep_failures.clear()
+
+
+def test_round_a_failing_exam_logs_its_stack_once_and_is_retried_with_backoff(broken_sweep, caplog):
+    now, calls = broken_sweep
+    with caplog.at_level(logging.WARNING):
+        main_module._close_expired_exams_once()
+        stacks = [r for r in caplog.records if r.exc_info]
+        assert len(stacks) == 1 and "EXAM_WA1_POISON" in stacks[0].getMessage()
+
+        now["t"] += 10  # backing off: not even tried
+        main_module._close_expired_exams_once()
+        assert calls == ["EXAM_WA1_POISON"]
+
+        now["t"] += 25  # past the first back-off (30 s): tried again, no new stack, no new line yet
+        main_module._close_expired_exams_once()
+        assert len(calls) == 2 and len([r for r in caplog.records if r.exc_info]) == 1 and len(caplog.records) == 1
+
+        now["t"] += 700  # past the report interval: ONE line, no stack
+        main_module._close_expired_exams_once()
+        lines = [r for r in caplog.records if not r.exc_info]
+        assert len(calls) == 3 and len(lines) == 1 and "still cannot be auto-closed" in lines[0].getMessage()
+        assert len([r for r in caplog.records if r.exc_info]) == 1
+
+
+def test_round_a_recovered_exam_leaves_the_failure_table(broken_sweep, real_sessions):
+    now, calls = broken_sweep
+    main_module._close_expired_exams_once()
+    assert "EXAM_WA1_POISON" in main_module._sweep_failures
+    with real_sessions() as db:  # the teacher closes it by hand
+        db.query(GeneratedExam).filter(GeneratedExam.id == "EXAM_WA1_POISON").update({"status": "closed"})
+        db.commit()
+    now["t"] += 1
+    main_module._close_expired_exams_once()
+    assert main_module._sweep_failures == {}

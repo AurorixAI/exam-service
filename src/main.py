@@ -7,6 +7,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -69,6 +70,33 @@ def _apply_migrations_safely() -> None:
         migration_engine.dispose()
 
 
+# A «poisoned» exam (a print exam without its package, ...) fails on EVERY sweep.  Per exam: how many times in a row,
+# when it may be tried again (exponential, 30 s ... 10 min) and when it was last reported.  The first failure logs the
+# full stack once; later ones at most a one-line warning every 10 minutes.
+_SWEEP_BACKOFF_START_S = 30.0
+_SWEEP_BACKOFF_MAX_S = 600.0
+_SWEEP_REPORT_EVERY_S = 600.0
+_sweep_failures: dict[str, dict] = {}
+
+
+def _sweep_clock() -> float:
+    return time.monotonic()
+
+
+def _note_sweep_failure(exam_id: str) -> None:
+    now = _sweep_clock()
+    state = _sweep_failures.get(exam_id)
+    if state is None:
+        log.exception("Unable to auto-close exam %s; the sweep continues with the others", exam_id)
+        _sweep_failures[exam_id] = {"count": 1, "retry_at": now + _SWEEP_BACKOFF_START_S, "reported_at": now}
+        return
+    state["count"] += 1
+    state["retry_at"] = now + min(_SWEEP_BACKOFF_START_S * 2 ** (state["count"] - 1), _SWEEP_BACKOFF_MAX_S)
+    if now - state["reported_at"] >= _SWEEP_REPORT_EVERY_S:
+        state["reported_at"] = now
+        log.warning("Exam %s still cannot be auto-closed (%d failed sweeps in a row)", exam_id, state["count"])
+
+
 def _close_expired_exams_once() -> None:
     """Run the blocking database sweep in a short-lived, isolated session."""
     db = SessionLocal()
@@ -81,14 +109,20 @@ def _close_expired_exams_once() -> None:
         # The ids are read first: after a failed exam's rollback every loaded row is expired, and one «poisoned» exam
         # (e.g. a print exam without its package) must neither stop the others from closing nor undo them.
         exam_ids = [exam.id for exam in active_exams]
+        for gone in set(_sweep_failures) - set(exam_ids):
+            _sweep_failures.pop(gone, None)  # closed meanwhile (by hand), cancelled or deleted
         for exam_id in exam_ids:
+            state = _sweep_failures.get(exam_id)
+            if state is not None and _sweep_clock() < state["retry_at"]:
+                continue  # backing off
             try:
                 exam = db.get(GeneratedExam, exam_id)
                 if exam is not None:
                     _check_and_auto_close_exam(db, exam)
+                _sweep_failures.pop(exam_id, None)
             except Exception:
                 db.rollback()
-                log.exception("Unable to auto-close exam %s; the sweep continues with the others", exam_id)
+                _note_sweep_failure(exam_id)
     except Exception:
         db.rollback()
         log.exception("Unable to sweep expired exams")
@@ -159,7 +193,9 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(CodedHTTPException)
     async def coded_http_error_handler(req: Request, exc: CodedHTTPException):
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail, "code": exc.code})
+        return JSONResponse(
+            status_code=exc.status_code, content={"detail": exc.detail, "code": exc.code}, headers=getattr(exc, "headers", None)
+        )
 
     @app.exception_handler(ExamServiceError)
     async def exam_error_handler(req: Request, exc: ExamServiceError):

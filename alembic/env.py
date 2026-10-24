@@ -11,7 +11,9 @@ from sqlalchemy import engine_from_config, pool
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.core.db_timezone import utc_connect_args  # noqa: E402  (migrations run in the same UTC session as the service)
-from src.models.exam_models import Base, ExamLifecycleEvent, GeneratedExam, ExamSession  # noqa: F401
+from src.models.exam_models import (  # noqa: F401
+    Base, ExamDeletion, ExamLifecycleEvent, ExamPrintPackage, ExamReport, GeneratedExam, ExamSession,
+)
 
 config = context.config
 
@@ -26,7 +28,9 @@ if db_url:
 target_metadata = Base.metadata
 
 # Only manage exam service owned tables — never touch shared/monolith tables
-_MANAGED = {"generated_exams", "exam_sessions", "exam_lifecycle_events"}
+_MANAGED = {
+    "generated_exams", "exam_sessions", "exam_lifecycle_events", "exam_deletions", "exam_print_packages", "exam_reports",
+}
 
 
 def include_object(obj, name, type_, reflected, compare_to):

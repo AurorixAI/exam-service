@@ -886,6 +886,17 @@ def _lock_exam_for_transition(
     return locked
 
 
+def _print_inputs(exam: GeneratedExam) -> dict[str, Any]:
+    """Everything a print snapshot is built from: if it differs after the lock, the snapshot is of a draft that no longer exists."""
+    return deepcopy({
+        "variants": exam.variants or [],
+        "print_layout": (exam.settings or {}).get("print_layout"),
+        "title": exam.title,
+        "subject": exam.subject,
+        "total_time_minutes": exam.total_time_minutes,
+    })
+
+
 def _require_print_delivery(exam: GeneratedExam) -> None:
     if exam.delivery_mode != "print":
         raise HTTPException(409, "Эта операция доступна только для экзамена в формате «Печать»")
@@ -1497,8 +1508,8 @@ class CodedHTTPException(HTTPException):
     ``detail`` stays a plain string, so every existing client keeps showing the server's text.
     """
 
-    def __init__(self, status_code: int, code: str, message: str) -> None:
-        super().__init__(status_code, message)
+    def __init__(self, status_code: int, code: str, message: str, headers: Optional[dict[str, str]] = None) -> None:
+        super().__init__(status_code, message, headers=headers)
         self.code = code
 
 
@@ -3352,6 +3363,9 @@ def assign_exam(
         "Назначить или перенести можно только экзамен до его запуска",
         no_sessions_refusal="Экзамен уже имеет попытки. Создайте копию (клон), чтобы провести для другой группы.",
     )
+    if exam.status == "lobby" and not req.publish:  # the same rule as above, on the locked row
+        db.rollback()
+        raise HTTPException(409, "Для экзамена в лобби выберите новое занятие и подтвердите перенос")
     previous_status = exam.status
     previous_group_id = exam.group_id
     previous_lesson_id = exam.scheduled_lesson_id
@@ -3589,9 +3603,10 @@ def open_exam_lobby(
     previous_group_id = exam.group_id
     previous_lesson_id = exam.scheduled_lesson_id
     previous_lesson_date = exam.scheduled_lesson_date
+    resolved_group_id = str(exam.group_id)
     group, _ = _await(_resolve_lesson_occurrence(
         actor,
-        group_id=str(exam.group_id),
+        group_id=resolved_group_id,
         lesson_id=req.lesson_id,
         lesson_date=req.lesson_date,
         substitute_bound_lesson=(previous_lesson_id, previous_lesson_date) if previous_lesson_id and previous_lesson_date else None,
@@ -3610,6 +3625,9 @@ def open_exam_lobby(
         "Открыть лобби можно только до начала экзамена",
         no_sessions_refusal="В лобби уже есть участники. Для другого занятия создайте копию экзамена",
     )
+    if str(exam.group_id) != resolved_group_id:  # the group the lesson was resolved for is not the locked row's group any more
+        db.rollback()
+        raise HTTPException(409, "Группа экзамена изменилась, повторите")
     previous_status = exam.status
     previous_group_id = exam.group_id
     previous_lesson_id = exam.scheduled_lesson_id
@@ -4173,6 +4191,7 @@ def prepare_print_package(
         lesson_id=req.lesson_id,
         lesson_date=req.lesson_date,
     )
+    built_from = _print_inputs(exam)
     try:
         layout = validate_print_layout(
             exam.variants or [],
@@ -4204,6 +4223,9 @@ def prepare_print_package(
     if db.query(ExamPrintPackage.id).filter(ExamPrintPackage.exam_id == exam.id).first():
         db.rollback()
         raise HTTPException(409, "Печатный комплект уже был создан. Для нового занятия создайте копию экзамена")
+    if _print_inputs(exam) != built_from:  # the locked, refreshed row: a task was replaced while the figures were fetched
+        db.rollback()
+        raise HTTPException(409, "Черновик изменился, повторите")
     exam.group_id = str(canonical_group["id"])
     exam.group_name = canonical_group.get("name")
     exam.class_level = canonical_group.get("class_level")
@@ -4279,7 +4301,10 @@ def start_print_exam(
         raise HTTPException(409, "Печатный комплект недоступен для проведения")
     _await(_require_lesson_in_progress(_exam_view(exam), actor), db)
     exam = _lock_exam_for_transition(db, exam, {"print_ready"}, "Печатный экзамен уже начат или больше не готов к началу")
-    package = _get_print_package_or_404(db, exam.id)
+    package = db.query(ExamPrintPackage).filter(ExamPrintPackage.exam_id == exam.id).populate_existing().first()
+    if package is None:
+        db.rollback()
+        raise HTTPException(404, "Печатный комплект для этого экзамена ещё не подготовлен")
     if package.status != "ready":
         db.rollback()
         raise HTTPException(409, "Печатный комплект недоступен для проведения")
@@ -5840,21 +5865,31 @@ def generate_variants(
     try:
         orch = VariantOrchestrator(db=db)
         report = orch.generate_variants(tasks_raw, variants_count, seed=42)
-        ExamRepository(db).update_variants(
-            exam,
-            [v.to_dict() for v in report.variants],
-            report.total_variants,
-        )
-        return {
-            "exam_id": exam_id,
-            "status": "variants_ready",
-            "variants_count": report.total_variants,
-            "templatized_tasks": report.tasks_templatized,
-            "original_tasks": report.tasks_fallback,
-        }
+        new_variants = [v.to_dict() for v in report.variants]
     except Exception as exc:
         log.error("Variant generation failed for %s: %s", exam_id, exc)
         raise HTTPException(500, f"Ошибка генерации вариантов: {exc}")
+
+    # The variants are written under the exam's row lock, on the state they were generated from: a twin request, or a
+    # replaced task, while the generator ran must not be silently overwritten.
+    exam = _lock_exam_for_transition(
+        db, exam, {"draft", "variants_ready"}, "Генерация вариантов возможна только для черновиков"
+    )
+    if (exam.variants or [{}])[0].get("tasks", []) != tasks_raw:
+        db.rollback()
+        raise HTTPException(409, "Черновик изменился, повторите")
+    try:
+        ExamRepository(db).update_variants(exam, new_variants, report.total_variants)
+    except Exception as exc:
+        log.error("Variant generation failed for %s: %s", exam_id, exc)
+        raise HTTPException(500, f"Ошибка генерации вариантов: {exc}")
+    return {
+        "exam_id": exam_id,
+        "status": "variants_ready",
+        "variants_count": report.total_variants,
+        "templatized_tasks": report.tasks_templatized,
+        "original_tasks": report.tasks_fallback,
+    }
 
 
 class ExamAnalyticsResponse(BaseModel):
