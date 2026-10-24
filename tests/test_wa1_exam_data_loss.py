@@ -602,26 +602,38 @@ def test_ex56_an_exam_id_that_keeps_colliding_gives_up_after_a_bounded_number_of
     db.rollback()
 
 
+def _feed_codes(monkeypatch, codes):
+    """Make _generate_access_code (secrets.choice, one character at a time) produce the codes of ``codes`` in turn."""
+    pending = []
+
+    def choice(chars):
+        if not pending:
+            pending.extend(next(codes)[2:])
+        return pending.pop(0)
+
+    monkeypatch.setattr(router_module.secrets, "choice", choice)
+
+
 def test_ex56_a_taken_access_code_is_never_handed_out_again(db, monkeypatch):
     holder = _exam(db, "lobby")
-    holder.access_code = "EXTAKEN01"
+    holder.access_code = "EXTAKEN001"
     db.commit()
-    codes = iter(["EXTAKEN01", "EXTAKEN01", "EXFRESH02"])
-    monkeypatch.setattr(router_module.random, "choices", lambda chars, k: list(next(codes)[2:]))
-    assert router_module._generate_access_code(db) == "EXFRESH02"
+    codes = iter(["EXTAKEN001", "EXTAKEN001", "EXFRESH002"])
+    _feed_codes(monkeypatch, codes)
+    assert router_module._generate_access_code(db) == "EXFRESH002"
 
 
 def test_ex56_publishing_gives_a_code_that_is_not_in_use(client, db, monkeypatch):
     holder = _exam(db, "lobby", exam_id="EXAM_HOLDER")
-    holder.access_code = "EXTAKEN01"
+    holder.access_code = "EXTAKEN001"
     holder.scheduled_lesson_id = "LSN_OTHER"
     db.commit()
     mine = _exam(db, "variants_ready", exam_id="EXAM_MINE")
-    codes = iter(["EXTAKEN01", "EXFRESH02"])
-    monkeypatch.setattr(router_module.random, "choices", lambda chars, k: list(next(codes)[2:]))
+    codes = iter(["EXTAKEN001", "EXFRESH002"])
+    _feed_codes(monkeypatch, codes)
     body = {"lesson_id": "LSN_TEST01", "lesson_date": mine.scheduled_lesson_date}
     resp = client.post(f"{API}/exams/{mine.id}/open-lobby", json=body)
-    assert resp.status_code == 200 and resp.json()["access_code"] == "EXFRESH02"
+    assert resp.status_code == 200 and resp.json()["access_code"] == "EXFRESH002"
 
 
 

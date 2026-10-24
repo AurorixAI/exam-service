@@ -92,6 +92,12 @@ BREAKER_MIN_DISTINCT_FAILS = 30
 BREAKER_FAIL_RATIO = 0.5
 
 
+# Lookups of a code that does not exist (404), per client address over ALL codes: a walk over the code space.  A class
+# behind one NAT typing a code wrong a few times stays far below this; the successful lookups are not limited here.
+CODE_MISSES_PER_MINUTE = Limit(30, 60)
+CODE_MISSES_PER_HOUR = Limit(150, 3600)
+
+
 # ── client address ─────────────────────────────────────────────────────────────────────────────────────────
 IPV6_BUCKET_PREFIX_LENGTH = 64
 
@@ -575,3 +581,30 @@ def admit_identity_attempt(request: Request, exam_code: str, *typed_identity: Op
         raise too_many_attempts(3)  # a flood of simultaneous lookups: a few seconds, not the minute of a failure budget
 
     return EntryTicket(ip_scope, member, fail_keys, flight_key, status == ADDED, code_fail_key, ok_key)
+
+
+class CodeLookupTicket:
+    """One admitted lookup of an exam by its code; ``miss()`` when the code turned out not to exist."""
+
+    def __init__(self, bucket: str) -> None:
+        self._bucket = bucket
+
+    def miss(self) -> None:
+        for limit in (CODE_MISSES_PER_MINUTE, CODE_MISSES_PER_HOUR):
+            counters.hit(f"codemiss:{limit.window}:{self._bucket}", limit.window)
+
+
+def admit_code_lookup(request: Request) -> CodeLookupTicket:
+    """Refuse (429 + Retry-After) a client address that already missed too many exam codes (EX-37).
+
+    The existence check of a code (404 / 410 / 200) must not be a free oracle: guessing codes is made as expensive as
+    guessing student IDs.  Only misses are counted, so a whole class opening the real code at once is not touched."""
+    bucket = client_bucket(request)
+    exceeded: list[int] = []
+    for limit in (CODE_MISSES_PER_MINUTE, CODE_MISSES_PER_HOUR):
+        misses, left = counters.peek(f"codemiss:{limit.window}:{bucket}")
+        if misses >= limit.count:
+            exceeded.append(left)
+    if exceeded:
+        raise too_many_attempts(max(exceeded))
+    return CodeLookupTicket(bucket)

@@ -49,7 +49,7 @@ import anyio.from_thread
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import and_, func, inspect as sa_inspect, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -64,7 +64,7 @@ from src.core.auth import (
     require_group_access,
     require_student_history_access,
 )
-from src.core.abuse_limit import EntryTicket, admit_identity_attempt, reset_entry_limits
+from src.core.abuse_limit import EntryTicket, admit_code_lookup, admit_identity_attempt, reset_entry_limits
 from src.core.config import get_settings
 from src.core.database import get_db, wrote_since_commit
 from src.core.exceptions import (
@@ -218,7 +218,8 @@ class ExamInfoResponse(BaseModel):
     title: str
     subject: str
     teacher_name: Optional[str] = None
-    group_id: Optional[str] = None
+    # Whether the exam is tied to a group (the student page asks for an ID then).  The group's own UUID is not public.
+    has_group: bool = False
     group_name: Optional[str] = None
     class_level: Optional[int] = None
     total_time_minutes: int
@@ -235,11 +236,25 @@ class CheckStudentExamRequest(BaseModel):
     student_name: Optional[str] = None
 
 
+class CheckedStudent(BaseModel):
+    """What the public check-student answer may say about a student: explicit fields, so a new field of auth-service's
+    student record can never leak through this endpoint by accident (extra keys are dropped)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    full_name: Optional[str] = None
+    display_id: Optional[str] = None
+    class_level: Optional[int] = None
+
+
 class CheckStudentExamResponse(BaseModel):
     enrolled: bool
     group_required: bool = False
     group_name: Optional[str] = None
-    student: Optional[Dict[str, Any]] = None
+    student: Optional[CheckedStudent] = None
     message: Optional[str] = None
     already_submitted: bool = False
     session_id: Optional[str] = None
@@ -632,14 +647,14 @@ def _generate_access_code(db: Optional[Session] = None) -> str:
     """A fresh public code.  With ``db`` it is checked against the codes already issued (the column is unique), so a
     collision is re-rolled here instead of surfacing at commit as a misleading «lesson already has an exam»."""
     chars = string.ascii_uppercase + string.digits
-    code = "EX" + "".join(random.choices(chars, k=8))
+    code = "EX" + "".join(secrets.choice(chars) for _ in range(8))
     if db is None:
         return code
     for _ in range(20):
         taken = db.query(GeneratedExam.id).filter(func.upper(GeneratedExam.access_code) == code).first()
         if taken is None:
             return code
-        code = "EX" + "".join(random.choices(chars, k=8))
+        code = "EX" + "".join(secrets.choice(chars) for _ in range(8))
     return code
 
 
@@ -4806,7 +4821,7 @@ def _exam_info_response(db: Session, exam: GeneratedExam) -> ExamInfoResponse:
         title=exam.title,
         subject=exam.subject or "Математика",
         teacher_name=exam.teacher_name,
-        group_id=exam.group_id,
+        has_group=bool(exam.group_id),
         group_name=exam.group_name,
         class_level=exam.class_level,
         total_time_minutes=exam.total_time_minutes,
@@ -4818,11 +4833,24 @@ def _exam_info_response(db: Session, exam: GeneratedExam) -> ExamInfoResponse:
     )
 
 
+async def _note_code_miss(ticket, exc: HTTPException) -> None:
+    """EX-37: a lookup that ended with 404 «no such code» is counted against the client address (the counters talk to
+    Redis, so this runs in the thread pool like every other limiter call of the public entry)."""
+    if exc.status_code == 404:
+        await run_in_threadpool(ticket.miss)
+
+
 @router.get("/exams/by-code/{code}", response_model=ExamInfoResponse,
             summary="Информация об экзамене по коду (студент)")
-async def get_exam_by_code(code: str, db: Session = Depends(get_db)):
+async def get_exam_by_code(code: str, request: Request, db: Session = Depends(get_db)):
     # Database work runs in the thread pool and its transaction is over before the network call (ROADMAP #95).
-    exam = await run_in_threadpool(_public_exam_precheck, db, code)
+    # EX-37: an address that keeps asking for codes that do not exist is refused (429 + Retry-After) before the lookup
+    lookup_ticket = await run_in_threadpool(admit_code_lookup, request)
+    try:
+        exam = await run_in_threadpool(_public_exam_precheck, db, code)
+    except HTTPException as exc:
+        await _note_code_miss(lookup_ticket, exc)
+        raise
     if exam.status == "lobby":
         await _require_public_lobby_available(exam)
     return await run_in_threadpool(_exam_info_response, db, exam)
@@ -4877,7 +4905,12 @@ async def check_student_for_exam(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    exam = await run_in_threadpool(_entry_exam_lookup, db, code)
+    lookup_ticket = await run_in_threadpool(admit_code_lookup, request)
+    try:
+        exam = await run_in_threadpool(_entry_exam_lookup, db, code)
+    except HTTPException as exc:
+        await _note_code_miss(lookup_ticket, exc)
+        raise
     # #33: the answer carries the student's name on a match, so every lookup is rate limited (429 + Retry-After)
     # per exam code and client address; a distinct failed input is what spends the strict budget.
     ticket = await run_in_threadpool(
@@ -4964,7 +4997,12 @@ async def start_exam(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    exam = await run_in_threadpool(_entry_exam_lookup, db, code)
+    lookup_ticket = await run_in_threadpool(admit_code_lookup, request)
+    try:
+        exam = await run_in_threadpool(_entry_exam_lookup, db, code)
+    except HTTPException as exc:
+        await _note_code_miss(lookup_ticket, exc)
+        raise
     # #33: the same budget as check-student
     ticket = await run_in_threadpool(
         admit_identity_attempt, request, exam.access_code or code, req.student_id or req.display_id, req.student_name,
@@ -5596,9 +5634,12 @@ def get_results(
 # ═══════════════════════════════════════════════════════════════════════════
 # TEXTBOOK catalog endpoints
 # ═══════════════════════════════════════════════════════════════════════════
+# Staff only (EX-36): the catalogue is the task bank's text.  The exam builder of a teacher is its only reader; the
+# student's pages (/e/<code>) never call it, so nothing here is public.
 
 
 @router.get("/textbooks", response_model=List[TextbookInfo],
+            dependencies=[Depends(require_exam_staff)],
             summary="Список учебников")
 def list_textbooks(
     class_level: Optional[int] = Query(None, ge=5, le=11),
@@ -5609,6 +5650,7 @@ def list_textbooks(
 
 
 @router.get("/textbooks/{textbook_id}/toc", response_model=List[TocNode],
+            dependencies=[Depends(require_exam_staff)],
             summary="Оглавление учебника")
 def get_toc(textbook_id: str):
     rows = TextbookRepository().get_toc(textbook_id)
@@ -5618,6 +5660,7 @@ def get_toc(textbook_id: str):
 
 
 @router.get("/textbooks/{textbook_id}/coverage", response_model=List[CoverageItem],
+            dependencies=[Depends(require_exam_staff)],
             summary="Покрытие учебника задачами")
 def get_coverage(textbook_id: str):
     rows = TextbookRepository().get_coverage(textbook_id)
@@ -5625,6 +5668,7 @@ def get_coverage(textbook_id: str):
 
 
 @router.get("/toc/{toc_id}/skills", response_model=List[SkillInParagraph],
+            dependencies=[Depends(require_exam_staff)],
             summary="Навыки параграфа")
 def get_toc_skills(toc_id: int):
     rows = TextbookRepository().get_toc_skills(toc_id)
@@ -5634,6 +5678,7 @@ def get_toc_skills(toc_id: int):
 # ── must be before /{textbook_id} to avoid route shadowing ────────────────
 
 @router.get("/textbooks/skills/tree", response_model=List[SkillTreeNode],
+            dependencies=[Depends(require_exam_staff)],
             summary="Дерево навыков (L1→L4) для режима «По программе»")
 def get_skill_tree(
     class_level: Optional[int] = Query(None, ge=5, le=11),
@@ -5659,6 +5704,7 @@ def get_skill_tree(
 
 
 @router.get("/textbooks/{textbook_id}", response_model=TextbookDetail,
+            dependencies=[Depends(require_exam_staff)],
             summary="Полная информация об учебнике")
 def get_textbook(textbook_id: str):
     row = TextbookRepository().get_by_id(textbook_id)
@@ -5668,6 +5714,7 @@ def get_textbook(textbook_id: str):
 
 
 @router.get("/textbooks/{textbook_id}/toc/tree", response_model=List[TocNode],
+            dependencies=[Depends(require_exam_staff)],
             summary="Оглавление учебника (вложенное дерево)")
 def get_toc_tree(textbook_id: str):
     rows = TextbookRepository().get_toc(textbook_id)
@@ -5685,6 +5732,7 @@ def get_toc_tree(textbook_id: str):
 
 
 @router.get("/textbooks/{textbook_id}/tasks", response_model=List[TextbookTaskInfo],
+            dependencies=[Depends(require_exam_staff)],
             summary="Задачи учебника с фильтрацией")
 def get_textbook_tasks(
     textbook_id: str,

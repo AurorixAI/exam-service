@@ -185,7 +185,8 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
-        allow_origin_regex=r"http://localhost:\d+",
+        # any localhost port (a dev frontend on a free port) only on a developer machine; never on a real domain
+        allow_origin_regex=r"http://localhost:\d+" if settings.is_development else None,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
