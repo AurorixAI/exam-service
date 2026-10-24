@@ -41,7 +41,7 @@ def wire(monkeypatch):
     w = Wire()
 
     def fake_post(url, params=None, json=None, headers=None, timeout=None):
-        w.posts.append({"url": url, "timeout": timeout})
+        w.posts.append({"url": url, "timeout": timeout, "headers": headers, "params": params})
         if "azure.invalid" in url:
             return types.SimpleNamespace(
                 status_code=w.azure_status, text="x",
@@ -116,10 +116,91 @@ def test_switch_on_without_any_key_makes_no_request(monkeypatch, wire):
     assert wire.posts == []
 
 
-def test_the_switch_covers_the_report_only_not_variant_templating(monkeypatch, wire):
-    set_env(monkeypatch, flag="false", azure=True)
-    assert gemini_client.call_gemini(SECRET_PROMPT, purpose="task_templatize") == "azure answer"
-    assert len(wire.posts) == 1
+@pytest.mark.parametrize("purpose", ["report_narrative", "task_templatize", "other"])
+def test_the_switch_stops_every_paid_call_of_the_service(monkeypatch, wire, purpose):
+    set_env(monkeypatch, flag="false", azure=True, gemini=True)
+    with pytest.raises(gemini_client.NarrativeDisabledError):
+        gemini_client.call_gemini(SECRET_PROMPT, purpose=purpose)
+    assert wire.posts == []                                   # incl. the variant templating chain
+
+
+def test_the_variant_templatizer_makes_no_request_while_the_switch_is_off(monkeypatch, wire):
+    from src.domain import llm_templatizer
+
+    set_env(monkeypatch, flag="false", azure=True, gemini=True)
+    monkeypatch.setattr(gemini_client, "get_model", lambda *_: "m", raising=False)
+    try:
+        llm_templatizer.templatize_via_llm("Найдите x", "x+1=4", "3", "exact_number")
+    except Exception:
+        pass
+    assert wire.posts == []
+
+
+def test_the_gemini_key_goes_in_a_header_never_in_the_url(monkeypatch, wire):
+    set_env(monkeypatch, gemini=True)
+    assert gemini_client.call_gemini(SECRET_PROMPT, purpose="report_narrative") == "gemini answer"
+    sent = wire.posts[0]
+    assert "key=" not in sent["url"] and "?" not in sent["url"]
+    assert sent["headers"]["x-goog-api-key"] == "g" and sent["params"] is None
+
+
+def test_no_exception_or_log_line_carries_the_api_key(monkeypatch, caplog):
+    secret = "AIzaSyTOP-SECRET-KEY-123456"
+    monkeypatch.setenv("AZURE_DEEPSEEK_API_KEY", secret + "-azure")
+    monkeypatch.setenv("AZURE_DEEPSEEK_ENDPOINT", "https://azure.invalid/v1")
+    monkeypatch.setenv("GEMINI_API_KEY", secret)
+    monkeypatch.delenv("REPORT_NARRATIVE_ENABLED", raising=False)
+    get_settings.cache_clear()
+
+    def leaky_post(url, **kwargs):
+        raise requests.ConnectionError(f"HTTPSConnectionPool: max retries exceeded with url {url} key {secret} {secret}-azure")
+
+    monkeypatch.setattr(requests, "post", leaky_post)
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RuntimeError) as err:
+            gemini_client.call_gemini(SECRET_PROMPT, purpose="report_narrative")
+    assert secret not in str(err.value)
+    assert secret not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_a_non_connection_error_is_wrapped_without_the_key(monkeypatch, caplog):
+    set_env(monkeypatch, gemini=True)
+
+    def bad(url, **kwargs):
+        raise ValueError("boom with key g inside")
+
+    monkeypatch.setattr(requests, "post", bad)
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RuntimeError) as err:
+            gemini_client.call_gemini(SECRET_PROMPT, purpose="report_narrative")
+    assert "boom" in str(err.value) and "key g " not in str(err.value) and "***" in str(err.value)
+
+
+def test_no_sleep_and_no_retrying_line_after_the_final_failed_attempt(monkeypatch, caplog):
+    set_env(monkeypatch, gemini=True)
+    slept = []
+    monkeypatch.setattr(gemini_client.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(
+        requests, "post",
+        lambda url, **k: types.SimpleNamespace(status_code=503, text="x", json=lambda: {}, raise_for_status=lambda: None),
+    )
+    with caplog.at_level(logging.INFO, logger="gemini_client"):
+        with pytest.raises(RuntimeError):
+            gemini_client.call_gemini(SECRET_PROMPT, purpose="report_narrative", max_retries=3)
+    assert slept == [1, 2]                                    # between the 3 attempts only, nothing after the last
+    retrying = [r for r in caplog.records if "retrying" in r.getMessage()]
+    assert len(retrying) == 2
+
+
+def test_startup_warns_about_an_unrecognised_switch_value_and_stays_on(monkeypatch, caplog):
+    set_env(monkeypatch, flag="flase")
+    with caplog.at_level(logging.WARNING, logger="gemini_client"):
+        assert gemini_client.warn_if_switch_unrecognised() is True
+    assert any("unrecognised" in r.getMessage() and "flase" in r.getMessage() for r in caplog.records)
+    assert gemini_client.narrative_enabled() is True          # still fail-open
+    for ok in (None, "true", "false", "0", "no", ""):
+        set_env(monkeypatch, flag=ok)
+        assert gemini_client.warn_if_switch_unrecognised() is False
 
 
 def test_every_paid_request_is_logged_without_prompt_or_answer(monkeypatch, wire, caplog):
@@ -156,7 +237,8 @@ def _slow_world(monkeypatch, per_request):
 
     def post(url, params=None, json=None, headers=None, timeout=None):
         seen.append(timeout)
-        clock.now += min(per_request, timeout)             # a hanging server: the request lasts until its timeout
+        assert isinstance(timeout, tuple) and len(timeout) == 2         # (connect, read)
+        clock.now += min(per_request, timeout[1])          # a hanging server: the request lasts until its read timeout
         raise requests.ConnectionError("hung")
 
     monkeypatch.setattr(requests, "post", post)
@@ -171,7 +253,7 @@ def test_the_whole_chain_ends_within_100_seconds(monkeypatch):
     with pytest.raises(RuntimeError):
         gemini_client.call_gemini(SECRET_PROMPT, purpose="report_narrative")   # defaults: timeout 120, 3 retries
     assert clock.now - start <= 100.0 + 1e-6               # before: Azure 120 s + 3 x 120 s + 1+2+4 s of sleep
-    assert all(t <= 100.0 + 1e-6 for t in seen) and len(seen) <= 2
+    assert all(c <= 5.0 and r <= 100.0 + 1e-6 for c, r in seen) and len(seen) <= 2
 
 
 def test_gemini_retries_stop_when_the_deadline_is_near(monkeypatch):
@@ -187,7 +269,8 @@ def test_gemini_retries_stop_when_the_deadline_is_near(monkeypatch):
 def test_a_fast_chain_is_not_affected(monkeypatch, wire):
     set_env(monkeypatch, azure=True)
     assert gemini_client.call_gemini(SECRET_PROMPT, purpose="report_narrative") == "azure answer"
-    assert wire.posts[0]["timeout"] <= 100.0
+    connect, read = wire.posts[0]["timeout"]
+    assert connect <= 5.0 and read <= 100.0
 
 
 # ── EX-26: '//' inside a JSON string is content ──────────────────────────────
@@ -373,6 +456,88 @@ def test_cache_path_still_marks_a_closed_exam_final(client, db, model, monkeypat
     db.commit()
     resp = _post(client, exam, force=True)
     assert resp.status_code == 200 and resp.json()["is_final"] is True and len(model) == 1
+
+
+def test_a_failed_forced_regeneration_keeps_the_previous_narrative_and_the_window(client, db, model, monkeypatch):
+    exam, _ = _graded_exam(db, "A3KEEP1")
+    set_env(monkeypatch)
+    first = _post(client, exam)
+    assert first.status_code == 200 and first.json()["narrative_generated"] is True
+    _age(db, exam, 11)
+    stamp = _report(db, exam).updated_at
+    _new_submission(db, exam)
+    model.answer = "I am not JSON"
+    resp = _post(client, exam, force=True)
+    assert resp.status_code == 200 and len(model) == 2
+    assert resp.json()["narrative_ru"] == first.json()["narrative_ru"]         # not overwritten with the fallback
+    assert resp.json()["narrative_generated"] is True
+    report = _report(db, exam)
+    assert report.updated_at == stamp                                          # the failed attempt spent no window
+    model.answer = GOOD
+    retry = _post(client, exam, force=True)                                   # so the teacher can try again at once
+    assert retry.status_code == 200 and len(model) == 3 and retry.json()["submitted_count"] == 2
+
+
+def test_a_model_error_on_force_also_keeps_the_previous_narrative(client, db, monkeypatch):
+    exam, _ = _graded_exam(db, "A3KEEP2")
+    set_env(monkeypatch)
+    monkeypatch.setattr(report_generator, "call_gemini", lambda *a, **k: GOOD)
+    first = _post(client, exam)
+    _age(db, exam, 11)
+    stamp = _report(db, exam).updated_at
+    _new_submission(db, exam)
+
+    def boom(prompt, **kwargs):
+        raise RuntimeError("model down")
+
+    monkeypatch.setattr(report_generator, "call_gemini", boom)
+    resp = _post(client, exam, force=True)
+    assert resp.status_code == 200 and resp.json()["narrative_ru"] == first.json()["narrative_ru"]
+    assert _report(db, exam).updated_at == stamp
+
+
+def test_a_failed_forced_retry_over_a_deterministic_report_saves_the_numbers_but_not_the_window(client, db, model, monkeypatch):
+    exam, _ = _graded_exam(db, "A3KEEP3")
+    set_env(monkeypatch, flag="false")
+    assert _post(client, exam).status_code == 200                              # deterministic report, no AI text
+    set_env(monkeypatch)
+    _age(db, exam, 11)
+    stamp = _report(db, exam).updated_at
+    _new_submission(db, exam)
+    model.answer = "garbage"
+    resp = _post(client, exam, force=True)
+    assert resp.status_code == 200 and resp.json()["submitted_count"] == 2 and resp.json()["narrative_generated"] is False
+    assert _report(db, exam).updated_at == stamp
+
+
+def test_marking_a_cached_report_final_does_not_move_updated_at(client, db, model, monkeypatch):
+    exam, _ = _graded_exam(db, "A3FINAL")
+    set_env(monkeypatch)
+    assert _post(client, exam).status_code == 200
+    report = _report(db, exam)
+    report.is_final = False
+    report.updated_at = datetime.utcnow() - timedelta(minutes=11)
+    db.commit()
+    stamp = _report(db, exam).updated_at
+    resp = _post(client, exam, force=True)
+    assert resp.status_code == 200 and resp.json()["is_final"] is True and len(model) == 1
+    assert _report(db, exam).updated_at == stamp
+
+
+def test_a_null_updated_at_falls_back_to_generated_at(client, db, model, monkeypatch):
+    exam, _ = _graded_exam(db, "A3NULL")
+    set_env(monkeypatch)
+    assert _post(client, exam).status_code == 200
+    db.query(ExamReport).filter(ExamReport.exam_id == exam.id).update(
+        {"updated_at": None, "generated_at": datetime.utcnow() - timedelta(minutes=11)})
+    db.commit()
+    _new_submission(db, exam)
+    assert _post(client, exam, force=True).status_code == 200 and len(model) == 2
+    db.query(ExamReport).filter(ExamReport.exam_id == exam.id).update(
+        {"updated_at": None, "generated_at": datetime.utcnow()})
+    db.commit()
+    _new_submission(db, exam, n=3)
+    assert _post(client, exam, force=True).status_code == 409                  # a fresh generated_at is still a window
 
 
 def test_a_lost_race_between_two_workers_is_a_409_not_a_second_payment(client, db, model, monkeypatch):

@@ -143,6 +143,9 @@ async def lifespan(app: FastAPI):
     # Every handler that touches the database is a plain ``def`` (or hops to a thread with run_in_threadpool), so the
     # event loop only does I/O.  How many of them may block at once per worker is this limiter.
     anyio.to_thread.current_default_thread_limiter().total_tokens = settings.worker_threads
+    from src.domain.gemini_client import warn_if_switch_unrecognised
+
+    warn_if_switch_unrecognised()  # an unknown REPORT_NARRATIVE_ENABLED value keeps paid calls ON: say so at start
     # In the test suite the schema is created by the conftest fixtures against
     # an in-memory SQLite DB; the Postgres-flavored migrations can't run there
     # (and would target a throwaway subprocess DB anyway). Skip them.

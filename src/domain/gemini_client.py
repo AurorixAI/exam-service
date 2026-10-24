@@ -16,8 +16,8 @@ log = logging.getLogger("gemini_client")
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 SERVICE = "exam"
-NARRATIVE_PURPOSE = "report_narrative"
 _OFF_VALUES = {"false", "0", "no", "off", "disabled"}
+_ON_VALUES = {"", "true", "1", "yes", "on", "enabled"}
 
 # EX-25: the WHOLE chain (Azure, then Gemini with its retries and back-off sleeps) must end before the
 # nginx proxy_read_timeout (120 s) turns the request into a 504 while the thread keeps paying in the background.
@@ -36,6 +36,30 @@ def narrative_enabled() -> bool:
     """
     value = str(get_settings().report_narrative_enabled or "").strip().lower()
     return value not in _OFF_VALUES
+
+
+def warn_if_switch_unrecognised() -> bool:
+    """Startup check: a value that is neither a known "on" nor a known "off" keeps the model ON (fail-open) - say so loudly.
+
+    Returns True when a warning was logged.
+    """
+    raw = str(get_settings().report_narrative_enabled or "")
+    value = raw.strip().lower()
+    if value in _OFF_VALUES or value in _ON_VALUES:
+        return False
+    log.warning(
+        "REPORT_NARRATIVE_ENABLED has an unrecognised value %r: treated as ON (paid report calls are ENABLED). "
+        "Use false/0/no/off to switch them off.", raw[:40],
+    )
+    return True
+
+
+def _scrub(text: object, *secrets: Optional[str]) -> str:
+    """``text`` with every non-empty secret replaced - no exception text or log line may carry an API key."""
+    out = str(text)
+    for secret in sorted((x for x in secrets if x), key=len, reverse=True):
+        out = out.replace(secret, "***")
+    return out
 
 
 def _log_paid_call(purpose: str, provider: str, model: str, started: float, ok: bool) -> None:
@@ -64,10 +88,11 @@ def call_gemini(
     Falls back to Google Gemini if Azure fails or is unconfigured.
 
     ``deadline_seconds`` bounds the whole chain (every request timeout is clipped to what is left, a retry is
-    not started when too little is left).  ``purpose="report_narrative"`` calls honour REPORT_NARRATIVE_ENABLED.
+    not started when too little is left).  REPORT_NARRATIVE_ENABLED=false stops EVERY paid call of this service,
+    whatever its purpose.
     """
     settings = get_settings()
-    if purpose == NARRATIVE_PURPOSE and not narrative_enabled():
+    if not narrative_enabled():
         raise NarrativeDisabledError("REPORT_NARRATIVE_ENABLED is off")
 
     deadline = time.monotonic() + max(float(deadline_seconds), 1.0)
@@ -100,7 +125,7 @@ def call_gemini(
                 "api-key": azure_key,
                 "Authorization": f"Bearer {azure_key}",
             }
-            resp = requests.post(azure_url, json=payload, headers=headers, timeout=min(timeout, remaining()))
+            resp = requests.post(azure_url, json=payload, headers=headers, timeout=_timeouts(timeout, remaining()))
             if resp.status_code == 200:
                 data = resp.json()
                 text = data["choices"][0]["message"]["content"].strip()
@@ -111,7 +136,7 @@ def call_gemini(
             else:
                 log.warning("Azure DeepSeek returned HTTP %d: %s", resp.status_code, resp.text[:300])
         except Exception as exc:
-            log.warning("Azure DeepSeek call failed: %s — trying Gemini fallback...", exc)
+            log.warning("Azure DeepSeek call failed: %s — trying Gemini fallback...", _scrub(exc, azure_key, api_key, settings.gemini_api_key))
         finally:
             _log_paid_call(purpose, "azure", settings.azure_deepseek_model, started, ok)
 
@@ -131,7 +156,8 @@ def call_gemini(
     if json_mode:
         gen_config["responseMimeType"] = "application/json"
 
-    last_exc: Optional[Exception] = None
+    last_exc: Optional[str] = None
+    secrets = (key, azure_key, api_key, settings.gemini_api_key)
 
     import requests
     for attempt in range(max_retries):
@@ -139,49 +165,52 @@ def call_gemini(
             log.warning("AI call chain ran out of its %.0f s deadline before attempt %d", deadline_seconds, attempt + 1)
             break
         started = time.monotonic()
-        ok = False
         try:
             resp = requests.post(
                 url,
-                params={"key": key},
+                headers={"x-goog-api-key": key, "Content-Type": "application/json"},   # never in the URL
                 json={
                     "contents": [{"parts": [{"text": prompt}]}],
                     "generationConfig": gen_config,
                 },
-                timeout=min(timeout, remaining()),
+                timeout=_timeouts(timeout, remaining()),
             )
             if resp.status_code == 429 or resp.status_code >= 500:
-                wait = min(2 ** attempt, max(remaining() - _MIN_USEFUL_SECONDS, 0))
-                log.warning("Gemini %s (attempt %d/%d), retrying in %ds",
-                            resp.status_code, attempt + 1, max_retries, wait)
-                last_exc = requests.HTTPError(response=resp)
                 _log_paid_call(purpose, "gemini", mdl, started, False)
-                time.sleep(wait)
-                continue
-
-            resp.raise_for_status()
-            data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            ok = True
-            _log_paid_call(purpose, "gemini", mdl, started, True)
-            return text
+                last_exc = f"HTTP {resp.status_code}"
+            else:
+                resp.raise_for_status()
+                data = resp.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                _log_paid_call(purpose, "gemini", mdl, started, True)
+                return text
 
         except requests.ConnectionError as exc:
-            wait = min(2 ** attempt, max(remaining() - _MIN_USEFUL_SECONDS, 0))
-            log.warning("Gemini connection error (attempt %d/%d), retrying in %ds",
-                        attempt + 1, max_retries, wait)
-            last_exc = exc
             _log_paid_call(purpose, "gemini", mdl, started, False)
-            time.sleep(wait)
-            continue
+            last_exc = _scrub(exc, *secrets)
 
         except Exception as exc:
-            if not ok:
-                _log_paid_call(purpose, "gemini", mdl, started, False)
-            log.error("Gemini unexpected error: %s", exc)
-            raise
+            _log_paid_call(purpose, "gemini", mdl, started, False)
+            message = _scrub(exc, *secrets)
+            log.error("Gemini unexpected error: %s", message)
+            raise RuntimeError(f"Gemini API error: {message}") from None
+
+        # Only a retry that will really happen is announced and waited for.
+        if attempt + 1 >= max_retries:
+            break
+        wait = min(2 ** attempt, max(remaining() - _MIN_USEFUL_SECONDS, 0))
+        if wait <= 0 and remaining() < _MIN_USEFUL_SECONDS:
+            break
+        log.warning("Gemini failed (%s), attempt %d/%d, retrying in %ds", last_exc, attempt + 1, max_retries, wait)
+        time.sleep(wait)
 
     raise RuntimeError(f"Gemini API failed after {max_retries} attempts (deadline {deadline_seconds:.0f} s): {last_exc}")
+
+
+def _timeouts(read_timeout: float, left: float) -> tuple:
+    """(connect, read) for ``requests``, both clipped to the time left of the chain's deadline."""
+    left = max(left, 0.1)
+    return (min(5.0, left), min(float(read_timeout), left))
 
 
 def _strip_line_comments(text: str) -> str:
