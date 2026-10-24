@@ -15,6 +15,7 @@
 | `DATABASE_URL` | ✅ | PostgreSQL DSN | `postgresql://algo:pass@algo-postgres-exam:5432/algo_exam` |
 | `REDIS_URL` | ✅ | Redis DSN | `redis://algo-redis-exam:6379` |
 | `GEMINI_API_KEY` | ✅ | Gemini AI (генерация вариантов) | `AIza...` |
+| `REPORT_NARRATIVE_ENABLED` | — | Аварийный выключатель платных вызовов нарратива отчёта (по умолчанию `true`; `false`/`0`/`no` — 0 платных вызовов) | `false` |
 | `APP_ENV` | — | `production` / `development` | `production` |
 | `CONTENT_SERVICE_URL` | — | URL content-service | `http://content-api:8004` |
 | `AUTH_SERVICE_URL` | — | URL auth-service | `http://algo-auth:8000` |

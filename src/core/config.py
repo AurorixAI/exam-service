@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379"
     redis_template_cache_ttl: int = 3600  # 1 hour
 
+    # Emergency switch for every paid report-narrative model call (REPORT_NARRATIVE_ENABLED).
+    # On by default: the narrative is a product feature.  "false" / "0" / "no" / "off" turns it off; the
+    # deterministic report is then produced with 0 paid calls.  Read ONLY through
+    # ``src.domain.gemini_client.narrative_enabled()``.  A string, so an empty value in a compose file
+    # cannot stop the service from starting.
+    report_narrative_enabled: str = "true"
+
     # Gemini AI — variant templatization / fallback
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
