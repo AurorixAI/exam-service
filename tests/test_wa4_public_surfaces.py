@@ -160,14 +160,15 @@ def test_ex37_access_codes_come_from_the_csprng(monkeypatch):
     assert all(re.fullmatch(r"EX[A-Z0-9]{8}", c) for c in codes)
 
 
-def test_ex37_missed_codes_are_braked_per_address_and_real_codes_are_not(client, db):
+def test_ex37_distinct_missed_codes_are_braked_per_address_and_real_codes_are_not(client, db):
     exam = make_exam_in_db(db, status="active")
     exam.access_code = "EXPUBLIC1"
     db.commit()
     mine = {"X-Real-IP": "203.0.113.7"}
+    assert abuse_limit.CODE_MISSES_PER_MINUTE.count == 60 and abuse_limit.CODE_MISSES_PER_HOUR.count == 300
     for i in range(abuse_limit.CODE_MISSES_PER_MINUTE.count):
         assert client.get(f"{API}/exams/by-code/EXNOPE{i:04d}", headers=mine).status_code == 404
-    refused = client.get(f"{API}/exams/by-code/EXNOPEXXXX", headers=mine)
+    refused = client.get(f"{API}/exams/by-code/EXNOPE9999", headers=mine)  # the 61st distinct wrong code in a minute
     assert refused.status_code == 429
     assert int(refused.headers["Retry-After"]) >= 1
     # the same address is refused for every public entry, even a real code (it is the address that walks)
@@ -175,6 +176,35 @@ def test_ex37_missed_codes_are_braked_per_address_and_real_codes_are_not(client,
     # the others are not
     other = {"X-Real-IP": "203.0.113.8"}
     assert client.get(f"{API}/exams/by-code/EXPUBLIC1", headers=other).status_code == 200
+
+
+def test_ex37_thirty_students_behind_one_nat_reloading_the_same_dead_code_are_never_braked(client, db):
+    exam = make_exam_in_db(db, status="active")
+    exam.access_code = "EXPUBLIC1"
+    db.commit()
+    nat = {"X-Real-IP": "198.51.100.30"}
+    for _ in range(30):  # 30 students, each reloading the dead code from the board several times
+        for _ in range(5):
+            assert client.get(f"{API}/exams/by-code/EXDEAD0001", headers=nat).status_code == 404
+    # ... and they can still open the real one
+    assert client.get(f"{API}/exams/by-code/EXPUBLIC1", headers=nat).status_code == 200
+
+
+def test_ex37_the_teachers_reset_lifts_the_miss_budget_of_the_addresses_that_opened_the_exam(client, db):
+    exam = make_exam_in_db(db, status="active")
+    exam.access_code = "EXPUBLIC1"
+    db.commit()
+    nat = {"X-Real-IP": "198.51.100.40"}
+    stranger = {"X-Real-IP": "198.51.100.41"}  # never opened this exam
+    assert client.get(f"{API}/exams/by-code/EXPUBLIC1", headers=nat).status_code == 200
+    for who in (nat, stranger):
+        for i in range(abuse_limit.CODE_MISSES_PER_MINUTE.count):
+            assert client.get(f"{API}/exams/by-code/EXWALK{i:04d}", headers=who).status_code == 404
+        assert client.get(f"{API}/exams/by-code/EXPUBLIC1", headers=who).status_code == 429
+    reset = client.post(f"{API}/exams/{exam.id}/entry-limits/reset")
+    assert reset.status_code == 200, reset.text
+    assert client.get(f"{API}/exams/by-code/EXPUBLIC1", headers=nat).status_code == 200
+    assert client.get(f"{API}/exams/by-code/EXPUBLIC1", headers=stranger).status_code == 429, "a walker gains nothing"
 
 
 def test_ex37_a_class_behind_one_nat_opening_the_real_code_is_never_braked(client, db):
@@ -322,9 +352,9 @@ def test_ex59_the_gemini_key_travels_in_a_header_not_in_the_url(monkeypatch):
 
 
 def test_ex59_request_id_is_taken_from_the_client_only_when_it_is_a_plain_token(client):
-    good = "req-1234abcd-5678"
-    assert client.get("/health/live", headers={"X-Request-ID": good}).headers["X-Request-ID"] == good
-    for bad in ["short", "x" * 65, "has space in it 1234", "a/b\\c:d;e,f 12345", "id-with-$(rm)-1234", "x=1&y=2;;;;"]:
+    for good in ["req-1234abcd-5678", "short", "a.b_c-1", "x" * 64]:
+        assert client.get("/health/live", headers={"X-Request-ID": good}).headers["X-Request-ID"] == good
+    for bad in ["x" * 65, "has space in it 1234", "a/b\\c:d;e,f 12345", "id-with-$(rm)-1234", "x=1&y=2;;;;"]:
         out = client.get("/health/live", headers={"X-Request-ID": bad}).headers["X-Request-ID"]
         assert out != bad
         assert re.fullmatch(r"[0-9a-f-]{36}", out), out
@@ -335,3 +365,4 @@ def test_ex59_sanitize_request_id_rejects_line_breaks_and_control_characters():
     for bad in ["abcdefgh\nINJECTED", "abcdefgh\r\n", "abcdefgh\x1b[31m", "\tabcdefgh", None, ""]:
         assert re.fullmatch(r"[0-9a-f-]{36}", sanitize_request_id(bad))
     assert sanitize_request_id("12345678") == "12345678"
+    assert sanitize_request_id("a") == "a" and sanitize_request_id("a.b_c-d") == "a.b_c-d"

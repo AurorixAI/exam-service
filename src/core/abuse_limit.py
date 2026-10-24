@@ -92,10 +92,13 @@ BREAKER_MIN_DISTINCT_FAILS = 30
 BREAKER_FAIL_RATIO = 0.5
 
 
-# Lookups of a code that does not exist (404), per client address over ALL codes: a walk over the code space.  A class
-# behind one NAT typing a code wrong a few times stays far below this; the successful lookups are not limited here.
-CODE_MISSES_PER_MINUTE = Limit(30, 60)
-CODE_MISSES_PER_HOUR = Limit(150, 3600)
+# DISTINCT codes that do not exist (404), per client address over ALL exams: a walk over the code space.  Distinct, because
+# a class behind one NAT whose students keep reloading the same dead code (a mistyped or an old one on the board) is ONE
+# miss, not thirty; a walk is a new code every time.  The successful lookups are not limited here.
+CODE_MISSES_PER_MINUTE = Limit(60, 60)
+CODE_MISSES_PER_HOUR = Limit(300, 3600)
+# The addresses that opened a given exam code (so the teacher's reset can lift their miss budget): kept a day, capped.
+EXAM_ADDRESSES = Limit(2000, 24 * 3600)
 
 
 # ── client address ─────────────────────────────────────────────────────────────────────────────────────────
@@ -406,6 +409,38 @@ class _Counters:
             return 0, 0
         return size, max(math.ceil(ends_at - now), 1)
 
+    def members(self, key: str) -> set:
+        """The members of the set at *key* (empty when there is none)."""
+        client = self._redis()
+        if client is not None:
+            try:
+                found = client.smembers(key)
+                self._mark_up()
+                return set(found)
+            except Exception as exc:  # noqa: BLE001
+                self._mark_down(exc)
+        now = _now()
+        with self._lock:
+            members, ends_at = self._sets.get(key, (set(), 0.0))
+            return set(members) if ends_at > now else set()
+
+    def delete(self, *keys: str) -> None:
+        """Forget these counters / sets."""
+        if not keys:
+            return
+        client = self._redis()
+        if client is not None:
+            try:
+                client.delete(*keys)
+                self._mark_up()
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._mark_down(exc)
+        with self._lock:
+            for key in keys:
+                self._memory.pop(key, None)
+                self._sets.pop(key, None)
+
     # -- epochs: the teacher's reset ---------------------------------------------------------------------
     def epoch(self, scope: str) -> int:
         client = self._redis()
@@ -528,9 +563,23 @@ class EntryTicket:
             counters.remove_member(self._flight_key, self._member)
 
 
+def _miss_keys(bucket: str) -> list[str]:
+    return [f"codemiss:{limit.window}:{bucket}" for limit in (CODE_MISSES_PER_MINUTE, CODE_MISSES_PER_HOUR)]
+
+
 def reset_entry_limits(exam_code: str) -> int:
-    """Teacher's reset: every counter of this exam code starts again from zero.  Returns the new epoch."""
-    return counters.bump_epoch(code_key(exam_code))
+    """Teacher's reset: every counter of this exam code starts again from zero.  Returns the new epoch.
+
+    The brake on MISSED codes belongs to an address, not to an exam, so it cannot be keyed by the epoch.  The reset
+    lifts it for the addresses that have opened THIS exam's code (``ExamCodeTicket.found`` records them): the class
+    that typed a few dead codes, was braked, and now cannot reach the exam the teacher is resetting.  An address that
+    never reached this exam keeps its budget - a walker gains nothing from a teacher's reset."""
+    scope = code_key(exam_code)
+    key = f"examaddrs:{scope}"
+    for bucket in counters.members(key):
+        counters.delete(*_miss_keys(bucket))
+    counters.delete(key)
+    return counters.bump_epoch(scope)
 
 
 def admit_identity_attempt(request: Request, exam_code: str, *typed_identity: Optional[str]) -> EntryTicket:
@@ -584,25 +633,31 @@ def admit_identity_attempt(request: Request, exam_code: str, *typed_identity: Op
 
 
 class CodeLookupTicket:
-    """One admitted lookup of an exam by its code; ``miss()`` when the code turned out not to exist."""
+    """One admitted lookup of an exam by its code: ``miss(code)`` when it does not exist, ``found(code)`` when it does."""
 
     def __init__(self, bucket: str) -> None:
         self._bucket = bucket
 
-    def miss(self) -> None:
+    def miss(self, code: str) -> None:
+        member = code_key(code)
         for limit in (CODE_MISSES_PER_MINUTE, CODE_MISSES_PER_HOUR):
-            counters.hit(f"codemiss:{limit.window}:{self._bucket}", limit.window)
+            counters.add_member(f"codemiss:{limit.window}:{self._bucket}", member, limit.window, limit.count)
+
+    def found(self, code: str) -> None:
+        """Remember that this address opened the exam, for the teacher's reset (``reset_entry_limits``)."""
+        counters.add_member(f"examaddrs:{code_key(code)}", self._bucket, EXAM_ADDRESSES.window, EXAM_ADDRESSES.count)
 
 
 def admit_code_lookup(request: Request) -> CodeLookupTicket:
-    """Refuse (429 + Retry-After) a client address that already missed too many exam codes (EX-37).
+    """Refuse (429 + Retry-After) a client address that already missed too many DISTINCT exam codes (EX-37).
 
     The existence check of a code (404 / 410 / 200) must not be a free oracle: guessing codes is made as expensive as
-    guessing student IDs.  Only misses are counted, so a whole class opening the real code at once is not touched."""
+    guessing student IDs.  Only distinct misses are counted, so a whole class reloading one dead code, or opening the
+    real code at once, is not touched."""
     bucket = client_bucket(request)
     exceeded: list[int] = []
-    for limit in (CODE_MISSES_PER_MINUTE, CODE_MISSES_PER_HOUR):
-        misses, left = counters.peek(f"codemiss:{limit.window}:{bucket}")
+    for limit, key in zip((CODE_MISSES_PER_MINUTE, CODE_MISSES_PER_HOUR), _miss_keys(bucket)):
+        misses, left = counters.count_members(key)
         if misses >= limit.count:
             exceeded.append(left)
     if exceeded:

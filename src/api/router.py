@@ -4833,11 +4833,11 @@ def _exam_info_response(db: Session, exam: GeneratedExam) -> ExamInfoResponse:
     )
 
 
-async def _note_code_miss(ticket, exc: HTTPException) -> None:
+async def _note_code_miss(ticket, exc: HTTPException, code: str) -> None:
     """EX-37: a lookup that ended with 404 «no such code» is counted against the client address (the counters talk to
     Redis, so this runs in the thread pool like every other limiter call of the public entry)."""
     if exc.status_code == 404:
-        await run_in_threadpool(ticket.miss)
+        await run_in_threadpool(ticket.miss, code)
 
 
 @router.get("/exams/by-code/{code}", response_model=ExamInfoResponse,
@@ -4849,8 +4849,9 @@ async def get_exam_by_code(code: str, request: Request, db: Session = Depends(ge
     try:
         exam = await run_in_threadpool(_public_exam_precheck, db, code)
     except HTTPException as exc:
-        await _note_code_miss(lookup_ticket, exc)
+        await _note_code_miss(lookup_ticket, exc, code)
         raise
+    await run_in_threadpool(lookup_ticket.found, code)
     if exam.status == "lobby":
         await _require_public_lobby_available(exam)
     return await run_in_threadpool(_exam_info_response, db, exam)
@@ -4909,8 +4910,9 @@ async def check_student_for_exam(
     try:
         exam = await run_in_threadpool(_entry_exam_lookup, db, code)
     except HTTPException as exc:
-        await _note_code_miss(lookup_ticket, exc)
+        await _note_code_miss(lookup_ticket, exc, code)
         raise
+    await run_in_threadpool(lookup_ticket.found, code)
     # #33: the answer carries the student's name on a match, so every lookup is rate limited (429 + Retry-After)
     # per exam code and client address; a distinct failed input is what spends the strict budget.
     ticket = await run_in_threadpool(
@@ -5001,8 +5003,9 @@ async def start_exam(
     try:
         exam = await run_in_threadpool(_entry_exam_lookup, db, code)
     except HTTPException as exc:
-        await _note_code_miss(lookup_ticket, exc)
+        await _note_code_miss(lookup_ticket, exc, code)
         raise
+    await run_in_threadpool(lookup_ticket.found, code)
     # #33: the same budget as check-student
     ticket = await run_in_threadpool(
         admit_identity_attempt, request, exam.access_code or code, req.student_id or req.display_id, req.student_name,
