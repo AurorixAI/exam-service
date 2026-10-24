@@ -50,7 +50,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.concurrency import run_in_threadpool
 import httpx
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, inspect as sa_inspect, or_, select
+from sqlalchemy import and_, func, inspect as sa_inspect, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -74,7 +74,7 @@ from src.core.exceptions import (
     SessionAlreadySubmittedError,
     NoTasksAvailableError,
 )
-from src.models import ExamLifecycleEvent, ExamPrintPackage, ExamReport, GeneratedExam, ExamSession
+from src.models import ExamDeletion, ExamLifecycleEvent, ExamPrintPackage, ExamReport, GeneratedExam, ExamSession
 from src.repositories.task_repo import TaskRepository, TextbookRepository
 from src.repositories.exam_repo import ExamRepository, SessionRepository, ExamReportRepository
 from src.domain.choice_options import ordered as order_choices
@@ -628,9 +628,51 @@ class LessonRescheduleSyncRequest(LessonBindingRequest):
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _generate_access_code() -> str:
+def _generate_access_code(db: Optional[Session] = None) -> str:
+    """A fresh public code.  With ``db`` it is checked against the codes already issued (the column is unique), so a
+    collision is re-rolled here instead of surfacing at commit as a misleading «lesson already has an exam»."""
     chars = string.ascii_uppercase + string.digits
-    return "EX" + "".join(random.choices(chars, k=8))
+    code = "EX" + "".join(random.choices(chars, k=8))
+    if db is None:
+        return code
+    for _ in range(20):
+        taken = db.query(GeneratedExam.id).filter(func.upper(GeneratedExam.access_code) == code).first()
+        if taken is None:
+            return code
+        code = "EX" + "".join(random.choices(chars, k=8))
+    return code
+
+
+def _new_exam_id() -> str:
+    """64 random bits (the former 32 collided at ~77 000 exams); ``String(30)`` holds the 21 characters."""
+    return f"EXAM_{uuid4().hex[:16]}"
+
+
+def _add_new_exam(db: Session, exam: GeneratedExam, *, attempts: int = 5) -> None:
+    """``db.add`` + ``flush`` of a brand-new exam; an id collision draws a new id instead of ending in a 500.
+
+    The flush runs in a SAVEPOINT so a lost draw does not poison the caller's transaction.
+    """
+    for attempt in range(attempts):
+        try:
+            with db.begin_nested():
+                db.add(exam)
+                db.flush()
+            return
+        except IntegrityError:
+            if attempt == attempts - 1:
+                raise
+            exam.id = _new_exam_id()
+
+
+def _binding_conflict(exc: IntegrityError, *, package_exists_message: bool = False) -> HTTPException:
+    """Which unique constraint was hit decides the message: a taken code or a twin request is not «the lesson already has an exam»."""
+    text = str(getattr(exc, "orig", exc)).lower()
+    if "access_code" in text:
+        return HTTPException(409, "Не удалось выдать код доступа к экзамену. Повторите попытку")
+    if package_exists_message and "exam_print_packages" in text:
+        return HTTPException(409, "Печатный комплект для этого экзамена уже подготовлен")
+    return HTTPException(409, "На это занятие уже назначен другой открытый экзамен")
 
 
 def _generate_session_token() -> str:
@@ -817,6 +859,31 @@ def _business_today() -> date:
 def _has_any_sessions(db: Session, exam_id: str) -> bool:
     """A started/waiting attempt makes the run historically immutable."""
     return db.query(ExamSession.id).filter(ExamSession.exam_id == exam_id).first() is not None
+
+
+def _lock_exam_for_transition(
+    db: Session,
+    exam: GeneratedExam,
+    allowed_statuses: set[str] | frozenset[str],
+    refusal: str,
+    *,
+    no_sessions_refusal: Optional[str] = None,
+) -> GeneratedExam:
+    """Take the exam's row lock and re-check the state the transition was decided on.
+
+    A status change is read -> (network) -> write.  Two requests (a double click) both passed the first read; the
+    row lock makes the second wait and then see the first one's result, so it answers 409 instead of repeating the
+    transition.  Call it AFTER the last network call (the bridge refuses to run over a row lock) and BEFORE the first
+    change.  Lock order everywhere: exam -> sessions.  ``populate_existing`` refreshes ``exam`` itself.
+    """
+    locked = _lock_exam_row(db, exam)
+    if locked.status not in allowed_statuses:
+        db.commit()  # let go of the lock at once
+        raise HTTPException(409, refusal)
+    if no_sessions_refusal and _has_any_sessions(db, locked.id):
+        db.commit()
+        raise HTTPException(409, no_sessions_refusal)
+    return locked
 
 
 def _require_print_delivery(exam: GeneratedExam) -> None:
@@ -1417,12 +1484,43 @@ async def _require_public_lobby_available(exam: GeneratedExam) -> None:
         raise HTTPException(409, "Экзамен станет доступен после начала урока преподавателем")
 
 
+def _count_answered(answers: Any) -> int:
+    """Answers the student really gave: a cleared field keeps its key in the map with an empty string."""
+    if not isinstance(answers, dict):
+        return 0
+    return sum(1 for value in answers.values() if value is not None and str(value).strip())
+
+
+class CodedHTTPException(HTTPException):
+    """An expected refusal that also carries a stable machine code (the body gets ``{"detail": text, "code": CODE}``).
+
+    ``detail`` stays a plain string, so every existing client keeps showing the server's text.
+    """
+
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        super().__init__(status_code, message)
+        self.code = code
+
+
+def _tokens_match(actual: str, supplied: str) -> bool:
+    """Constant-time token comparison that never raises on a header value.
+
+    ``secrets.compare_digest(str, str)`` raises ``TypeError`` for a non-ASCII string, and Starlette hands headers over
+    decoded as latin-1, so ``X-Exam-Session-Token: é`` used to end in a 500.  Comparing UTF-8 bytes keeps the
+    comparison constant-time and turns any such value into a plain mismatch (403 at the caller).
+    """
+    try:
+        return secrets.compare_digest(str(actual).encode("utf-8"), str(supplied).encode("utf-8"))
+    except (TypeError, ValueError, UnicodeError):
+        return False
+
+
 def _require_internal_service_token(token: Optional[str]) -> None:
     expected = get_settings().internal_service_token
     if not expected:
         log.critical("Internal lesson lifecycle call rejected: INTERNAL_SERVICE_TOKEN is not configured")
         raise HTTPException(503, "Внутренняя связка сервисов не настроена")
-    if not token or not secrets.compare_digest(token, expected):
+    if not token or not _tokens_match(token, expected):
         raise HTTPException(403, "Недействительный внутренний токен сервиса")
 
 
@@ -1595,7 +1693,7 @@ def _require_session_capability(session: ExamSession, session_token: Optional[st
     """Validate the attempt capability without leaking whether it exists."""
     if not session_token or not session.session_token:
         raise HTTPException(403, "Нет доступа к попытке экзамена")
-    if not secrets.compare_digest(session.session_token, session_token):
+    if not _tokens_match(session.session_token, session_token):
         raise HTTPException(403, "Нет доступа к попытке экзамена")
 
 
@@ -2258,7 +2356,7 @@ def generate_exam(
         )
 
     source = "topics" if req.skill_ids else "textbook"
-    exam_id = f"EXAM_{uuid4().hex[:8]}"
+    exam_id = _new_exam_id()
     skills_set = {t["skill_id"] for t in tasks if t["skill_id"]}
 
     group = _await(require_group_access(actor, req.group_id), db) if req.group_id else None
@@ -2308,10 +2406,10 @@ def generate_exam(
         settings["print_layout"] = build_default_print_layout(exam.variants or [])
         exam.settings = settings
 
-    db.add(exam)
     # The lifecycle history has a database foreign key to generated_exams.
     # Flush the parent first, while keeping both writes in one transaction.
-    db.flush()
+    _add_new_exam(db, exam)
+    exam_id = exam.id  # an id collision may have drawn a new one
     _record_exam_lifecycle_event(
         db,
         exam,
@@ -3120,7 +3218,7 @@ def clone_exam(
     if requested_title is not None and not requested_title:
         raise HTTPException(422, "Название экзамена не может состоять только из пробелов")
 
-    new_id = f"EXAM_{uuid4().hex[:8]}"
+    new_id = _new_exam_id()
     clone = GeneratedExam(
         id=new_id,
         title=requested_title or _next_clone_title(db, src, actor.org_id),
@@ -3152,11 +3250,11 @@ def clone_exam(
         source_exam_id=exam_id,   # track lineage
         is_pinned=False,
     )
-    db.add(clone)
     # ``exam_lifecycle_events.exam_id`` has a real foreign key in PostgreSQL.
     # Flush the new row before appending its first audit event; committing both
     # afterwards still keeps clone and history atomic as one transaction.
-    db.flush()
+    _add_new_exam(db, clone)
+    new_id = clone.id  # an id collision may have drawn a new one
     _record_exam_lifecycle_event(
         db,
         clone,
@@ -3247,6 +3345,18 @@ def assign_exam(
             lesson_date=req.lesson_date,
         ), db)
 
+    exam = _lock_exam_for_transition(
+        db,
+        exam,
+        {"draft", "variants_ready", "lobby"},
+        "Назначить или перенести можно только экзамен до его запуска",
+        no_sessions_refusal="Экзамен уже имеет попытки. Создайте копию (клон), чтобы провести для другой группы.",
+    )
+    previous_status = exam.status
+    previous_group_id = exam.group_id
+    previous_lesson_id = exam.scheduled_lesson_id
+    previous_lesson_date = exam.scheduled_lesson_date
+
     exam.group_id = str(group["id"])
     exam.group_name = group.get("name")
     exam.class_level = group.get("class_level")
@@ -3282,7 +3392,7 @@ def assign_exam(
         # A code is a public capability, not a permanent exam identifier.
         # Rotating it on a move prevents an old QR/link from opening the new
         # lesson's lobby by accident.
-        access_code = _generate_access_code() if is_rebinding else (exam.access_code or _generate_access_code())
+        access_code = _generate_access_code(db) if is_rebinding else (exam.access_code or _generate_access_code(db))
         exam.access_code = access_code
         exam.status = "lobby"
         _record_exam_lifecycle_event(
@@ -3325,7 +3435,7 @@ def assign_exam(
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(409, "На это занятие уже назначен другой открытый экзамен") from exc
+        raise _binding_conflict(exc) from exc
     db.refresh(exam)
 
     log.info("Exam %s assigned to group %s, publish=%s", exam_id, req.group_id, req.publish)
@@ -3380,6 +3490,13 @@ def publish_exam(
         lesson_id=req.lesson_id,
         lesson_date=req.lesson_date,
     )
+    exam = _lock_exam_for_transition(
+        db,
+        exam,
+        {"draft", "variants_ready", "lobby"},
+        "В лобби можно вывести только экзамен до его запуска",
+        no_sessions_refusal="Экзамен уже имеет попытки. Для нового урока создайте его копию",
+    )
     previous_status = exam.status
     previous_group_id = exam.group_id
     previous_lesson_id = exam.scheduled_lesson_id
@@ -3392,7 +3509,7 @@ def publish_exam(
             or previous_lesson_date != req.lesson_date
         )
     )
-    code = _generate_access_code() if is_rebinding else (exam.access_code or _generate_access_code())
+    code = _generate_access_code(db) if is_rebinding else (exam.access_code or _generate_access_code(db))
     if req.subject:
         exam.subject = req.subject
     exam.group_id = str(group["id"])
@@ -3428,7 +3545,7 @@ def publish_exam(
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(409, "На это занятие уже назначен другой открытый экзамен") from exc
+        raise _binding_conflict(exc) from exc
     db.refresh(exam)
 
     return PublishExamResponse(
@@ -3486,6 +3603,17 @@ def open_exam_lobby(
         lesson_id=req.lesson_id,
         lesson_date=req.lesson_date,
     )
+    exam = _lock_exam_for_transition(
+        db,
+        exam,
+        {"draft", "variants_ready", "lobby"},
+        "Открыть лобби можно только до начала экзамена",
+        no_sessions_refusal="В лобби уже есть участники. Для другого занятия создайте копию экзамена",
+    )
+    previous_status = exam.status
+    previous_group_id = exam.group_id
+    previous_lesson_id = exam.scheduled_lesson_id
+    previous_lesson_date = exam.scheduled_lesson_date
     exam.group_id = str(group["id"])
     exam.group_name = group.get("name")
     exam.class_level = group.get("class_level")
@@ -3501,7 +3629,7 @@ def open_exam_lobby(
         )
     )
     if is_rebinding or not exam.access_code:
-        exam.access_code = _generate_access_code()
+        exam.access_code = _generate_access_code(db)
     exam.status = "lobby"
     _record_exam_lifecycle_event(
         db,
@@ -3526,7 +3654,7 @@ def open_exam_lobby(
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(409, "На это занятие уже назначен другой открытый экзамен") from exc
+        raise _binding_conflict(exc) from exc
     db.refresh(exam)
     return {
         "status": "lobby",
@@ -3652,6 +3780,7 @@ def start_exam_live(
     if exam.status != "lobby":
         raise HTTPException(409, "Начать можно только экзамен, открытый в лобби")
     _await(_require_lesson_in_progress(_exam_view(exam), actor), db)
+    exam = _lock_exam_for_transition(db, exam, {"lobby"}, "Экзамен уже запущен или больше не находится в лобби")
     exam.status = "active"
     sessions = SessionRepository(db).list_by_exam(exam_id)
     started_count = 0
@@ -3720,7 +3849,7 @@ def get_exam_lobby_status(
             "student_name": s.student_name,
             "status": s.status,
             "variant_number": s.variant_number,
-            "answered_count": len(s.answers or {}),
+            "answered_count": _count_answered(s.answers),
             "total_tasks": s.total_tasks or exam.tasks_per_variant,
             "score": s.score,
             "max_score": s.max_score,
@@ -3787,31 +3916,91 @@ def kick_student_session(
     return {"ok": True, "kicked_session_id": session_id}
 
 
+def _exam_has_results(db: Session, exam_id: str) -> bool:
+    """Has any student worked in this exam?  A started or graded attempt is a result; a lobby entrant (``waiting``) is not."""
+    return (
+        db.query(ExamSession.id)
+        .filter(ExamSession.exam_id == exam_id, ExamSession.status != "waiting")
+        .first()
+        is not None
+    )
+
+
+def _lock_exam_row(db: Session, exam: GeneratedExam) -> GeneratedExam:
+    """Re-read the exam under its row lock (``None`` -> 404: a twin request deleted it while this one waited)."""
+    locked = (
+        db.query(GeneratedExam)
+        .filter(GeneratedExam.id == exam.id)
+        .with_for_update()
+        .populate_existing()
+        .first()
+    )
+    if locked is None:
+        raise HTTPException(404, "Экзамен не найден")
+    return locked
+
+
 @router.delete("/exams/{exam_id}", summary="Удалить экзамен (в архив или навсегда)")
 def delete_exam(
     exam_id: str,
     permanent: bool = False,
+    reason: Optional[str] = Query(None, max_length=500),
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
+    """Archive an exam, or delete an ARCHIVED exam without results for good.
+
+    * ``permanent=false`` archives (draft / variants_ready / closed).  An exam that is already archived stays archived
+      and answers 200 again: a double click must never turn the second «archive» into a deletion.
+    * ``permanent=true`` is allowed only for an archived exam that has no student results; otherwise 409
+      (``EXAM_HAS_RESULTS`` / ``EXAM_NOT_ARCHIVED``).  Every permanent deletion leaves one ``exam_deletions`` row.
+    """
     repo = ExamRepository(db)
     exam = _get_exam_for_teacher_operator(db, exam_id, actor)
+    exam = _lock_exam_row(db, exam)
     if exam.status in ("active", "lobby", "print_ready"):
+        db.commit()  # nothing changed: release the row lock
         raise HTTPException(409, "Сначала завершите экзамен, затем его можно архивировать")
-    if permanent or exam.status == "archived":
-        repo.delete(exam)
-        return {"ok": True, "action": "deleted_permanently", "id": exam_id}
-    else:
-        exam.status = "archived"
-        exam.is_pinned = False
-        _record_exam_lifecycle_event(
-            db,
-            exam,
-            {"type": "exam_archived", "group_id": exam.group_id, "group_name": exam.group_name},
-            actor_id=actor.user_id,
+    if permanent:
+        if _exam_has_results(db, exam.id):
+            db.commit()  # nothing changed: release the row lock
+            raise CodedHTTPException(
+                409,
+                "EXAM_HAS_RESULTS",
+                "У экзамена есть результаты учеников — его можно только отправить в архив",
+            )
+        if exam.status != "archived":
+            db.commit()  # nothing changed: release the row lock
+            raise CodedHTTPException(
+                409,
+                "EXAM_NOT_ARCHIVED",
+                "Сначала отправьте экзамен в архив: окончательно удалить можно только архивный экзамен",
+            )
+        db.add(
+            ExamDeletion(
+                id=str(uuid4()),
+                exam_id=exam.id,
+                org_id=str(exam.org_id) if exam.org_id else None,
+                title=exam.title,
+                deleted_by=actor.user_id,
+                reason=(reason or "").strip()[:500] or "Удалён навсегда из архива",
+            )
         )
-        db.commit()
-        return {"ok": True, "action": "archived", "id": exam_id}
+        repo.delete(exam)  # the trace row and the removal are ONE commit
+        return {"ok": True, "action": "deleted_permanently", "id": exam_id}
+    if exam.status == "archived":
+        db.commit()  # nothing changed: release the row lock
+        return {"ok": True, "action": "archived", "id": exam_id, "already_archived": True}
+    exam.status = "archived"
+    exam.is_pinned = False
+    _record_exam_lifecycle_event(
+        db,
+        exam,
+        {"type": "exam_archived", "group_id": exam.group_id, "group_name": exam.group_name},
+        actor_id=actor.user_id,
+    )
+    db.commit()
+    return {"ok": True, "action": "archived", "id": exam_id}
 
 
 @router.post("/exams/{exam_id}/restore", summary="Восстановить экзамен из архива")
@@ -3820,13 +4009,27 @@ def restore_exam(
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    repo = ExamRepository(db)
+    """Bring an ARCHIVED exam back to a state it can be continued from; any other exam is a 409.
+
+    * an exam that was held (graded sessions, or a completed print package) returns as ``closed``;
+    * anything else returns as an editable draft with no leftover lobby code or lesson binding.
+    """
     exam = _get_exam_for_teacher_operator(db, exam_id, actor)
-    if not exam.group_id:
-        exam.status = "variants_ready" if (exam.variants and len(exam.variants) > 0) else "draft"
+    exam = _lock_exam_row(db, exam)
+    if exam.status != "archived":
+        db.commit()  # nothing changed: release the row lock
+        raise CodedHTTPException(409, "EXAM_NOT_ARCHIVED", "Восстановить можно только экзамен из архива")
+    held = False
+    if exam.delivery_mode == "print":
+        package = db.query(ExamPrintPackage).filter(ExamPrintPackage.exam_id == exam.id).first()
+        held = bool(package and package.status == "completed")
+    elif exam.group_id:
+        held = _has_any_sessions(db, exam.id)
+    if held:
+        exam.status = "closed"
     else:
-        sessions = SessionRepository(db).list_by_exam(exam_id)
-        exam.status = "closed" if sessions else "draft"
+        # the same reset a cancelled lobby gets: draft/variants_ready, no access code, no lesson occurrence
+        _reset_lobby_to_draft(db, exam)
     _record_exam_lifecycle_event(
         db,
         exam,
@@ -3991,6 +4194,16 @@ def prepare_print_package(
         raise HTTPException(422, str(exc)) from exc
     snapshot = _await(_embed_print_figures(snapshot), db)  # nothing is written yet: the bridge ends the read transaction
 
+    exam = _lock_exam_for_transition(
+        db,
+        exam,
+        {"draft", "variants_ready"},
+        "Печатный комплект можно подготовить только из черновика",
+        no_sessions_refusal="Экзамен уже имеет попытки. Для нового проведения создайте копию",
+    )
+    if db.query(ExamPrintPackage.id).filter(ExamPrintPackage.exam_id == exam.id).first():
+        db.commit()
+        raise HTTPException(409, "Печатный комплект уже был создан. Для нового занятия создайте копию экзамена")
     exam.group_id = str(canonical_group["id"])
     exam.group_name = canonical_group.get("name")
     exam.class_level = canonical_group.get("class_level")
@@ -4034,7 +4247,7 @@ def prepare_print_package(
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(409, "На это занятие уже назначен другой открытый экзамен") from exc
+        raise _binding_conflict(exc, package_exists_message=True) from exc
     db.refresh(package)
     return {
         "exam_id": exam.id,
@@ -4065,6 +4278,11 @@ def start_print_exam(
     if package.status != "ready":
         raise HTTPException(409, "Печатный комплект недоступен для проведения")
     _await(_require_lesson_in_progress(_exam_view(exam), actor), db)
+    exam = _lock_exam_for_transition(db, exam, {"print_ready"}, "Печатный экзамен уже начат или больше не готов к началу")
+    package = _get_print_package_or_404(db, exam.id)
+    if package.status != "ready":
+        db.commit()
+        raise HTTPException(409, "Печатный комплект недоступен для проведения")
 
     exam.status = "active"
     settings = deepcopy(exam.settings or {})
@@ -4110,6 +4328,18 @@ def _pdf_response(content: bytes, filename: str, *, download: bool) -> Response:
     )
 
 
+def _require_snapshot_variant(snapshot: dict[str, Any], variant_number: int) -> None:
+    """A PDF of a variant that does not exist is a plain 404, decided before any rendering work starts."""
+    numbers = set()
+    for variant in (snapshot or {}).get("variants") or []:
+        try:
+            numbers.add(int(variant.get("variant_number", 0)))
+        except (AttributeError, TypeError, ValueError):
+            continue
+    if variant_number not in numbers:
+        raise HTTPException(404, f"Вариант №{variant_number} в этом экзамене не найден")
+
+
 def _pdf_download_response(content: bytes, filename: str) -> Response:
     return _pdf_response(content, filename, download=True)
 
@@ -4140,6 +4370,7 @@ def preview_print_pdf(
         raise HTTPException(409, "Печатный комплект уже зафиксирован. Скачайте его из карточки экзамена")
 
     snapshot = _build_print_preview_snapshot(exam)
+    _require_snapshot_variant(snapshot, variant_number)
     snapshot = _await(_embed_print_figures(snapshot), db)  # ends the read transaction before the figures are fetched
     try:
         pdf = (
@@ -4172,6 +4403,7 @@ def download_print_student_pdf(
     if package.status not in {"ready", "released", "completed"}:
         raise HTTPException(410, "Печатный комплект отменён и больше не доступен")
     snapshot, package_id = package.snapshot, package.id
+    _require_snapshot_variant(snapshot, variant_number)
     _release_read_transaction(db)  # the rendering below (chromium) takes seconds: no «idle in transaction» meanwhile
     try:
         pdf = render_student_exam_pdf(snapshot, variant_number)
@@ -4196,6 +4428,7 @@ def download_print_teacher_key_pdf(
     if package.status not in {"ready", "released", "completed"}:
         raise HTTPException(410, "Печатный комплект отменён и больше не доступен")
     snapshot, package_id = package.snapshot, package.id
+    _require_snapshot_variant(snapshot, variant_number)
     _release_read_transaction(db)  # the rendering below (chromium) takes seconds: no «idle in transaction» meanwhile
     try:
         pdf = render_teacher_key_pdf(snapshot, variant_number)
@@ -4345,6 +4578,13 @@ def replace_task(
         if not new_task_raw:
             raise HTTPException(404, "Выбранная задача не найдена в базе")
         new_task = _normalize_content_task(new_task_raw)
+        # The same task twice in one variant is silently mis-graded (verdicts are keyed by task_id, the maximum
+        # counts both) and breaks the print layout: refuse it.  Replacing a task by itself is a harmless no-op.
+        other_ids = {
+            str(t.get("task_id")) for t in variant.get("tasks", []) if t.get("task_id") != target_old_id
+        }
+        if {str(req.new_task_id), str(new_task.get("task_id"))} & other_ids:
+            raise HTTPException(409, "Эта задача уже есть в варианте. Выберите другую для замены")
     else:
         used_ids = [t.get("task_id") for t in variant.get("tasks", [])]
         skill_ids = [old_task["skill_id"]] if old_task.get("skill_id") else []
@@ -4358,8 +4598,8 @@ def replace_task(
             alternatives = task_repo.get_tasks_by_toc_ids([old_task["toc_id"]], old_task.get("difficulty"), 1, used_ids)
         if not alternatives and old_task.get("toc_id"):
             alternatives = task_repo.get_tasks_by_toc_ids([old_task["toc_id"]], None, 1, used_ids)
-        if not alternatives and exam.toc_ids:
-            alternatives = task_repo.get_tasks_by_toc_ids(exam.toc_ids, None, 1, used_ids)
+        if not alternatives and exam.toc_ids_used:
+            alternatives = task_repo.get_tasks_by_toc_ids(list(exam.toc_ids_used), None, 1, used_ids)
         if not alternatives:
             raise HTTPException(400, "Нет доступных задач для замены")
         new_task = _normalize_content_task(alternatives[0])
@@ -5155,7 +5395,7 @@ def save_exam_progress(
         )
 
     db.commit()
-    return {"ok": True, "answered_count": len(curr_answers)}
+    return {"ok": True, "answered_count": _count_answered(curr_answers)}
 
 
 def _stored_submit_result(session: ExamSession) -> SubmitExamResponse:
@@ -5166,7 +5406,7 @@ def _stored_submit_result(session: ExamSession) -> SubmitExamResponse:
         session_id=session.id,
         score=score,
         max_score=max_score,
-        answered_count=len(session.answers or {}),
+        answered_count=_count_answered(session.answers),
         correct_count=session.correct_count or 0,
         total_tasks=session.total_tasks or 0,
         percentage=round(score / max_score * 100, 1) if max_score else 0.0,
@@ -5212,15 +5452,18 @@ def submit_exam(
         if started_at else 0
     )
 
+    # Answers autosaved by ``progress`` that the request body does not repeat (a second tab/device, a stale client)
+    # are kept; the body wins where it speaks, exactly as ``progress`` merges.
+    merged_answers = {**(session.answers or {}), **(req.answers or {})}
     res = _grade_and_submit_session(
-        db, session, exam, req.answers, server_time_spent
+        db, session, exam, merged_answers, server_time_spent
     )
 
     return SubmitExamResponse(
         session_id=session_id,
         score=res["score"],
         max_score=res["max_score"],
-        answered_count=len(req.answers),
+        answered_count=_count_answered(merged_answers),
         correct_count=res["correct_count"],
         total_tasks=res["total_tasks"],
         percentage=res["percentage"],
@@ -5313,7 +5556,7 @@ def get_results(
         variant_number=session.variant_number,
         score=session.score,
         max_score=max_score,
-        answered_count=len(session.answers or {}),
+        answered_count=_count_answered(session.answers),
         correct_count=session.correct_count,
         total_tasks=session.total_tasks,
         percentage=round(session.score / max_score * 100, 1) if max_score else 0.0,

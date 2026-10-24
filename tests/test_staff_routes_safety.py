@@ -447,7 +447,7 @@ def test_the_print_pdf_is_rendered_with_no_transaction_open(client, db, monkeypa
     exam.delivery_mode = "print"
     db.commit()
     db.add(ExamPrintPackage(
-        id="PKG_1", exam_id=exam.id, org_id=TEST_ORG_ID, version=1, status="ready", snapshot={"variants": []},
+        id="PKG_1", exam_id=exam.id, org_id=TEST_ORG_ID, version=1, status="ready", snapshot={"variants": [{"variant_number": 1, "tasks": []}]},
         snapshot_sha256="0" * 64, created_by=TEST_USER_ID,
     ))
     db.commit()

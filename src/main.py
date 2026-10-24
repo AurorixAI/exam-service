@@ -21,7 +21,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from src.core.config import get_settings
 from src.core.exceptions import ExamServiceError
 from src.core.middleware import RequestIDMiddleware, configure_logging
-from src.api.router import _check_and_auto_close_exam, router
+from src.api.router import CodedHTTPException, _check_and_auto_close_exam, router
 from src.core.database import SessionLocal, transient_db_failure
 from src.core.db_timezone import utc_connect_args, verify_database_timezone
 from src.models.exam_models import GeneratedExam
@@ -78,8 +78,17 @@ def _close_expired_exams_once() -> None:
             .filter(GeneratedExam.status == "active")
             .all()
         )
-        for exam in active_exams:
-            _check_and_auto_close_exam(db, exam)
+        # The ids are read first: after a failed exam's rollback every loaded row is expired, and one «poisoned» exam
+        # (e.g. a print exam without its package) must neither stop the others from closing nor undo them.
+        exam_ids = [exam.id for exam in active_exams]
+        for exam_id in exam_ids:
+            try:
+                exam = db.get(GeneratedExam, exam_id)
+                if exam is not None:
+                    _check_and_auto_close_exam(db, exam)
+            except Exception:
+                db.rollback()
+                log.exception("Unable to auto-close exam %s; the sweep continues with the others", exam_id)
     except Exception:
         db.rollback()
         log.exception("Unable to sweep expired exams")
@@ -147,6 +156,10 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.exception_handler(CodedHTTPException)
+    async def coded_http_error_handler(req: Request, exc: CodedHTTPException):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail, "code": exc.code})
 
     @app.exception_handler(ExamServiceError)
     async def exam_error_handler(req: Request, exc: ExamServiceError):
