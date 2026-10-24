@@ -184,6 +184,30 @@ class ExamPrintPackage(Base):
     )
 
 
+class ExamDeletion(Base):
+    """Trace of a permanently deleted exam.
+
+    Deliberately WITHOUT a foreign key to ``generated_exams``: the row has to outlive the exam it describes (the
+    exam, its sessions and its lifecycle history are gone).  Only a title, who and when are kept - never tasks,
+    answers or a student capability.
+    """
+
+    __tablename__ = "exam_deletions"
+
+    id = Column(String(36), primary_key=True)
+    exam_id = Column(String(30), nullable=False)
+    org_id = Column(String(36), nullable=True)
+    title = Column(String(300), nullable=True)
+    deleted_by = Column(String(100), nullable=True)
+    deleted_at = Column(DateTime, nullable=False, server_default=func.now())
+    reason = Column(String(500), nullable=True)
+
+    __table_args__ = (
+        Index("idx_exam_deletions_org_time", "org_id", "deleted_at"),
+        Index("idx_exam_deletions_exam", "exam_id"),
+    )
+
+
 class ExamReport(Base):
     """
     On-demand LLM narrative report for a whole exam (one per exam).
