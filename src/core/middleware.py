@@ -21,11 +21,11 @@ from starlette.responses import Response
 # Request-ID middleware
 # ---------------------------------------------------------------------------
 
-_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 def sanitize_request_id(value: str | None) -> str:
-    """The caller's X-Request-ID when it is a plain token (letters, digits, dashes, 8-64 chars), else a fresh UUID.
+    """The caller's X-Request-ID when it is a plain token (letters, digits, dot, underscore, dash; 1-64 chars), else a fresh UUID.
     Whatever a client typed must never reach the log or the response header as it is (line breaks, JSON, ANSI)."""
     if value and _REQUEST_ID_RE.fullmatch(value):
         return value

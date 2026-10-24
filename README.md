@@ -32,7 +32,7 @@
 ## Как запустить
 
 ```bash
-cp .env.example .env   # заполнить DATABASE_URL, REDIS_URL, GEMINI_API_KEY
+cp .env.example .env   # заполнить DATABASE_URL, REDIS_URL, GEMINI_API_KEY и INTERNAL_SERVICE_TOKEN (любая длинная случайная строка; без неё `docker compose up` сразу остановится с понятной ошибкой)
 docker compose up -d --build
 
 # Миграции
