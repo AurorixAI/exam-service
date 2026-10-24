@@ -14,7 +14,7 @@ services:
       REDIS_URL: redis://algo-redis-exam:6379
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       REPORT_NARRATIVE_ENABLED: ${REPORT_NARRATIVE_ENABLED:-true}
-      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-local-internal-service-token-change-in-production}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?set INTERNAL_SERVICE_TOKEN in .env (any long random string for local work)}
     depends_on:
       postgres:
         condition: service_healthy

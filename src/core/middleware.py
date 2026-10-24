@@ -7,6 +7,7 @@ Exam Service — Shared middleware.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import uuid
 
@@ -20,11 +21,22 @@ from starlette.responses import Response
 # Request-ID middleware
 # ---------------------------------------------------------------------------
 
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+
+
+def sanitize_request_id(value: str | None) -> str:
+    """The caller's X-Request-ID when it is a plain token (letters, digits, dashes, 8-64 chars), else a fresh UUID.
+    Whatever a client typed must never reach the log or the response header as it is (line breaks, JSON, ANSI)."""
+    if value and _REQUEST_ID_RE.fullmatch(value):
+        return value
+    return str(uuid.uuid4())
+
+
 class RequestIDMiddleware(BaseHTTPMiddleware):
-    """Propagate or generate X-Request-ID and bind it to structlog context."""
+    """Propagate (a valid one) or generate X-Request-ID and bind it to structlog context."""
 
     async def dispatch(self, request: Request, call_next) -> Response:
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request_id = sanitize_request_id(request.headers.get("X-Request-ID"))
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(request_id=request_id)
         response = await call_next(request)

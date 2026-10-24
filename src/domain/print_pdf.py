@@ -398,6 +398,18 @@ def _crop_transparent_math_png(png: bytes) -> bytes:
         return png
 
 
+# What a helper process (node for KaTeX, Chromium for the raster) may see of our environment: the way to find
+# programs, a home, a locale and a temp dir.  NOT the database URL, the model keys or INTERNAL_SERVICE_TOKEN.
+_CHILD_ENV_KEYS = (
+    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT",
+    "NODE_PATH", "FONTCONFIG_PATH", "FONTCONFIG_FILE", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR",
+)
+
+
+def _child_process_env() -> dict[str, str]:
+    return {key: os.environ[key] for key in _CHILD_ENV_KEYS if key in os.environ}
+
+
 def _render_katex_artifacts(
     requests: list[tuple[str, float, str]],
 ) -> dict[tuple[str, float, str], _MathArtifact]:
@@ -423,10 +435,7 @@ def _render_katex_artifacts(
     try:
         with tempfile.TemporaryDirectory(prefix="algo-katex-") as temp_dir:
             temporary = Path(temp_dir)
-            environment = {
-                **os.environ,
-                "KATEX_CSS_PATH": str(stylesheet),
-            }
+            environment = {**_child_process_env(), "KATEX_CSS_PATH": str(stylesheet)}
             for batch_index in range(0, len(unique_requests), _KATEX_BATCH_SIZE):
                 batch = unique_requests[batch_index:batch_index + _KATEX_BATCH_SIZE]
                 html = subprocess.run(
@@ -472,6 +481,7 @@ def _render_katex_artifacts(
                     capture_output=True,
                     check=True,
                     timeout=20,
+                    env=_child_process_env(),
                 )
                 from PIL import Image as PillowImage
 
