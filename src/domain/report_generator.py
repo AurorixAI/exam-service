@@ -13,6 +13,8 @@ import json
 import logging
 import random
 import string
+import threading
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -20,7 +22,7 @@ from sqlalchemy.orm import Session
 from src.domain.grading import check_task_answer, regrade_if_stale, stored_verdicts
 from src.domain.distractor_utils import resolve_analytics_explanation
 from src.domain.task_display import bind_report_task_statements, question_display_fields
-from src.domain.gemini_client import call_gemini, parse_json_response
+from src.domain.gemini_client import call_gemini, narrative_enabled, parse_json_response
 from src.models import ExamSession, GeneratedExam
 from src.repositories.exam_repo import ExamReportRepository
 
@@ -511,6 +513,65 @@ def _build_deterministic_fallback(
 
 # ── Main Entry Point ──────────────────────────────────────────────────────────
 
+# EX-40: a forced regeneration is a paid model call started by a button.  One per exam per this window.
+FORCE_COOLDOWN = timedelta(minutes=10)
+# The aggregate is rounded to 0.1 and the stored column to 0.01: anything below this is not a change.
+_SAME_NUMBER_EPS = 0.06
+
+
+class ReportCooldownError(Exception):
+    """``force=true`` again within FORCE_COOLDOWN of the last generation (409 + Retry-After)."""
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__(f"report regeneration cooldown, {retry_after} s left")
+        self.retry_after = max(int(retry_after), 1)
+
+
+class ReportInProgressError(Exception):
+    """The same exam's report is being generated right now by this worker (409)."""
+
+
+_in_flight: set = set()
+_in_flight_lock = threading.Lock()
+
+
+def _utcnow() -> datetime:
+    """Naive UTC, like the DateTime columns (the connection runs in UTC - see db_timezone)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _naive_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _last_generated_at(report: Any) -> Optional[datetime]:
+    """When the cached report was last (re)written: ``updated_at`` moves on every overwrite, ``generated_at`` does not."""
+    return _naive_utc(getattr(report, "updated_at", None) or getattr(report, "generated_at", None))
+
+
+def _has_new_graded_work(report: Any, agg: Dict[str, Any], submitted_at: List[Optional[datetime]]) -> bool:
+    """Is there anything the cached report does not know about?
+
+    A new submission (count or ``submitted_at`` after the report), or a re-grade that moved the class numbers.
+    """
+    if int(report.submitted_count or 0) != int(agg["submitted_count"]):
+        return True
+    written = _last_generated_at(report)
+    for at in submitted_at:
+        at = _naive_utc(at)
+        if at is not None and written is not None and at > written:
+            return True
+    if abs(float(report.avg_score_pct or 0) - float(agg["avg_score_pct"])) > _SAME_NUMBER_EPS:
+        return True
+    if abs(float(report.pass_rate_pct or 0) - float(agg["pass_rate_pct"])) > _SAME_NUMBER_EPS:
+        return True
+    return False
+
+
 def generate_exam_report(
     db: Session,
     *,
@@ -520,15 +581,30 @@ def generate_exam_report(
 ) -> Optional[Any]:
     """
     Aggregate sessions, call Azure DeepSeek (or Gemini fallback), upsert ExamReport.
+
+    ``force=True`` is a paid call started by a button, so (EX-40) it is rate limited per exam:
+      * within FORCE_COOLDOWN of the last generation -> ``ReportCooldownError`` (no model call);
+      * no new graded work since the cached report -> the cache is returned (no model call);
+        exception: a cached report that never got an AI narrative (switch was off / the model failed) may retry;
+      * the claim of the slot is atomic in the database, so two workers cannot both pay for the same window.
+    REPORT_NARRATIVE_ENABLED=false skips the model entirely: the deterministic report is stored with
+    ``narrative_generated=False`` (EX-24: the flag says whether a model really wrote the text).
     """
     repo = ExamReportRepository(db)
     exam_id, exam_title = exam.id, exam.title
 
-    if not force:
-        existing = repo.get_by_exam(exam_id)
-        if existing:
-            log.info("ExamReport already exists for exam %s — returning cached", exam_id)
-            return existing
+    existing = repo.get_by_exam(exam_id)
+    if existing and not force:
+        log.info("ExamReport already exists for exam %s — returning cached", exam_id)
+        return existing
+
+    if force and existing:
+        written = _last_generated_at(existing)
+        if written is not None:
+            left = (written + FORCE_COOLDOWN) - _utcnow()
+            if left.total_seconds() > 0:
+                log.info("Report force for exam %s refused: cooldown, %d s left", exam_id, int(left.total_seconds()))
+                raise ReportCooldownError(int(left.total_seconds()) + 1)
 
     agg = _aggregate(exam, sessions)
 
@@ -538,32 +614,92 @@ def generate_exam_report(
 
     submitted = [s for s in sessions if s.status == "submitted"]
     grade = next((s.class_level for s in submitted if s.class_level), None)
-
-    # The aggregates are plain dicts now.  End the read transaction BEFORE the model is called: the call takes up to
-    # 120 s (and the server kills a transaction that idles for 30 s - ROADMAP #95 R3: the report was lost and the
-    # teacher was told «no submitted works»).  Nothing below reads the ORM objects again.
+    submitted_at = [s.submitted_at for s in submitted]
+    use_model = narrative_enabled()
+    # The aggregates are plain values now.  End the read transaction (and persist a re-grade the aggregation made)
+    # BEFORE anything waits: a refusal below must not leave pending changes on the session, and the model call takes
+    # up to 100 s (the server kills a transaction that idles for 30 s - ROADMAP #95 R3).  Nothing below reads the
+    # ORM session objects again.
     db.commit()
 
+    if force and existing and not _has_new_graded_work(existing, agg, submitted_at):
+        # Nothing to say that the cache does not already say.  Retrying the model is only worth it when the cache
+        # holds no model text at all and the model is allowed.
+        if existing.narrative_generated or not use_model:
+            log.info("Report force for exam %s: no new graded work — cache returned, 0 paid calls", exam_id)
+            status = db.query(GeneratedExam.status).filter(GeneratedExam.id == exam_id).scalar()
+            if status in ("closed", "archived") and not existing.is_final:
+                existing.is_final = True
+            db.commit()
+            return existing
+
+    # Claim the slot before paying.  In-process guard against a double click on the same worker...
+    with _in_flight_lock:
+        if exam_id in _in_flight:
+            raise ReportInProgressError(exam_id)
+        _in_flight.add(exam_id)
+    try:
+        if force and existing:
+            # ...and an atomic compare-and-set in the database against the other workers: only the request that moves
+            # ``updated_at`` out of the cooldown window proceeds.
+            threshold = _utcnow() - FORCE_COOLDOWN
+            claimed = (
+                db.query(type(existing))
+                .filter(type(existing).id == existing.id, type(existing).updated_at <= threshold)
+                .update({"updated_at": _utcnow()}, synchronize_session=False)
+            )
+            db.commit()
+            if not claimed:
+                db.expire_all()
+                fresh = repo.get_by_exam(exam_id)
+                left = (_last_generated_at(fresh) + FORCE_COOLDOWN - _utcnow()).total_seconds() if fresh else 60
+                raise ReportCooldownError(int(max(left, 1)) + 1)
+        return _generate_and_store(
+            db, repo=repo, exam_id=exam_id, exam_title=exam_title, grade=grade, agg=agg, use_model=use_model,
+        )
+    finally:
+        with _in_flight_lock:
+            _in_flight.discard(exam_id)
+
+
+def _generate_and_store(
+    db: Session,
+    *,
+    repo: ExamReportRepository,
+    exam_id: str,
+    exam_title: str,
+    grade: Optional[int],
+    agg: Dict[str, Any],
+    use_model: bool,
+) -> Any:
+    # The read transaction is already closed (see generate_exam_report): the model is called with no transaction open.
     # AI narrative JSON generation (no transaction, no connection held)
     report_dict: Optional[Dict[str, Any]] = None
-    try:
-        prompt = _build_deepseek_prompt(exam_title, grade, agg)
-
-        raw_response = call_gemini(
-            prompt,
-            temperature=0.3,
-            max_tokens=8000,
-            json_mode=True,
-        )
-        report_dict = parse_json_response(raw_response)
-        if not report_dict or not report_dict.get("summary"):
-            log.warning("DeepSeek output invalid JSON; using deterministic fallback")
-            report_dict = _build_deterministic_fallback(exam_title, grade, agg)
-        else:
-            log.info("DeepSeek report successfully generated for exam %s", exam_id)
-    except Exception as exc:
-        log.warning("AI generation failed for exam %s: %s — using deterministic fallback", exam_id, exc)
+    used_llm = False
+    if not use_model:
+        log.info("Narrative for exam %s skipped (REPORT_NARRATIVE_ENABLED is off): 0 paid calls", exam_id)
         report_dict = _build_deterministic_fallback(exam_title, grade, agg)
+    else:
+        try:
+            prompt = _build_deepseek_prompt(exam_title, grade, agg)
+
+            raw_response = call_gemini(
+                prompt,
+                temperature=0.3,
+                max_tokens=8000,
+                json_mode=True,
+                purpose="report_narrative",
+            )
+            report_dict = parse_json_response(raw_response)
+            if not report_dict or not report_dict.get("summary"):
+                log.warning("DeepSeek output invalid JSON; using deterministic fallback")
+                report_dict = _build_deterministic_fallback(exam_title, grade, agg)
+            else:
+                used_llm = True
+                log.info("DeepSeek report successfully generated for exam %s", exam_id)
+        except Exception as exc:
+            log.warning("AI generation failed for exam %s: %s — using deterministic fallback", exam_id, exc)
+            report_dict = _build_deterministic_fallback(exam_title, grade, agg)
 
     report_dict = bind_report_task_statements(report_dict, agg["task_analytics"])
     narrative_json_str = json.dumps(report_dict, ensure_ascii=False)
@@ -584,12 +720,12 @@ def generate_exam_report(
             task_analytics=agg["task_analytics"],
             top_errors=agg["top_errors"],
             narrative_ru=narrative_json_str,
-            narrative_generated=True,
+            narrative_generated=used_llm,
             is_final=is_final,
         )
         log.info(
-            "ExamReport saved for exam %s (submitted=%d, narrative=yes, final=%s)",
-            exam_id, agg["submitted_count"], is_final,
+            "ExamReport saved for exam %s (submitted=%d, narrative=%s, final=%s)",
+            exam_id, agg["submitted_count"], "ai" if used_llm else "deterministic", is_final,
         )
         return report
     except Exception as exc:

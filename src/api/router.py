@@ -6121,9 +6121,15 @@ def generate_exam_report_endpoint(
     """
     Генерирует нарратив с помощью Gemini на основе агрегированной аналитики.
     Идемпотентен: повторный вызов вернёт кешированный отчёт (если force=false).
-    Параметр ?force=true перезапишет существующий отчёт.
+    Параметр ?force=true перезапишет существующий отчёт, но не чаще раза в 10 минут на экзамен (409 + Retry-After),
+    и без платного вызова, если новых сданных работ с прошлой генерации нет.
+    Аварийный выключатель REPORT_NARRATIVE_ENABLED=false: отчёт строится детерминированно, 0 платных вызовов.
     """
-    from src.domain.report_generator import generate_exam_report
+    from src.domain.report_generator import (
+        ReportCooldownError,
+        ReportInProgressError,
+        generate_exam_report,
+    )
 
     exam = _get_exam_for_teacher_operator(db, exam_id, actor)
 
@@ -6131,7 +6137,24 @@ def generate_exam_report_endpoint(
         db.query(ExamSession).filter(ExamSession.exam_id == exam_id).all()
     )
 
-    report = generate_exam_report(db, exam=exam, sessions=sessions, force=force)
+    try:
+        report = generate_exam_report(db, exam=exam, sessions=sessions, force=force)
+    except ReportCooldownError as exc:
+        minutes = max(1, -(-exc.retry_after // 60))
+        raise CodedHTTPException(
+            409,
+            "REPORT_COOLDOWN",
+            f"Отчёт по этому экзамену уже обновлялся совсем недавно. Повторное обновление будет доступно "
+            f"примерно через {minutes} мин. Текущий отчёт можно открыть без повторного формирования.",
+            headers={"Retry-After": str(exc.retry_after)},
+        )
+    except ReportInProgressError:
+        raise CodedHTTPException(
+            409,
+            "REPORT_IN_PROGRESS",
+            "Отчёт по этому экзамену уже формируется. Подождите около минуты и обновите страницу.",
+            headers={"Retry-After": "15"},
+        )
     if report is None:
         raise HTTPException(422, "Нет сданных работ — отчёт не может быть сформирован")
 
