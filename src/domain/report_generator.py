@@ -17,13 +17,14 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.domain.grading import check_task_answer, regrade_if_stale, stored_verdicts
 from src.domain.distractor_utils import resolve_analytics_explanation
 from src.domain.task_display import bind_report_task_statements, question_display_fields
 from src.domain.gemini_client import call_gemini, narrative_enabled, parse_json_response
-from src.models import ExamSession, GeneratedExam
+from src.models import ExamReport, ExamSession, GeneratedExam
 from src.repositories.exam_repo import ExamReportRepository
 
 log = logging.getLogger(__name__)
@@ -597,6 +598,9 @@ def generate_exam_report(
     if existing and not force:
         log.info("ExamReport already exists for exam %s — returning cached", exam_id)
         return existing
+    # What a failed forced attempt must put back (the teacher is not locked out for 10 minutes by it).
+    previous_updated_at = getattr(existing, "updated_at", None) if existing else None
+    previous_had_ai = bool(existing and existing.narrative_generated)
 
     if force and existing:
         written = _last_generated_at(existing)
@@ -629,7 +633,12 @@ def generate_exam_report(
             log.info("Report force for exam %s: no new graded work — cache returned, 0 paid calls", exam_id)
             status = db.query(GeneratedExam.status).filter(GeneratedExam.id == exam_id).scalar()
             if status in ("closed", "archived") and not existing.is_final:
-                existing.is_final = True
+                # ``updated_at`` is the cooldown / "anything new?" reference: this write must not move it
+                # (the column's onupdate would), so it is set explicitly to its current value.
+                db.query(ExamReport).filter(ExamReport.id == existing.id).update(
+                    {"is_final": True, "updated_at": existing.updated_at}, synchronize_session=False,
+                )
+                db.expire(existing)
             db.commit()
             return existing
 
@@ -644,8 +653,11 @@ def generate_exam_report(
             # ``updated_at`` out of the cooldown window proceeds.
             threshold = _utcnow() - FORCE_COOLDOWN
             claimed = (
-                db.query(type(existing))
-                .filter(type(existing).id == existing.id, type(existing).updated_at <= threshold)
+                db.query(ExamReport)
+                .filter(
+                    ExamReport.id == existing.id,
+                    func.coalesce(ExamReport.updated_at, ExamReport.generated_at) <= threshold,
+                )
                 .update({"updated_at": _utcnow()}, synchronize_session=False)
             )
             db.commit()
@@ -656,10 +668,21 @@ def generate_exam_report(
                 raise ReportCooldownError(int(max(left, 1)) + 1)
         return _generate_and_store(
             db, repo=repo, exam_id=exam_id, exam_title=exam_title, grade=grade, agg=agg, use_model=use_model,
+            forced_over=existing if (force and existing) else None,
+            previous_updated_at=previous_updated_at, previous_had_ai=previous_had_ai,
         )
     finally:
         with _in_flight_lock:
             _in_flight.discard(exam_id)
+
+
+def _restore_updated_at(db: Session, report: Any, value: Optional[datetime]) -> None:
+    """Put ``updated_at`` back to what it was before the claim (an explicit value: onupdate does not override it)."""
+    if value is None:
+        return
+    db.query(ExamReport).filter(ExamReport.id == report.id).update({"updated_at": value}, synchronize_session=False)
+    db.commit()
+    db.expire_all()
 
 
 def _generate_and_store(
@@ -671,6 +694,9 @@ def _generate_and_store(
     grade: Optional[int],
     agg: Dict[str, Any],
     use_model: bool,
+    forced_over: Any = None,
+    previous_updated_at: Optional[datetime] = None,
+    previous_had_ai: bool = False,
 ) -> Any:
     # The read transaction is already closed (see generate_exam_report): the model is called with no transaction open.
     # AI narrative JSON generation (no transaction, no connection held)
@@ -701,6 +727,15 @@ def _generate_and_store(
             log.warning("AI generation failed for exam %s: %s — using deterministic fallback", exam_id, exc)
             report_dict = _build_deterministic_fallback(exam_title, grade, agg)
 
+    if forced_over is not None and use_model and not used_llm:
+        # A forced regeneration paid (or tried to) and got no model text.  A previous report that has a model
+        # narrative is kept as it is - not overwritten with the deterministic fallback - and the failed attempt does
+        # not start the cooldown.
+        if previous_had_ai:
+            _restore_updated_at(db, forced_over, previous_updated_at)
+            log.warning("Forced report for exam %s got no model text: the previous narrative is kept", exam_id)
+            return repo.get_by_exam(exam_id)
+
     report_dict = bind_report_task_statements(report_dict, agg["task_analytics"])
     narrative_json_str = json.dumps(report_dict, ensure_ascii=False)
 
@@ -723,6 +758,10 @@ def _generate_and_store(
             narrative_generated=used_llm,
             is_final=is_final,
         )
+        if forced_over is not None and use_model and not used_llm:
+            # the previous report had no model text either: refreshed numbers are saved, the window is not spent
+            _restore_updated_at(db, forced_over, previous_updated_at)
+            report = repo.get_by_exam(exam_id)
         log.info(
             "ExamReport saved for exam %s (submitted=%d, narrative=%s, final=%s)",
             exam_id, agg["submitted_count"], "ai" if used_llm else "deterministic", is_final,
