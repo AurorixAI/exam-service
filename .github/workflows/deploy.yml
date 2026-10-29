@@ -80,7 +80,7 @@ jobs:
               echo "envfile=.env.staging"
               echo "srcdir=$REPO_DIR"
               echo "container=$PROD_CONTAINER"
-              echo "site=https://algolab.me"
+              echo "site=https://app.algolab.me"
             } >> "$GITHUB_OUTPUT"
           fi
 
