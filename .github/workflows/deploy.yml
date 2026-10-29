@@ -229,11 +229,46 @@ jobs:
           if-no-files-found: error
 
       - name: Verify site responds
+        # The old check waited for 200 on "/" but "/" redirects (307) to the login.
+        # Now: the service itself reports the release we just deployed (asked over
+        # the same ssh, from inside its container, with the python already in the
+        # image), and the public login page must be up. Every network call has a
+        # limit (LESSONS rule 57).
+        env:
+          SITE: ${{ steps.t.outputs.site }}
+          CONTAINER: ${{ steps.t.outputs.container }}
+          EXPECTED_SHA: ${{ github.sha }}
+          SERVICE_PORT: "8003"
         run: |
-          for i in $(seq 1 12); do
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' "${{ steps.t.outputs.site }}/" || echo 000)
-            [ "$CODE" = "200" ] && { echo "${{ steps.t.outputs.site }} -> 200"; exit 0; }
+          set -u
+          ssh_opts=(-i "$HOME/.ssh/deploy_key" -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2 -o BatchMode=yes)
+          remote="timeout 20 docker exec $CONTAINER python -c 'import json,urllib.request as u; print(json.load(u.urlopen(\"http://127.0.0.1:$SERVICE_PORT/version\", timeout=5)).get(\"release_sha\", \"\"))'"
+          got=""
+          rc=1
+          for attempt in $(seq 1 12); do
+            got=$(ssh "${ssh_opts[@]}" "$SERVER_USER@$SERVER_HOST" "$remote") && rc=0 || rc=$?
+            if [ "$rc" = 0 ] && [ "$got" = "$EXPECTED_SHA" ]; then
+              break
+            fi
             sleep 5
           done
-          echo "${{ steps.t.outputs.site }} never returned 200" >&2
-          exit 1
+          if [ "$rc" != 0 ]; then
+            echo "$CONTAINER на $SITE не ответил на /version (ssh или docker exec вернул код $rc)" >&2
+            exit 1
+          fi
+          if [ "$got" != "$EXPECTED_SHA" ]; then
+            echo "на $SITE ($CONTAINER) версия ${got:-<не указана>}, ожидали $EXPECTED_SHA" >&2
+            exit 1
+          fi
+          echo "$CONTAINER /version -> release_sha $got"
+          login=000
+          for attempt in $(seq 1 12); do
+            login=$(curl -s -o /dev/null --max-time 10 -w '%{http_code}' "$SITE/login" || true)
+            [ "$login" = 200 ] && break
+            sleep 5
+          done
+          if [ "$login" != 200 ]; then
+            echo "сайт $SITE/login ответил $login, ожидали 200" >&2
+            exit 1
+          fi
+          echo "$SITE/login -> 200"
