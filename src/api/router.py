@@ -2887,6 +2887,17 @@ def _monitor_period_clause(
     return or_(*date_conditions)
 
 
+def _lobby_bucket_clause(bucket: str, today: str):
+    """#159 E1: where the lesson of a ``lobby`` exam stands against the business day ``today`` (ISO date; the column is an ISO string, so the comparison is by date).
+    ``future`` - a later day, ``today`` - this day, ``past`` - an earlier day or no date at all (the three are disjoint and cover every lobby)."""
+    column = GeneratedExam.scheduled_lesson_date
+    if bucket == "future":
+        return column > today
+    if bucket == "today":
+        return column == today
+    return or_(column.is_(None), column < today)
+
+
 def _monitor_summary(db: Session, exam: GeneratedExam, submitted_count: int) -> ExamSummaryResponse:
     return ExamSummaryResponse(
         exam_id=exam.id,
@@ -2920,7 +2931,7 @@ def _monitor_summary(db: Session, exam: GeneratedExam, submitted_count: int) -> 
 def get_admin_exam_monitor(
     date_from: Optional[date] = Query(None),
     date_to: Optional[date] = Query(None),
-    state: str = Query("all", pattern="^(all|active|lobby|closed|changes)$"),
+    state: str = Query("all", pattern="^(all|active|lobby|lobby_future|lobby_today|closed|changes)$"),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -2930,12 +2941,18 @@ def get_admin_exam_monitor(
 
     ``active`` and ``lobby`` deliberately mean the current operational state;
     the web app resets the visible period to today before requesting either.
+    #159 E1: a ``lobby`` exam is published for a lesson that may be days away.
+    ``lobby_future`` / ``lobby_today`` are its buckets by ``scheduled_lesson_date``
+    against the business day (Asia/Tashkent), and ``counts`` carries
+    ``lobby_future`` / ``lobby_today`` / ``lobby_past`` (a lobby of an earlier
+    day, or without a date), so the web app needs no page walk to count them.
     ``closed`` and ``changes`` are historical filters backed by immutable
     events, with a scheduled-date fallback for legacy closed runs.
     """
     _require_exam_admin_observer(actor)
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422, "Начало периода не может быть позже его окончания")
+    today = _business_today().isoformat()          # ONE reading of the business day for the filter and the counters
 
     period_clause = _monitor_period_clause(org_id=actor.org_id, date_from=date_from, date_to=date_to)
     base = db.query(GeneratedExam).filter(GeneratedExam.org_id == actor.org_id)
@@ -2958,6 +2975,8 @@ def get_admin_exam_monitor(
         scoped = scoped.filter(GeneratedExam.status == "active")
     elif state == "lobby":
         scoped = scoped.filter(GeneratedExam.status == "lobby")
+    elif state in ("lobby_future", "lobby_today"):
+        scoped = scoped.filter(GeneratedExam.status == "lobby", _lobby_bucket_clause(state.split("_", 1)[1], today))
     elif state == "closed":
         legacy_closed = GeneratedExam.status == "closed"
         if date_from or date_to:
@@ -3014,6 +3033,9 @@ def get_admin_exam_monitor(
         "all": metric_base.count(),
         "active": metric_base.filter(GeneratedExam.status == "active").count(),
         "lobby": metric_base.filter(GeneratedExam.status == "lobby").count(),
+        "lobby_future": metric_base.filter(GeneratedExam.status == "lobby", _lobby_bucket_clause("future", today)).count(),
+        "lobby_today": metric_base.filter(GeneratedExam.status == "lobby", _lobby_bucket_clause("today", today)).count(),
+        "lobby_past": metric_base.filter(GeneratedExam.status == "lobby", _lobby_bucket_clause("past", today)).count(),
         "closed": metric_base.filter(GeneratedExam.status == "closed").count(),
         "changes": base.filter(GeneratedExam.id.in_(changes_ids)).count(),
     }
