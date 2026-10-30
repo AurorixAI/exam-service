@@ -108,10 +108,26 @@ class ExamActor:
         return self.role in {"owner", "admin"}
 
 
+# K2-1 (m3): the browser's cabinet cookies are the access cookie AND the refresh cookie (the refresh cookie is ``Path=/`` since the ``__Host-`` rule, so it
+# reaches every service). auth-service needs only the access cookie to answer ``/auth/me``; the refresh token (14 days) must not travel through this process,
+# its logs or its error reports.
+_ACCESS_COOKIE_NAMES = frozenset({"__Host-algo_auth_token", "algo_auth_token"})
+
+
+def _access_cookies_only(cookie_header: str) -> str:
+    """The ``Cookie`` header reduced to the access-token cookie(s): everything else (the refresh cookie, any other cookie of the site) is dropped."""
+    kept = []
+    for pair in cookie_header.split(";"):
+        name = pair.split("=", 1)[0].strip()
+        if name in _ACCESS_COOKIE_NAMES and "=" in pair:
+            kept.append(pair.strip())
+    return "; ".join(kept)
+
+
 def _forwarded_auth_headers(request: Request) -> dict[str, str]:
-    """Forward only the credentials auth-service understands."""
+    """Forward only the credentials auth-service needs: the access cookie and ``Authorization`` (never the refresh cookie)."""
     headers: dict[str, str] = {}
-    if cookie := request.headers.get("cookie"):
+    if cookie := _access_cookies_only(request.headers.get("cookie") or ""):
         headers["cookie"] = cookie
     if authorization := request.headers.get("authorization"):
         headers["authorization"] = authorization

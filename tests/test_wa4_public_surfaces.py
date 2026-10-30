@@ -75,7 +75,7 @@ class FakeRepo:
 
 @pytest.fixture
 def real_auth(db, monkeypatch):
-    """The app with the REAL staff dependency: auth-service answers from the cookie the caller sends."""
+    """The app with the REAL staff dependency: auth-service answers from the cookie the caller sends (the ROLE rides in the VALUE of the access cookie: the service forwards that cookie only, K2-1)."""
     from src.core.database import get_db
     from src.main import app
 
@@ -118,16 +118,16 @@ def real_auth(db, monkeypatch):
 def test_ex36_the_catalogue_refuses_anonymous_and_students(real_auth, path):
     anonymous = real_auth.get(API + path)
     assert anonymous.status_code == 401, path
-    student = real_auth.get(API + path, headers={"cookie": "algo_auth_token=t; role=student"})
+    student = real_auth.get(API + path, headers={"cookie": "algo_auth_token=role=student"})
     assert student.status_code == 403, path
-    parent = real_auth.get(API + path, headers={"cookie": "algo_auth_token=t; role=parent"})
+    parent = real_auth.get(API + path, headers={"cookie": "algo_auth_token=role=parent"})
     assert parent.status_code == 403, path
 
 
 @pytest.mark.parametrize("path", CATALOGUE)
 @pytest.mark.parametrize("role", ["teacher", "admin", "owner"])
 def test_ex36_the_catalogue_answers_staff(real_auth, path, role):
-    r = real_auth.get(API + path, headers={"cookie": f"algo_auth_token=t; role={role}"})
+    r = real_auth.get(API + path, headers={"cookie": f"algo_auth_token=role={role}"})
     # empty catalogue: 200 with a list, or the route's own 404 for an unknown textbook - never 401/403
     assert r.status_code in (200, 404), (path, r.status_code, r.text)
     if r.status_code == 404:
