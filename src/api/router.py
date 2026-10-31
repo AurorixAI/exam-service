@@ -27,6 +27,7 @@ Endpoints:
 """
 from __future__ import annotations
 
+from src.domain.exam_aggregate import DEFAULT_PASS_THRESHOLD_PCT, aggregate_exam, exam_pass_threshold_pct
 from src.domain.task_display import question_display_fields, report_display_projection
 
 import asyncio
@@ -50,7 +51,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.concurrency import run_in_threadpool
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import and_, func, inspect as sa_inspect, or_, select
+from sqlalchemy import and_, case, func, inspect as sa_inspect, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -66,6 +67,7 @@ from src.core.auth import (
 )
 from src.core.abuse_limit import EntryTicket, admit_code_lookup, admit_identity_attempt, reset_entry_limits
 from src.core.config import get_settings
+from src.core.http_pool import pooled_client
 from src.core.database import get_db, wrote_since_commit
 from src.core.exceptions import (
     ExamNotFoundError,
@@ -136,6 +138,8 @@ class GenerateExamRequest(BaseModel):
     mc_mode: str = "auto"
     delivery_mode: Literal["online", "print", "hybrid"] = "online"
     teacher_name: Optional[str] = None
+    # Share of the maximum score from which a student counts as having passed THIS exam (owner decision 31.10).
+    pass_threshold_pct: int = Field(DEFAULT_PASS_THRESHOLD_PCT, ge=1, le=100)
 
 
 class PublishExamRequest(BaseModel):
@@ -168,6 +172,7 @@ class ExamSummaryResponse(BaseModel):
     source_exam_id: Optional[str] = None
     total_sessions: int = 0
     skills_covered: List[str] = []
+    pass_threshold_pct: int = DEFAULT_PASS_THRESHOLD_PCT
     # A compact, immutable-to-users audit trail for operational monitoring.
     # The full task snapshot never depends on these entries.
     recent_events: List[Dict[str, Any]] = Field(default_factory=list)
@@ -498,6 +503,9 @@ class DraftExamResponse(BaseModel):
     is_pinned: bool = False
     scheduled_lesson_id: Optional[str] = None
     scheduled_lesson_date: Optional[str] = None
+    pass_threshold_pct: int = DEFAULT_PASS_THRESHOLD_PCT
+    # True once a work is submitted: the threshold can no longer change (PATCH /exams/{id}/pass-threshold answers 409)
+    pass_threshold_locked: bool = False
     settings: Dict[str, Any]
     # Only lifecycle metadata is returned.  The snapshot and answer key remain
     # server-side and are rendered directly into staff PDFs.
@@ -984,7 +992,7 @@ async def _embed_print_figures(snapshot: dict[str, Any]) -> dict[str, Any]:
 
     cache: dict[str, dict[str, str]] = {}
     try:
-        async with httpx.AsyncClient(timeout=12.0, follow_redirects=False) as client:
+        async with pooled_client(timeout=12.0) as client:
             for task in tasks:
                 reference = str(task["question_image_url"]).strip()
                 image = cache.get(reference)
@@ -1295,7 +1303,7 @@ async def _lesson_attendance_status(
     """The attendance status of one occurrence at auth-service (None = the lesson was never started)."""
     url = f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/groups/{group_id}/attendance"
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with pooled_client(timeout=5.0) as client:
             response = await client.get(
                 url,
                 params={"date_from": lesson_date, "date_to": lesson_date},
@@ -1346,7 +1354,7 @@ async def _resolve_lesson_occurrence(
         group = access
     url = f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/schedule/occurrences"
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with pooled_client(timeout=5.0) as client:
             response = await client.get(
                 url,
                 params={"date_from": lesson_date, "date_to": lesson_date},
@@ -1434,7 +1442,7 @@ async def _require_lesson_in_progress(exam: GeneratedExam, actor: ExamActor) -> 
         f"{exam.group_id}/attendance"
     )
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with pooled_client(timeout=5.0) as client:
             response = await client.get(
                 url,
                 params={
@@ -1486,7 +1494,7 @@ async def _require_public_lobby_available(exam: GeneratedExam) -> None:
         f"/groups/{exam.group_id}/lessons/{exam.scheduled_lesson_id}/attendance"
     )
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with pooled_client(timeout=5.0) as client:
             response = await client.get(
                 url,
                 params={"lesson_date": exam.scheduled_lesson_date},
@@ -1661,7 +1669,7 @@ async def _canonical_student_for_exam(
 
     async def ask(extra: Optional[dict[str, str]] = None) -> dict:
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with pooled_client(timeout=5.0) as client:
                 response = await client.get(
                     url,
                     params={**params, **(extra or {})},
@@ -1696,15 +1704,24 @@ async def _canonical_student_for_exam(
     return data["student"]
 
 
-def _exam_started_at_of_snapshot(exam: GeneratedExam) -> Optional[datetime]:
-    """``settings.started_at`` of a detached exam copy as naive UTC (no database access: the entry runs without a transaction)."""
+def _settings_started_at(exam: Any) -> Optional[datetime]:
+    """``settings.started_at`` of an exam (or of a detached copy of it) as naive UTC; ``None`` when it was never set or is not a date.
+
+    The ONE parser (EX-44): it used to be written out in six places.  No database access - the public entry runs without a transaction.
+    """
     raw = (getattr(exam, "settings", None) or {}).get("started_at")
     if not raw:
         return None
     try:
         return _to_naive_utc(datetime.fromisoformat(raw))
     except (TypeError, ValueError):
+        log.warning("Invalid started_at for exam %s", getattr(exam, "id", "?"))
         return None
+
+
+def _exam_started_at_of_snapshot(exam: GeneratedExam) -> Optional[datetime]:
+    """``settings.started_at`` of a detached exam copy as naive UTC (no database access: the entry runs without a transaction)."""
+    return _settings_started_at(exam)
 
 
 def _has_resumable_session(db: Session, exam_id: str, student: dict) -> bool:
@@ -2412,6 +2429,7 @@ def generate_exam(
         total_time_minutes=req.time_minutes,
         variants_count=1,
         tasks_per_variant=len(tasks),
+        pass_threshold_pct=req.pass_threshold_pct,
     )
 
     # Optional: auto-generate variants via VariantOrchestrator
@@ -2530,12 +2548,9 @@ def _grade_and_submit_session(
 
 def _exam_started_at(db: Session, exam: GeneratedExam) -> Optional[datetime]:
     """Return the authoritative common start timestamp for one live exam."""
-    raw_started_at = (exam.settings or {}).get("started_at")
-    if raw_started_at:
-        try:
-            return _to_naive_utc(datetime.fromisoformat(raw_started_at))
-        except (TypeError, ValueError):
-            log.warning("Invalid started_at for exam %s", exam.id)
+    from_settings = _settings_started_at(exam)
+    if from_settings:
+        return from_settings
 
     first_session = (
         db.query(ExamSession.started_at)
@@ -2712,6 +2727,109 @@ def _check_and_auto_close_exam(db: Session, exam: Optional[GeneratedExam]) -> bo
     return False
 
 
+def _exam_summary(
+    db: Session, exam: GeneratedExam, *, access_code: Optional[str] = None, total_sessions: int = 0
+) -> ExamSummaryResponse:
+    """THE assembly of an exam card (EX-44: it was written out three times and the copies had drifted apart).
+
+    ``access_code`` is a student capability: the caller passes it only for the teacher of the group.  ``total_sessions`` is the
+    number of SUBMITTED works.
+    """
+    return ExamSummaryResponse(
+        exam_id=exam.id,
+        title=exam.title,
+        status=exam.status,
+        delivery_mode=exam.delivery_mode or "online",
+        access_code=access_code,
+        tasks_per_variant=exam.tasks_per_variant,
+        variants_count=exam.variants_count,
+        total_time_minutes=exam.total_time_minutes or 45,
+        group_id=exam.group_id,
+        group_name=exam.group_name,
+        class_level=exam.class_level,
+        teacher_name=exam.teacher_name,
+        scheduled_lesson_id=exam.scheduled_lesson_id,
+        scheduled_lesson_date=exam.scheduled_lesson_date,
+        is_pinned=bool(exam.is_pinned),
+        source_exam_id=exam.source_exam_id,
+        total_sessions=total_sessions,
+        skills_covered=list(exam.skills_covered or []),
+        pass_threshold_pct=exam_pass_threshold_pct(exam),
+        recent_events=_recent_exam_lifecycle_events(db, exam),
+        created_at=exam.created_at,
+    )
+
+
+def _has_submitted_work(db: Session, exam_id: str) -> bool:
+    """Is there a SUBMITTED work in this exam (what locks the pass threshold)?"""
+    return (
+        db.query(ExamSession.id)
+        .filter(ExamSession.exam_id == exam_id, ExamSession.status == "submitted")
+        .first()
+    ) is not None
+
+
+def _submitted_counts(db: Session, exam_ids: list[str]) -> dict[str, int]:
+    """{exam id: submitted works}, one query for the whole page."""
+    if not exam_ids:
+        return {}
+    rows = (
+        db.query(ExamSession.exam_id, func.count(ExamSession.id))
+        .filter(ExamSession.exam_id.in_(exam_ids), ExamSession.status == "submitted")
+        .group_by(ExamSession.exam_id)
+        .all()
+    )
+    return {exam_id: count for exam_id, count in rows}
+
+
+def _teacher_visibility_clause(db: Session, query, actor: ExamActor):
+    """EX-01: what a non-admin may see, as a condition of the SQL query itself - so that the page limit counts only visible exams.
+
+    The rule is the one of ``require_exam_access`` (``core.auth.exam_access_group``): an unassigned library template belongs to
+    its author; an exam of a group belongs to whoever may work with that group - the group's teacher, or a substitute for the
+    lessons he substitutes in.  Group access lives in auth-service, so the (few) distinct groups of the already filtered query
+    are asked first - once each, together - and the answer becomes ``group_id IN (...)``.  A group that is gone, foreign or
+    refused hides its exams, exactly as before; an unavailable auth-service is a 503 (never a silently shorter library).
+    """
+    bound = and_(GeneratedExam.scheduled_lesson_id.isnot(None), GeneratedExam.scheduled_lesson_date.isnot(None))
+    rows = (
+        query.with_entities(GeneratedExam.group_id, func.max(case((bound, 1), else_=0)))
+        .filter(GeneratedExam.group_id.isnot(None))
+        .group_by(GeneratedExam.group_id)
+        .all()
+    )
+    has_lessons = {str(group_id): bool(flag) for group_id, flag in rows}
+    conditions = [and_(GeneratedExam.group_id.is_(None), GeneratedExam.created_by == actor.user_id)]
+    if has_lessons:
+        outcomes = _await(_group_access_batch(actor, list(has_lessons)), db)
+        allowed: list[str] = []
+        forbidden: list[str] = []
+        for group_id, outcome in outcomes.items():
+            if isinstance(outcome, HTTPException):
+                if outcome.status_code not in {403, 404}:
+                    raise outcome
+                if outcome.status_code == 403 and actor.role == "teacher" and has_lessons[group_id]:
+                    forbidden.append(group_id)  # a substitute is refused on the group but may see the exam of his lesson
+            elif isinstance(outcome, BaseException):
+                raise outcome
+            else:
+                allowed.append(group_id)
+        if allowed:
+            conditions.append(GeneratedExam.group_id.in_(allowed))
+        # LOGIC-B2 (D-1): only the refused groups that hold a lesson-bound exam are asked for the lessons of a substitution
+        substituted = _await(_substitute_lessons_batch(actor, forbidden), db) if forbidden else {}
+        for group_id, lessons in substituted.items():
+            if lessons:
+                conditions.append(and_(
+                    GeneratedExam.group_id == group_id,
+                    or_(*[
+                        and_(GeneratedExam.scheduled_lesson_id == lesson_id, GeneratedExam.scheduled_lesson_date == lesson_date)
+                        for lesson_id, lesson_date in lessons
+                    ]),
+                ))
+    return or_(*conditions)
+
+
 @router.get("/exams",
             summary="Список экзаменов (Библиотека учителя)")
 def list_exams(
@@ -2722,10 +2840,18 @@ def list_exams(
     limit: int = Query(100, ge=1, le=100),
     offset: int = Query(0, ge=0),
     include_meta: bool = Query(False),
+    page: Optional[int] = Query(None, ge=1, description="1-based page of `size` exams; the answer carries `total` and `has_more`"),
+    size: int = Query(50, ge=1, le=100),
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    """List exams with optional filters. Includes session counts."""
+    """List exams with optional filters. Includes session counts.
+
+    Three shapes, one visibility rule (EX-01 - the access filter runs in SQL BEFORE the page limit, for every role):
+      * ``page``/``size``  -> ``{items, total, page, size, has_more}``  (the library: «Показать ещё»);
+      * ``include_meta``   -> ``{items, total, limit, offset}``           (the administrator's console, ``limit``/``offset``);
+      * neither            -> the plain array of the first 100 visible exams (an older client during a rolling release).
+    """
     query = db.query(GeneratedExam).filter(GeneratedExam.org_id == actor.org_id)
     if group_id:
         query = query.filter(GeneratedExam.group_id == group_id)
@@ -2741,27 +2867,30 @@ def list_exams(
     elif not include_archived:
         query = query.filter(GeneratedExam.status != "archived")
 
-    if include_meta and not actor.is_org_admin:
-        raise HTTPException(403, "Постраничный каталог доступен только администратору")
+    # An owner/admin can see the whole organisation.  A teacher can see their own templates and the runs assigned to a
+    # group they teach (or lessons they substitute in) - decided in the query, not on the page that is left of it.
+    if not actor.is_org_admin:
+        query = query.filter(_teacher_visibility_clause(db, query, actor))
 
-    total = query.count() if include_meta else None
+    paged = page is not None
+    if paged:
+        page_limit, page_offset = size, (page - 1) * size
+    elif include_meta:
+        page_limit, page_offset = limit, offset
+    else:
+        page_limit, page_offset = 100, 0
+    total = query.count() if (paged or include_meta) else None
     exams = (
         query
         .order_by(
             GeneratedExam.is_pinned.desc(),   # pinned first
-            GeneratedExam.created_at.desc()
+            GeneratedExam.created_at.desc(),
+            GeneratedExam.id.desc(),          # a total order, so that two pages never overlap or skip an exam
         )
-        .offset(offset if include_meta else 0)
-        .limit(limit if include_meta else 100)
+        .offset(page_offset)
+        .limit(page_limit)
         .all()
     )
-    # An owner/admin can see the whole organisation.  A teacher can see their
-    # own templates and the runs assigned to a group they teach.
-    if not actor.is_org_admin:
-        # A deleted group may still be referenced by an old archived exam. It is not visible to this teacher, but
-        # must not make the complete library unavailable (a 403/404 for a group hides its exams, nothing more).
-        decisions = _exam_access_decisions(db, exams, actor)
-        exams = [exam for exam in exams if decisions[exam.id]]
 
     # An open exam is valid only when it has a concrete schedule occurrence.
     # Legacy rows with attempts are intentionally never rewritten here.
@@ -2773,47 +2902,27 @@ def list_exams(
         elif e.status == "active":
             _check_and_auto_close_exam(db, e)
 
-    # Count submitted sessions per exam in one query
-    from sqlalchemy import func as sqlfunc
-    exam_ids = [e.id for e in exams]
-    session_counts: dict[str, int] = {}
-    if exam_ids:
-        rows = (
-            db.query(ExamSession.exam_id, sqlfunc.count(ExamSession.id))
-            .filter(ExamSession.exam_id.in_(exam_ids), ExamSession.status == "submitted")
-            .group_by(ExamSession.exam_id)
-            .all()
-        )
-        session_counts = {r[0]: r[1] for r in rows}
-
+    session_counts = _submitted_counts(db, [e.id for e in exams])
     summaries = [
-        ExamSummaryResponse(
-            exam_id=e.id,
-            title=e.title,
-            status=e.status,
-            delivery_mode=e.delivery_mode or "online",
+        _exam_summary(
+            db,
+            e,
             # Access code is a student capability.  Organisation-wide
             # monitoring deliberately does not grant an administrator the
             # ability to distribute or reopen a classroom run.
             access_code=e.access_code if actor.role == "teacher" else None,
-            tasks_per_variant=e.tasks_per_variant,
-            variants_count=e.variants_count,
-            total_time_minutes=e.total_time_minutes or 45,
-            group_id=e.group_id,
-            group_name=e.group_name,
-            class_level=e.class_level,
-            teacher_name=e.teacher_name,
-            scheduled_lesson_id=e.scheduled_lesson_id,
-            scheduled_lesson_date=e.scheduled_lesson_date,
-            is_pinned=bool(e.is_pinned),
-            source_exam_id=e.source_exam_id,
             total_sessions=session_counts.get(e.id, 0),
-            skills_covered=list(e.skills_covered or []),
-            recent_events=_recent_exam_lifecycle_events(db, e),
-            created_at=e.created_at,
         )
         for e in exams
     ]
+    if paged:
+        return {
+            "items": summaries,
+            "total": total or 0,
+            "page": page,
+            "size": size,
+            "has_more": page_offset + len(summaries) < (total or 0),
+        }
     if include_meta:
         return {
             "items": summaries,
@@ -2899,28 +3008,7 @@ def _lobby_bucket_clause(bucket: str, today: str):
 
 
 def _monitor_summary(db: Session, exam: GeneratedExam, submitted_count: int) -> ExamSummaryResponse:
-    return ExamSummaryResponse(
-        exam_id=exam.id,
-        title=exam.title,
-        status=exam.status,
-        delivery_mode=exam.delivery_mode or "online",
-        access_code=None,
-        tasks_per_variant=exam.tasks_per_variant,
-        variants_count=exam.variants_count,
-        total_time_minutes=exam.total_time_minutes or 45,
-        group_id=exam.group_id,
-        group_name=exam.group_name,
-        class_level=exam.class_level,
-        is_pinned=bool(exam.is_pinned),
-        teacher_name=exam.teacher_name,
-        scheduled_lesson_id=exam.scheduled_lesson_id,
-        scheduled_lesson_date=exam.scheduled_lesson_date,
-        source_exam_id=exam.source_exam_id,
-        total_sessions=submitted_count,
-        skills_covered=list(exam.skills_covered or []),
-        recent_events=_recent_exam_lifecycle_events(db, exam),
-        created_at=exam.created_at,
-    )
+    return _exam_summary(db, exam, total_sessions=submitted_count)
 
 
 @router.get(
@@ -3243,6 +3331,47 @@ def rename_exam(
     return {"exam_id": exam.id, "title": exam.title, "status": exam.status}
 
 
+class UpdatePassThresholdRequest(BaseModel):
+    pass_threshold_pct: int = Field(..., ge=1, le=100)
+
+
+PASS_THRESHOLD_LOCKED_MESSAGE = "Порог нельзя изменить: по экзамену уже есть сданные работы"
+
+
+@router.patch("/exams/{exam_id}/pass-threshold", summary="Изменить проходной порог экзамена")
+def update_pass_threshold(
+    exam_id: str,
+    req: UpdatePassThresholdRequest,
+    db: Session = Depends(get_db),
+    actor: ExamActor = Depends(require_exam_staff),
+):
+    """The pass threshold (1..100 % of the maximum score) of one exam.
+
+    It may change until the first work is SUBMITTED: after that every number that counts «passed» (Аналитика, Отчёт, the
+    text of the report) would silently move under results people already saw - 409.  The exam row is locked for the check
+    (lock order of every writer: exam -> sessions), so two requests cannot both pass it.
+    """
+    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
+    locked = (
+        db.query(GeneratedExam)
+        .filter(GeneratedExam.id == exam.id)
+        .with_for_update()
+        .populate_existing()
+        .first()
+    )
+    if locked is None:
+        raise HTTPException(404, "Экзамен не найден")
+    if exam_pass_threshold_pct(locked) == req.pass_threshold_pct:
+        db.commit()
+        return {"exam_id": locked.id, "pass_threshold_pct": req.pass_threshold_pct}
+    if _has_submitted_work(db, locked.id):
+        db.rollback()
+        raise CodedHTTPException(409, "PASS_THRESHOLD_LOCKED", PASS_THRESHOLD_LOCKED_MESSAGE)
+    locked.pass_threshold_pct = req.pass_threshold_pct
+    db.commit()
+    return {"exam_id": locked.id, "pass_threshold_pct": req.pass_threshold_pct}
+
+
 @router.post("/exams/{exam_id}/clone",
              summary="Клонировать экзамен (шаблон)")
 def clone_exam(
@@ -3297,6 +3426,7 @@ def clone_exam(
         subject=src.subject,
         source_exam_id=exam_id,   # track lineage
         is_pinned=False,
+        pass_threshold_pct=src.pass_threshold_pct or DEFAULT_PASS_THRESHOLD_PCT,
     )
     # ``exam_lifecycle_events.exam_id`` has a real foreign key in PostgreSQL.
     # Flush the new row before appending its first audit event; committing both
@@ -3912,14 +4042,9 @@ def get_exam_lobby_status(
             "submitted_at": s.submitted_at.isoformat() if s.submitted_at else None,
         })
 
-    exam_started_at_str = (exam.settings or {}).get("started_at")
-    if exam_started_at_str:
-        try:
-            exam_started_at = _to_naive_utc(datetime.fromisoformat(exam_started_at_str))
-            if exam_started_at and (not earliest_started_at or exam_started_at < earliest_started_at):
-                earliest_started_at = exam_started_at
-        except Exception:
-            pass
+    exam_started_at = _settings_started_at(exam)
+    if exam_started_at and (not earliest_started_at or exam_started_at < earliest_started_at):
+        earliest_started_at = exam_started_at
 
     total_time_seconds = exam.total_time_minutes * 60
     time_remaining_seconds = total_time_seconds
@@ -4150,6 +4275,8 @@ def get_exam_draft(
         teacher_name=exam.teacher_name,
         scheduled_lesson_id=exam.scheduled_lesson_id,
         scheduled_lesson_date=exam.scheduled_lesson_date,
+        pass_threshold_pct=exam_pass_threshold_pct(exam),
+        pass_threshold_locked=_has_submitted_work(db, exam.id),
         settings=exam.settings or {},
         print_package=_print_package_metadata(db, exam.id),
         skills_covered=exam.skills_covered or [],
@@ -4696,23 +4823,11 @@ def get_exam(
     # Check and auto-close if exam duration expired
     _check_and_auto_close_exam(db, exam)
 
-    return ExamSummaryResponse(
-        exam_id=exam.id,
-        title=exam.title,
-        status=exam.status,
-        delivery_mode=exam.delivery_mode or "online",
+    return _exam_summary(
+        db,
+        exam,
         access_code=exam.access_code if actor.role == "teacher" else None,
-        tasks_per_variant=exam.tasks_per_variant,
-        variants_count=exam.variants_count,
-        group_id=exam.group_id,
-        group_name=exam.group_name,
-        class_level=exam.class_level,
-        teacher_name=exam.teacher_name,
-        scheduled_lesson_id=exam.scheduled_lesson_id,
-        scheduled_lesson_date=exam.scheduled_lesson_date,
-        recent_events=_recent_exam_lifecycle_events(db, exam),
-        total_time_minutes=exam.total_time_minutes or 45,
-        created_at=exam.created_at,
+        total_sessions=_submitted_counts(db, [exam.id]).get(exam.id, 0),
     )
 
 
@@ -4751,6 +4866,21 @@ def _entry_exam_lookup(db: Session, code: str) -> GeneratedExam:
     return snapshot
 
 
+def _require_open_bound_exam(exam: GeneratedExam) -> None:
+    """The one rule of «can a student enter this exam now» (EX-44): both public entry checks used to spell it out, and one of
+    them turned only a 409 into the 410 the student sees.  An exam that is not open, or not tied to a lesson, is 410 here.
+
+    A historical completed exam may predate the lesson-binding workflow; its old public URL must still say the meaningful
+    terminal state, not imply that a teacher needs to assign it now.
+    """
+    if exam.status not in ("active", "lobby"):
+        raise HTTPException(410, "Экзамен уже завершён. Повторное прохождение недоступно.")
+    try:
+        _require_bound_exam(exam)
+    except HTTPException as exc:
+        raise HTTPException(410, "Экзамен ещё не назначен на занятие") from exc
+
+
 def _entry_gate(db: Session, exam_id: str) -> GeneratedExam:
     """What check-student and start verify about the exam BEFORE they call auth-service; a snapshot comes out.
 
@@ -4761,12 +4891,7 @@ def _entry_gate(db: Session, exam_id: str) -> GeneratedExam:
     if not exam:
         raise HTTPException(404, "Экзамен не найден")
     _check_and_auto_close_exam(db, exam)
-    if exam.status not in ("active", "lobby"):
-        raise HTTPException(410, "Экзамен уже завершён. Повторное прохождение недоступно.")
-    try:
-        _require_bound_exam(exam)
-    except HTTPException as exc:
-        raise HTTPException(410, "Экзамен ещё не назначен на занятие") from exc
+    _require_open_bound_exam(exam)
     snapshot = _detached_exam_copy(exam, skip=("variants",))
     db.commit()
     return snapshot
@@ -4793,18 +4918,7 @@ def _public_exam_precheck(db: Session, code: str) -> GeneratedExam:
     # Check and auto-close if time expired
     _check_and_auto_close_exam(db, exam)
 
-    # A historical completed exam may predate the lesson-binding workflow.
-    # Its old public URL must still communicate the meaningful terminal state,
-    # rather than incorrectly implying that a teacher needs to assign it now.
-    if exam.status not in ("active", "lobby"):
-        raise HTTPException(410, "Экзамен уже завершён. Повторное прохождение недоступно.")
-
-    try:
-        _require_bound_exam(exam)
-    except HTTPException as exc:
-        if exc.status_code == 409:
-            raise HTTPException(410, "Экзамен ещё не назначен на занятие") from exc
-        raise
+    _require_open_bound_exam(exam)
     snapshot = _detached_exam_copy(exam, skip=("variants",))
     db.commit()
     return snapshot
@@ -4814,13 +4928,7 @@ def _exam_info_response(db: Session, exam: GeneratedExam) -> ExamInfoResponse:
     remaining_seconds = None
     started_at_str = None
     if exam.status == "active":
-        exam_start = None
-        s_str = (exam.settings or {}).get("started_at")
-        if s_str:
-            try:
-                exam_start = _to_naive_utc(datetime.fromisoformat(s_str))
-            except Exception:
-                pass
+        exam_start = _settings_started_at(exam)
         if not exam_start:
             sessions = SessionRepository(db).list_by_exam(exam.id)
             for s in sessions:
@@ -5104,13 +5212,7 @@ def _admit_student_to_exam(
         raise HTTPException(403, STUDENT_NOT_FOUND_MESSAGE)
 
     # Determine global exam start time
-    exam_start_time = None
-    exam_started_at_str = (view.settings or {}).get("started_at")
-    if exam_started_at_str:
-        try:
-            exam_start_time = _to_naive_utc(datetime.fromisoformat(exam_started_at_str))
-        except Exception:
-            pass
+    exam_start_time = _settings_started_at(view)
 
     now_utc = datetime.utcnow()
 
@@ -5332,13 +5434,7 @@ def get_session_status(
 
     if exam.status == "active":
         now_utc = datetime.utcnow()
-        exam_start_time = None
-        exam_started_at_str = (exam.settings or {}).get("started_at")
-        if exam_started_at_str:
-            try:
-                exam_start_time = _to_naive_utc(datetime.fromisoformat(exam_started_at_str))
-            except Exception:
-                pass
+        exam_start_time = _settings_started_at(exam)
 
         if session.status == "waiting":
             session.status = "in_progress"
@@ -5973,6 +6069,8 @@ class ExamAnalyticsResponse(BaseModel):
     avg_score_pct: float
     avg_time_seconds: float
     pass_rate_pct: float
+    # The pass threshold of THIS exam, the one `pass_rate_pct` was counted with
+    pass_threshold_pct: int = DEFAULT_PASS_THRESHOLD_PCT
     # Единый список задач: correct_rate + distractor_hits вместе
     # Отсортировано от худшего к лучшему
     task_analytics: List[dict] = []
@@ -5994,169 +6092,26 @@ def get_exam_analytics(
         .filter(ExamSession.exam_id == exam_id)
         .all()
     )
-    total = len(sessions)
     submitted = [s for s in sessions if s.status == "submitted"]
-    n_submitted = len(submitted)
     # Scores and per-task correctness below must come from one grading (see grading.regrade_if_stale).
     if any([regrade_if_stale(s, exam) for s in submitted]):
         db.commit()
 
-    if n_submitted == 0:
-        return ExamAnalyticsResponse(
-            exam_id=exam_id,
-            title=exam.title,
-            total_sessions=total,
-            submitted_sessions=0,
-            avg_score_pct=0.0,
-            avg_time_seconds=0.0,
-            pass_rate_pct=0.0,
-        )
-
-    avg_pct = sum(
-        (s.score / s.max_score * 100) if s.max_score else 0
-        for s in submitted
-    ) / n_submitted
-
-    avg_time = sum(s.time_spent_seconds for s in submitted) / n_submitted
-
-    pass_rate = sum(
-        1 for s in submitted
-        if s.max_score and (s.score / s.max_score) >= 0.5
-    ) / n_submitted * 100
-
-    # Per-task correctness analysis
-    task_correct: Dict[str, int] = {}
-    task_total: Dict[str, int] = {}
-
-    # Build task metadata lookup from exam variants (первый вариант = эталон)
-    task_lookup: Dict[str, dict] = {}
-    for v in (exam.variants or []):
-        for t in v.get("tasks", []):
-            if t["task_id"] not in task_lookup:
-                task_lookup[t["task_id"]] = t
-
-    # {task_id: {explanation_key: {explanation, error_type, count}}}
-    task_distractor_hits: Dict[str, Dict[str, dict]] = {}
-    mc_mode = (exam.settings or {}).get("mc_mode", "auto")
-
-    for s in submitted:
-        verdicts = stored_verdicts(s.distractor_analytics) or {}
-        for task_id, student_ans in (s.answers or {}).items():
-            task = task_lookup.get(task_id, {})
-            task_total[task_id] = task_total.get(task_id, 0) + 1
-            if verdicts[task_id] if task_id in verdicts else check_task_answer(task, student_ans, mc_mode):
-                task_correct[task_id] = task_correct.get(task_id, 0) + 1
-
-        # Агрегируем дистрактор-попадания
-        for task_id, hit in (s.distractor_analytics or {}).items():
-            if not isinstance(hit, dict) or not hit.get("hit"):
-                continue
-            error_type = hit.get("error_type", "unknown")
-            task_meta = task_lookup.get(task_id, {})
-            explanation = resolve_analytics_explanation(
-                hit,
-                student_answer=(s.answers or {}).get(task_id, ""),
-                distractor_meta=task_meta.get("distractor_meta"),
-                match_fn=_match_distractor,
-            )
-            if not explanation:
-                continue
-            # Ключ группировки: error_type (+ первые 60 символов для уникальности)
-            key = f"{error_type}::{explanation[:60]}"
-            bucket = task_distractor_hits.setdefault(task_id, {})
-            if key not in bucket:
-                bucket[key] = {
-                    "explanation": explanation,
-                    "error_type": error_type,
-                    "count": 0,
-                }
-            bucket[key]["count"] += 1
-
-    # ── Объединённый список задач ─────────────────────────────────────────────
-    all_task_ids = set(task_total.keys()) | set(task_distractor_hits.keys())
-    task_analytics = []
-    for task_id in all_task_ids:
-        total_attempts = task_total.get(task_id, 0)
-        correct = task_correct.get(task_id, 0)
-        wrong = total_attempts - correct
-        rate = round(correct / total_attempts, 3) if total_attempts else 0.0
-
-        task_meta = task_lookup.get(task_id, {})
-        # Название темы: skill_name → fallback к toc/question начало
-        skill_name = (
-            task_meta.get("skill_name")
-            or task_meta.get("toc_title")
-            or ""
-        )
-        hits = task_distractor_hits.get(task_id, {})
-        distractor_hits = sorted(
-            [
-                {
-                    "explanation": info["explanation"],
-                    "count": info["count"],
-                    "students_pct": round(info["count"] / max(wrong, 1) * 100, 1),
-                }
-                for info in hits.values()
-            ],
-            key=lambda x: x["count"],
-            reverse=True,
-        )
-
-        task_analytics.append({
-            "task_id": task_id,
-            **question_display_fields(task_meta),
-            "skill_name": skill_name,
-            "attempts": total_attempts,
-            "correct_count": correct,
-            "wrong_count": wrong,
-            "correct_rate": rate,
-            "distractor_hits": distractor_hits,
-        })
-
-    # Сортировка: самые провальные задачи первыми
-    task_analytics.sort(key=lambda x: (x["correct_rate"], -x["attempts"]))
-
-    # ── Топ-5 типичных ошибок по всему экзамену ───────────────────────────────
-    # Агрегируем одинаковые объяснения из разных задач
-    error_aggregate: Dict[str, dict] = {}
-    for item in task_analytics:
-        for hit in item["distractor_hits"]:
-            key = hit["explanation"][:80]
-            if key not in error_aggregate:
-                error_aggregate[key] = {
-                    "explanation": hit["explanation"],
-                    "total_count": 0,
-                    "affected_tasks": [],
-                }
-            error_aggregate[key]["total_count"] += hit["count"]
-            error_aggregate[key]["affected_tasks"].append(
-                item.get("skill_name") or item["task_id"]
-            )
-
-    top_errors = sorted(
-        [
-            {
-                "explanation": v["explanation"],
-                "total_count": v["total_count"],
-                "affected_skills": list(dict.fromkeys(v["affected_tasks"]))[:3],
-                "students_pct": round(v["total_count"] / max(n_submitted, 1) * 100, 1),
-            }
-            for v in error_aggregate.values()
-        ],
-        key=lambda x: x["total_count"],
-        reverse=True,
-    )[:5]
+    # The very same function the "Отчёт" uses (EX-11): one threshold (the exam's own), one denominator.
+    agg = aggregate_exam(exam, sessions)
+    avg_time = sum(s.time_spent_seconds or 0 for s in submitted) / len(submitted) if submitted else 0.0
 
     return ExamAnalyticsResponse(
         exam_id=exam_id,
         title=exam.title,
-        total_sessions=total,
-        submitted_sessions=n_submitted,
-        avg_score_pct=round(avg_pct, 1),
+        total_sessions=agg["total_students"],
+        submitted_sessions=agg["submitted_count"],
+        avg_score_pct=agg["avg_score_pct"],
         avg_time_seconds=round(avg_time, 1),
-        pass_rate_pct=round(pass_rate, 1),
-        task_analytics=task_analytics,
-        top_errors=top_errors,
+        pass_rate_pct=agg["pass_rate_pct"],
+        pass_threshold_pct=agg["pass_threshold_pct"],
+        task_analytics=agg["task_analytics"],
+        top_errors=agg["top_errors"],
     )
 
 
@@ -6172,6 +6127,8 @@ class ExamReportResponse(BaseModel):
     submitted_count: int
     avg_score_pct: float
     pass_rate_pct: float
+    # The pass threshold of this exam (locked after the first submitted work, so it is the one the saved numbers used)
+    pass_threshold_pct: int = DEFAULT_PASS_THRESHOLD_PCT
     task_analytics: List[dict] = []
     top_errors: List[dict] = []
     narrative_ru: Optional[str] = None
@@ -6241,6 +6198,7 @@ def generate_exam_report_endpoint(
         submitted_count=report.submitted_count,
         avg_score_pct=float(report.avg_score_pct or 0),
         pass_rate_pct=float(report.pass_rate_pct or 0),
+        pass_threshold_pct=exam_pass_threshold_pct(exam),
         task_analytics=task_analytics,
         top_errors=report.top_errors or [],
         narrative_ru=narrative_ru,
@@ -6283,6 +6241,7 @@ def get_exam_report_endpoint(
         submitted_count=report.submitted_count,
         avg_score_pct=float(report.avg_score_pct or 0),
         pass_rate_pct=float(report.pass_rate_pct or 0),
+        pass_threshold_pct=exam_pass_threshold_pct(exam),
         task_analytics=task_analytics,
         top_errors=report.top_errors or [],
         narrative_ru=narrative_ru,

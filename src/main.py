@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 import anyio.to_thread
+import httpx
 import sqlalchemy
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +22,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 
 from src.core.config import get_settings
 from src.core.exceptions import ExamServiceError
+from src.core.http_pool import close_pools
 from src.core.middleware import RequestIDMiddleware, configure_logging
 from src.api.router import CodedHTTPException, _check_and_auto_close_exam, router
 from src.core.database import SessionLocal, transient_db_failure
@@ -150,7 +152,10 @@ async def lifespan(app: FastAPI):
     # an in-memory SQLite DB; the Postgres-flavored migrations can't run there
     # (and would target a throwaway subprocess DB anyway). Skip them.
     if settings.app_env == "testing":
-        yield
+        try:
+            yield
+        finally:
+            await close_pools()
         return
     # Every database session must run in UTC (ROADMAP #49).  Checked before the first migration: on any other zone the
     # service raises here and does not start, instead of writing shifted timestamps.
@@ -173,6 +178,7 @@ async def lifespan(app: FastAPI):
             await close_expired_exams_task
         except asyncio.CancelledError:
             pass
+        await close_pools()
 
 
 def create_app() -> FastAPI:
@@ -214,6 +220,23 @@ def create_app() -> FastAPI:
             raise exc
         log.warning("transient database failure on %s %s: %s", req.method, req.url.path, type(exc).__name__)
         return JSONResponse(status_code=503, content={"detail": message}, headers={"Retry-After": "2"})
+
+    @app.exception_handler(httpx.HTTPError)
+    async def upstream_error_handler(req: Request, exc: httpx.HTTPError):
+        """EX-28: content-service (or auth-service) down or failing is «try again in a minute» - 503 with Retry-After, never a bare 500.
+
+        Content calls raise ``raise_for_status()`` errors and, after three retries, connection errors; auth calls are caught where
+        they are made.  A 404 of the catalogue is a 404 here too (the textbook/paragraph does not exist), not a server fault.
+        """
+        response = getattr(exc, "response", None)
+        if response is not None and response.status_code == 404:
+            return JSONResponse(status_code=404, content={"detail": "Не найдено в каталоге задач"})
+        log.warning("upstream failure on %s %s: %s", req.method, req.url.path, type(exc).__name__)
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Каталог задач временно недоступен. Повторите попытку через минуту."},
+            headers={"Retry-After": "30"},
+        )
 
     app.include_router(router, prefix="/api/v1")
 

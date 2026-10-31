@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
@@ -16,6 +17,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB as PostgreSQLJSONB
 from sqlalchemy.sql import func
@@ -82,6 +84,10 @@ class GeneratedExam(Base):
     variants_count = Column(Integer, default=1)
     tasks_per_variant = Column(Integer, default=10)
 
+    # Share of the maximum score (1..100 %) from which a student counts as having passed THIS exam.  One number for
+    # the analytics, the report and the report's AI text; locked after the first submitted work (see the router).
+    pass_threshold_pct = Column(Integer, nullable=False, default=60, server_default=text("60"))
+
     # Group binding (nullable = unassigned / library template)
     group_id = Column(String(36), nullable=True, index=True)
     group_name = Column(String(200), nullable=True)
@@ -110,6 +116,7 @@ class GeneratedExam(Base):
             "scheduled_lesson_id",
             "scheduled_lesson_date",
         ),
+        CheckConstraint("pass_threshold_pct BETWEEN 1 AND 100", name="ck_generated_exams_pass_threshold_pct"),
     )
 
 

@@ -18,6 +18,7 @@ import httpx
 from fastapi import HTTPException, Request, status
 
 from src.core.config import get_settings
+from src.core.http_pool import pooled_client
 
 
 log = logging.getLogger("exam_service.auth")
@@ -183,7 +184,7 @@ async def _resolve_staff_actor(request: Request) -> ExamActor:
 
     auth_url = f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/me"
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with pooled_client(timeout=5.0) as client:
             response = await client.get(auth_url, headers=headers)
     except httpx.HTTPError as exc:
         raise HTTPException(
@@ -235,7 +236,7 @@ async def require_group_access(actor: ExamActor, group_id: str) -> dict:
         f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/groups/{group_id}"
     )
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with pooled_client(timeout=5.0) as client:
             response = await client.get(auth_url, headers=dict(actor.auth_headers))
     except httpx.HTTPError as exc:
         raise HTTPException(
@@ -273,7 +274,7 @@ async def require_student_history_access(actor: ExamActor, student_id: str) -> d
         f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/students/{student_id}"
     )
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with pooled_client(timeout=5.0) as client:
             response = await client.get(auth_url, headers=dict(actor.auth_headers))
     except httpx.HTTPError as exc:
         raise HTTPException(
@@ -343,7 +344,7 @@ async def lesson_access(actor: ExamActor, group_id: str) -> Optional[dict]:
         return None
     url = f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/groups/{group_id}/lesson-access"
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with pooled_client(timeout=5.0) as client:
             response = await client.get(url, headers=dict(actor.auth_headers))
     except httpx.HTTPError:
         return None
