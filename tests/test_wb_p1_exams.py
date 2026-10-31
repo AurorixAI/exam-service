@@ -458,11 +458,13 @@ def _auth_transport(groups: list[str], assigned: list[dict], seen: list[str], *,
     """auth-service as the library sees it: only the two list routes exist - any other path (a lookup per group) answers 500."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request.url.path)
+        seen.append(request.url.path + (f"?{request.url.query.decode()}" if request.url.query else ""))
         if request.url.path.endswith("/auth/org/groups"):
             return httpx.Response(groups_status, json=[{"id": g} for g in groups])
         if request.url.path.endswith("/auth/org/substitutions/mine"):
-            return httpx.Response(mine_status, json={"assignedToMe": assigned})
+            # the NEW auth-service: ``past_days`` widens the window back; the older one ignores the parameter and answers from today
+            wanted = int(request.url.params.get("past_days", 0))
+            return httpx.Response(mine_status, json={"assignedToMe": [a for a in assigned if a.get("daysAgo", 0) <= wanted]})
         return httpx.Response(500)
 
     return httpx.MockTransport(handler)
@@ -490,6 +492,7 @@ def test_a_centre_of_50_groups_costs_the_teacher_two_calls_to_auth_per_page(clie
     first = client.get(f"{API}/exams", params={"page": 1, "size": 5}).json()
     assert first["total"] == 9 and len(first["items"]) == 5 and {i["group_id"] for i in first["items"]} <= set(ids[:3])
     assert len(seen) == 2                              # the groups he teaches + his substitute lessons: at most 3, nothing per group
+    assert any(path.endswith("/auth/org/substitutions/mine?past_days=7") for path in seen)
     seen.clear()
     second = client.get(f"{API}/exams", params={"page": 2, "size": 5}).json()
     assert len(second["items"]) == 4 and len(seen) == 2    # «Показать ещё» asks the same two again, not more
@@ -510,6 +513,49 @@ def test_a_failing_substitute_list_leaves_those_lessons_out_but_never_refuses_th
             totals[mine_status] = client.get(f"{API}/exams", params={"page": 1, "size": 50}).json()["total"]
     assert totals == {200: 9 + 1, 500: 9}                      # the one lesson he substitutes in is listed, and only when auth answers
     assert "substitute lessons of user" in caplog.text           # the failure is logged, not silent
+
+
+def test_a_substitute_sees_the_exam_of_yesterdays_lesson_in_the_library(client, db, monkeypatch):
+    """The owner's decision: a substitute keeps seeing, for 7 days, the exam of a lesson he led (what ``lesson-access`` always gave him)."""
+    ids = _centre_of_50_groups(db)
+    real = httpx.AsyncClient
+    yesterday = {"groupId": ids[20], "lessonId": "lesson-0", "lessonDate": "2026-11-03", "daysAgo": 1}
+    today = {"groupId": ids[21], "lessonId": "lesson-1", "lessonDate": "2026-11-04", "daysAgo": 0}
+    monkeypatch.setattr(core_auth.httpx, "AsyncClient", lambda *a, **k: real(*a, transport=_auth_transport(ids[:3], [yesterday, today], [], ), **k))
+    db.get(GeneratedExam, "EXC_21_1").scheduled_lesson_date = "2026-11-04"      # (EXC_20_0 is bound to lesson-0 of 2026-11-03 already)
+    db.commit()
+    _as(TEACHER_A)
+    body = client.get(f"{API}/exams", params={"page": 1, "size": 50}).json()
+    ours = {i["exam_id"] for i in body["items"]}
+    assert {"EXC_20_0", "EXC_21_1"} <= ours                                  # yesterday's lesson AND today's
+    assert "EXC_20_1" not in ours and "EXC_22_0" not in ours                  # another lesson of that group, another group
+    assert body["total"] == 9 + 2
+
+
+def test_an_older_auth_service_that_ignores_past_days_still_answers_from_today(client, db, monkeypatch):
+    """The window of a rolling release: exam new, auth old.  FastAPI skips an unknown query parameter, so the call works; only yesterday's lessons are missing."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    old_auth = FastAPI()
+
+    @old_auth.get("/api/v1/auth/org/substitutions/mine")          # the route of the older auth: no ``past_days`` parameter
+    def mine(status: str = "all"):
+        return {"assignedToMe": [{"groupId": "g", "lessonId": "l", "lessonDate": "2026-11-04"}]}
+
+    assert TestClient(old_auth).get("/api/v1/auth/org/substitutions/mine", params={"past_days": 7}).json() == {
+        "assignedToMe": [{"groupId": "g", "lessonId": "l", "lessonDate": "2026-11-04"}]
+    }
+    ids = _centre_of_50_groups(db)
+    real = httpx.AsyncClient
+    yesterday = {"groupId": ids[20], "lessonId": "lesson-0", "lessonDate": "2026-11-03", "daysAgo": 1}
+    monkeypatch.setattr(
+        core_auth.httpx, "AsyncClient",
+        lambda *a, **k: real(*a, transport=httpx.MockTransport(lambda r: httpx.Response(
+            200, json=[{"id": g} for g in ids[:3]] if r.url.path.endswith("/groups") else {"assignedToMe": []})), **k),
+    )
+    _as(TEACHER_A)
+    assert client.get(f"{API}/exams", params={"page": 1, "size": 50}).json()["total"] == 9
 
 
 def test_without_the_list_of_his_groups_the_library_is_a_503(client, db, monkeypatch):

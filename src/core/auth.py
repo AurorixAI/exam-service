@@ -379,15 +379,20 @@ async def teacher_group_ids(actor: ExamActor) -> set[str]:
     return {str(row["id"]) for row in rows if isinstance(row, dict) and row.get("id")}
 
 
+SUBSTITUTE_PAST_DAYS = 7  # the days back a substitute still sees the exam of a lesson he led (auth-service's lesson-access window)
+
+
 async def assigned_substitution_lessons(actor: ExamActor) -> dict[str, set]:
-    """ONE call: ``{group_id: {(lesson_id, lesson_date)}}`` of the lessons the actor is the SUBSTITUTE in (``GET /org/substitutions/mine`` -> ``assignedToMe``: today and the coming days).
+    """ONE call: ``{group_id: {(lesson_id, lesson_date)}}`` of the lessons the actor is the SUBSTITUTE in (``GET /org/substitutions/mine?past_days=7`` -> ``assignedToMe``:
+    the last 7 days, today and the coming days - the window ``lesson-access`` has always given a substitute).  An auth-service that does not know ``past_days`` ignores it
+    (FastAPI skips an unknown query parameter) and answers from today: the older lessons are then missing from the list, nothing else changes.
 
     Best effort: if it fails, the substitute lessons simply are not listed (and a line is logged); the teacher's own library is never refused because of it.
     """
     url = f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/substitutions/mine"
     try:
         async with pooled_client(timeout=5.0) as client:
-            response = await client.get(url, headers=dict(actor.auth_headers))
+            response = await client.get(url, params={"past_days": SUBSTITUTE_PAST_DAYS}, headers=dict(actor.auth_headers))
         if response.status_code != 200:
             raise ValueError(f"HTTP {response.status_code}")
         assigned = response.json().get("assignedToMe") or []
