@@ -282,6 +282,15 @@ def test_no_database_statement_ever_runs_on_the_event_loop_thread(client, db, st
         return await original(awaitable)
 
     monkeypatch.setattr(router_module, "_run_awaitable", noting)
+
+    async def my_groups(actor):
+        return {TEST_GROUP_ID}
+
+    async def no_substitution(actor):
+        return {}
+
+    monkeypatch.setattr(core_auth, "teacher_group_ids", my_groups)             # the library asks auth for his groups (2 list calls), not per exam
+    monkeypatch.setattr(core_auth, "assigned_substitution_lessons", no_substitution)
     exam = make_exam_in_db(db, tasks=[make_task("TASK_001", answer="3")], status="active")
     exam.access_code = "LOOP0001"
     exam.settings = {**exam.settings, "started_at": (datetime.utcnow() - timedelta(minutes=2)).isoformat()}

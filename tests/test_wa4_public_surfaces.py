@@ -82,6 +82,7 @@ def real_auth(db, monkeypatch):
     calls = []
 
     class FakeAuthClient:
+        cookies = __import__('httpx').Cookies()   # the pooled client sets the cookie policy on its jar
         def __init__(self, *a, **k):
             pass
 

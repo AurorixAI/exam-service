@@ -2782,57 +2782,45 @@ def _submitted_counts(db: Session, exam_ids: list[str]) -> dict[str, int]:
     return {exam_id: count for exam_id, count in rows}
 
 
-def _teacher_visibility_clause(db: Session, query, actor: ExamActor):
+def _teacher_visibility_clause(db: Session, actor: ExamActor, request: Optional[Request] = None):
     """EX-01: what a non-admin may see, as a condition of the SQL query itself - so that the page limit counts only visible exams.
 
     The rule is the one of ``require_exam_access`` (``core.auth.exam_access_group``): an unassigned library template belongs to
-    its author; an exam of a group belongs to whoever may work with that group - the group's teacher, or a substitute for the
-    lessons he substitutes in.  Group access lives in auth-service, so the (few) distinct groups of the already filtered query
-    are asked first - once each, together - and the answer becomes ``group_id IN (...)``.  A group that is gone, foreign or
-    refused hides its exams, exactly as before; an unavailable auth-service is a 503 (never a silently shorter library).
+    its author; an exam of a group belongs to whoever TEACHES that group, or substitutes in the lesson it is bound to.
+
+    Two auth-service calls per request, however many groups the centre has (R3: it used to be one per group of the centre,
+    plus a lesson lookup for each foreign one): the groups he teaches, and his substitute lessons.  Both are kept on the request,
+    so a second use of the clause (count, page) does not ask again.  Unavailable group list = 503 (never a silently shorter
+    library); a failing substitute list only leaves the substitute lessons out (logged).
     """
-    bound = and_(GeneratedExam.scheduled_lesson_id.isnot(None), GeneratedExam.scheduled_lesson_date.isnot(None))
-    rows = (
-        query.with_entities(GeneratedExam.group_id, func.max(case((bound, 1), else_=0)))
-        .filter(GeneratedExam.group_id.isnot(None))
-        .group_by(GeneratedExam.group_id)
-        .all()
-    )
-    has_lessons = {str(group_id): bool(flag) for group_id, flag in rows}
+    scope = getattr(getattr(request, "state", None), "library_scope", None)
+    if scope is None:
+        groups = _await(core_auth.teacher_group_ids(actor), db)
+        substituted = _await(core_auth.assigned_substitution_lessons(actor), db)
+        scope = (groups, substituted)
+        if request is not None:
+            request.state.library_scope = scope
+    groups, substituted = scope
     conditions = [and_(GeneratedExam.group_id.is_(None), GeneratedExam.created_by == actor.user_id)]
-    if has_lessons:
-        outcomes = _await(_group_access_batch(actor, list(has_lessons)), db)
-        allowed: list[str] = []
-        forbidden: list[str] = []
-        for group_id, outcome in outcomes.items():
-            if isinstance(outcome, HTTPException):
-                if outcome.status_code not in {403, 404}:
-                    raise outcome
-                if outcome.status_code == 403 and actor.role == "teacher" and has_lessons[group_id]:
-                    forbidden.append(group_id)  # a substitute is refused on the group but may see the exam of his lesson
-            elif isinstance(outcome, BaseException):
-                raise outcome
-            else:
-                allowed.append(group_id)
-        if allowed:
-            conditions.append(GeneratedExam.group_id.in_(allowed))
-        # LOGIC-B2 (D-1): only the refused groups that hold a lesson-bound exam are asked for the lessons of a substitution
-        substituted = _await(_substitute_lessons_batch(actor, forbidden), db) if forbidden else {}
-        for group_id, lessons in substituted.items():
-            if lessons:
-                conditions.append(and_(
-                    GeneratedExam.group_id == group_id,
-                    or_(*[
-                        and_(GeneratedExam.scheduled_lesson_id == lesson_id, GeneratedExam.scheduled_lesson_date == lesson_date)
-                        for lesson_id, lesson_date in lessons
-                    ]),
-                ))
+    if groups:
+        conditions.append(GeneratedExam.group_id.in_(sorted(groups)))
+    for group_id, lessons in sorted(substituted.items()):
+        if group_id in groups or not lessons:
+            continue
+        conditions.append(and_(
+            GeneratedExam.group_id == group_id,
+            or_(*[
+                and_(GeneratedExam.scheduled_lesson_id == lesson_id, GeneratedExam.scheduled_lesson_date == lesson_date)
+                for lesson_id, lesson_date in sorted(lessons)
+            ]),
+        ))
     return or_(*conditions)
 
 
 @router.get("/exams",
             summary="Список экзаменов (Библиотека учителя)")
 def list_exams(
+    request: Request,
     group_id: Optional[str] = None,
     unassigned: Optional[bool] = None,   # True = only library templates (group_id IS NULL)
     status: Optional[str] = None,        # draft | active | closed | archived
@@ -2870,7 +2858,7 @@ def list_exams(
     # An owner/admin can see the whole organisation.  A teacher can see their own templates and the runs assigned to a
     # group they teach (or lessons they substitute in) - decided in the query, not on the page that is left of it.
     if not actor.is_org_admin:
-        query = query.filter(_teacher_visibility_clause(db, query, actor))
+        query = query.filter(_teacher_visibility_clause(db, actor, request))
 
     paged = page is not None
     if paged:
@@ -3347,11 +3335,14 @@ def update_pass_threshold(
 ):
     """The pass threshold (1..100 % of the maximum score) of one exam.
 
-    It may change until the first work is SUBMITTED: after that every number that counts «passed» (Аналитика, Отчёт, the
+    It may change until the first work is SUBMITTED (or the exam's time is up): after that every number that counts «passed» (Аналитика, Отчёт, the
     text of the report) would silently move under results people already saw - 409.  The exam row is locked for the check
     (lock order of every writer: exam -> sessions), so two requests cannot both pass it.
     """
     exam = _get_exam_for_teacher_operator(db, exam_id, actor)
+    # An exam whose time is up counts as over even if the sweeper has not closed it yet (it runs every 30 s): closing it
+    # now submits the unfinished works, and a submitted work locks the threshold.
+    _check_and_auto_close_exam(db, exam)
     locked = (
         db.query(GeneratedExam)
         .filter(GeneratedExam.id == exam.id)

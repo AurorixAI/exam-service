@@ -188,6 +188,28 @@ def test_threshold_is_locked_after_the_first_submitted_work(client, db):
     assert client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 70}).status_code == 200
 
 
+def test_an_exam_whose_time_is_up_locks_the_threshold_even_before_the_sweeper_closes_it(client, db):
+    """R3 #3: time over, students still «in progress», nobody has submitted: the sweeper (every 30 s) has not closed the exam yet.
+    Changing the threshold now would grade the works that are about to be auto-submitted by a different number."""
+    exam = _exam(db, threshold=60)
+    exam.settings = {**exam.settings, "started_at": (datetime.utcnow() - timedelta(minutes=exam.total_time_minutes + 5)).isoformat()}
+    db.add(ExamSession(id="SES_LATE", exam_id=exam.id, student_name="Late", variant_number=1, answers={"T1": "3"}, max_score=10, status="in_progress", session_token="tok-late"))
+    db.commit()
+    response = client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 90})
+    assert response.status_code == 409 and response.json()["detail"] == MESSAGE_LOCKED
+    db.expire_all()
+    assert db.get(GeneratedExam, exam.id).pass_threshold_pct == 60
+    assert db.get(ExamSession, "SES_LATE").status == "submitted"
+
+
+def test_an_exam_still_running_keeps_the_threshold_editable(client, db):
+    exam = _exam(db, threshold=60)
+    exam.settings = {**exam.settings, "started_at": (datetime.utcnow() - timedelta(minutes=1)).isoformat()}
+    db.add(ExamSession(id="SES_ON", exam_id=exam.id, student_name="On", variant_number=1, answers={}, max_score=10, status="in_progress", session_token="tok-on"))
+    db.commit()
+    assert client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 90}).status_code == 200
+
+
 @pytest.mark.parametrize("bad", [0, 101, "x"])
 def test_patch_refuses_a_threshold_outside_1_100(client, db, bad):
     exam = _exam(db)
@@ -354,20 +376,15 @@ def two_teachers(db, monkeypatch):
     «newest 100 of the whole centre, then filter» library (the old code) shows A nothing at all."""
     calls: list[str] = []
 
-    async def group_access(actor, group_id):
-        calls.append(group_id)
-        owner = GROUP_OWNER.get(str(group_id))
-        if owner is None:
-            raise HTTPException(404, "Группа не найдена")
-        if actor.role == "teacher" and owner != actor.user_id:
-            raise HTTPException(403, "Нет доступа к этой группе")
-        return {"id": group_id, "teacher_id": owner}
+    async def teacher_groups(actor):
+        calls.append(actor.user_id)
+        return {group for group, owner in GROUP_OWNER.items() if owner == actor.user_id}
 
-    async def no_substitution(actor, group_id):
-        return None
+    async def no_substitution(actor):
+        return {}
 
-    monkeypatch.setattr(core_auth, "require_group_access", group_access)
-    monkeypatch.setattr(core_auth, "substitute_lessons", no_substitution)
+    monkeypatch.setattr(core_auth, "teacher_group_ids", teacher_groups)
+    monkeypatch.setattr(core_auth, "assigned_substitution_lessons", no_substitution)
     rows = []
     for index in range(75):
         rows.append(_row(f"EXA_{index:03d}", created_by=TEACHER_A, group_id=GROUP_A if index < 60 else None, n=index))
@@ -437,17 +454,68 @@ def test_filters_apply_with_the_access_rule(client, two_teachers):
     assert body["total"] == 0                                      # B's group is not his, whatever he asks for
 
 
-def test_a_group_lookup_is_made_once_per_group_not_once_per_exam(client, two_teachers):
+def _auth_transport(groups: list[str], assigned: list[dict], seen: list[str], *, groups_status=200, mine_status=200):
+    """auth-service as the library sees it: only the two list routes exist - any other path (a lookup per group) answers 500."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("/auth/org/groups"):
+            return httpx.Response(groups_status, json=[{"id": g} for g in groups])
+        if request.url.path.endswith("/auth/org/substitutions/mine"):
+            return httpx.Response(mine_status, json={"assignedToMe": assigned})
+        return httpx.Response(500)
+
+    return httpx.MockTransport(handler)
+
+
+def _centre_of_50_groups(db):
+    """50 groups, each with 3 exams bound to a lesson; teacher A teaches the first 3."""
+    ids = [f"cccccccc-0000-0000-0000-{i:012d}" for i in range(50)]
+    rows = [
+        _row(f"EXC_{g:02d}_{k}", created_by="USR_BOSS", group_id=group, n=g * 10 + k, lesson=(f"lesson-{k}", "2026-11-03"), status="lobby")
+        for g, group in enumerate(ids) for k in range(3)
+    ]
+    db.add_all(rows)
+    db.commit()
+    return ids
+
+
+def test_a_centre_of_50_groups_costs_the_teacher_two_calls_to_auth_per_page(client, db, monkeypatch):
+    """R3 #1: the library used to ask auth for every group of the centre (and the lesson of each foreign one): 97 calls per page at 50 groups.  Kills a per-group lookup."""
+    ids = _centre_of_50_groups(db)
+    seen: list[str] = []
+    real = httpx.AsyncClient
+    monkeypatch.setattr(core_auth.httpx, "AsyncClient", lambda *a, **k: real(*a, transport=_auth_transport(ids[:3], [], seen), **k))
     _as(TEACHER_A)
-    client.get(f"{API}/exams", params={"page": 1, "size": 50})
-    assert sorted(set(two_teachers)) == [GROUP_A, GROUP_B] and len(two_teachers) == 2
+    first = client.get(f"{API}/exams", params={"page": 1, "size": 5}).json()
+    assert first["total"] == 9 and len(first["items"]) == 5 and {i["group_id"] for i in first["items"]} <= set(ids[:3])
+    assert len(seen) == 2                              # the groups he teaches + his substitute lessons: at most 3, nothing per group
+    seen.clear()
+    second = client.get(f"{API}/exams", params={"page": 2, "size": 5}).json()
+    assert len(second["items"]) == 4 and len(seen) == 2    # «Показать ещё» asks the same two again, not more
 
 
-def test_an_unavailable_auth_service_is_a_503_not_a_shorter_library(client, two_teachers, monkeypatch):
-    async def down(actor, group_id):
-        raise HTTPException(503, "Не удалось проверить доступ к группе. Повторите попытку.")
+def test_a_failing_substitute_list_leaves_those_lessons_out_but_never_refuses_the_library(client, db, monkeypatch, caplog):
+    ids = _centre_of_50_groups(db)
+    real = httpx.AsyncClient
+    assigned = [{"groupId": ids[10], "lessonId": "lesson-1", "lessonDate": "2026-11-03"}]
+    totals = {}
+    for mine_status in (200, 500):
+        monkeypatch.setattr(
+            core_auth.httpx, "AsyncClient",
+            lambda *a, _s=mine_status, **k: real(*a, transport=_auth_transport(ids[:3], assigned, [], mine_status=_s), **k),
+        )
+        _as(TEACHER_A)
+        with caplog.at_level("WARNING", logger="exam_service.auth"):
+            totals[mine_status] = client.get(f"{API}/exams", params={"page": 1, "size": 50}).json()["total"]
+    assert totals == {200: 9 + 1, 500: 9}                      # the one lesson he substitutes in is listed, and only when auth answers
+    assert "substitute lessons of user" in caplog.text           # the failure is logged, not silent
 
-    monkeypatch.setattr(core_auth, "require_group_access", down)
+
+def test_without_the_list_of_his_groups_the_library_is_a_503(client, db, monkeypatch):
+    ids = _centre_of_50_groups(db)
+    real = httpx.AsyncClient
+    monkeypatch.setattr(core_auth.httpx, "AsyncClient", lambda *a, **k: real(*a, transport=_auth_transport(ids[:3], [], [], groups_status=500), **k))
     _as(TEACHER_A)
     assert client.get(f"{API}/exams", params={"page": 1, "size": 50}).status_code == 503
 
@@ -460,10 +528,10 @@ def test_a_substitute_sees_only_the_exam_of_the_lesson_he_substitutes(client, db
     ])
     db.commit()
 
-    async def substitute(actor, group_id):
-        return {lesson} if str(group_id) == GROUP_B else None
+    async def substitute(actor):
+        return {GROUP_B: {lesson}}
 
-    monkeypatch.setattr(core_auth, "substitute_lessons", substitute)
+    monkeypatch.setattr(core_auth, "assigned_substitution_lessons", substitute)
     _as(TEACHER_A)
     ids, total = _all_pages(client, size=100)
     assert "EX_SUB_OK" in ids and "EX_SUB_OTHER" not in ids
@@ -526,6 +594,18 @@ def test_content_service_failure_is_503_with_retry_after(client, failure):
     assert "Internal Server Error" not in response.text
 
 
+@pytest.mark.parametrize("code", [400, 401, 403, 422])
+def test_a_refusal_of_content_service_is_not_a_try_again(client, code):
+    """R3 #9: a wrong service token or a refused request is not transient - no «повторите», no Retry-After, a plain 502."""
+    repo = MagicMock()
+    repo.get_toc.side_effect = _upstream_status(code)
+    with patch("src.api.router.TextbookRepository", return_value=repo):
+        response = client.get(f"{API}/textbooks/x/toc")
+    assert response.status_code == 502
+    assert "Retry-After" not in response.headers
+    assert "Повторите" not in response.text and "минуту" not in response.text
+
+
 def test_a_generation_with_content_service_down_is_503(client):
     repo = MagicMock()
     repo.get_tasks_by_skills.side_effect = httpx.ConnectError("down")
@@ -568,6 +648,30 @@ def test_the_pooled_client_is_one_per_loop_and_timeout_and_is_not_closed_by_the_
     first = asyncio.run(scenario())
     second_loop = asyncio.run(scenario())
     assert first is not second_loop                          # a client never travels to another event loop
+
+
+def test_the_shared_client_keeps_no_cookies_between_calls():
+    """R3 #2: a Set-Cookie answered to one person must not ride on the next person's request (the pool is shared by everybody)."""
+    from src.core.http_pool import close_pools, pooled_client
+
+    sent: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers.get("cookie"))
+        return httpx.Response(200, headers={"set-cookie": "algo_access=USER_A_TOKEN; Path=/"}, json={})
+
+    real = httpx.AsyncClient
+
+    async def scenario():
+        async with pooled_client(timeout=5.0) as client:
+            await client.get("http://auth.internal/api/v1/auth/me", headers={"authorization": "Bearer A"})
+            await client.get("http://auth.internal/api/v1/auth/me", headers={"authorization": "Bearer B"})
+            assert not list(client.cookies.jar)
+        await close_pools()
+
+    with patch.object(httpx, "AsyncClient", lambda *a, **k: real(*a, transport=httpx.MockTransport(handler), **k)):
+        asyncio.run(scenario())
+    assert sent == [None, None]
 
 
 def test_staff_calls_to_auth_share_one_connection_pool(monkeypatch):

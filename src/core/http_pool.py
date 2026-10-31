@@ -6,12 +6,15 @@ new connection (and a handshake) each time.  ``pooled_client`` is a drop-in for 
 
 * One client per (event loop, class, timeout, redirects): connections of a client belong to the loop that opened them, and a
   loop that is gone (a test's ``asyncio.run``) takes its clients with it (``WeakKeyDictionary``).
+* The shared client keeps NO cookies: a ``Set-Cookie`` answer to one person's call must never ride on the next person's request
+  (the pool is shared by every teacher and student; a client that lived for one request could not leak, this one could).
 * The class is part of the key: whoever swaps ``httpx.AsyncClient`` (a test double) gets a client of the swapped class.
 * ``close_pools`` runs at shutdown on the serving loop.
 """
 from __future__ import annotations
 
 import asyncio
+import http.cookiejar
 import weakref
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -19,7 +22,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 # Enough for one worker: staff calls are bounded by `staff_slots`/`heavy_slots`; keep-alive is short so a restarted auth-service is not held on a dead socket.
-_LIMITS = httpx.Limits(max_connections=40, max_keepalive_connections=20, keepalive_expiry=20.0)
+_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=20.0)
 
 _pools: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple, Any]]" = weakref.WeakKeyDictionary()
 
@@ -30,10 +33,9 @@ def _client_for(timeout: float, follow_redirects: bool) -> Any:
     per_loop = _pools.setdefault(loop, {})
     client = per_loop.get(key)
     if client is None or getattr(client, "is_closed", False):
-        try:
-            client = httpx.AsyncClient(timeout=timeout, follow_redirects=follow_redirects, limits=_LIMITS)
-        except TypeError:  # a stand-in class that knows only the timeout
-            client = httpx.AsyncClient(timeout=timeout)
+        client = httpx.AsyncClient(timeout=timeout, follow_redirects=follow_redirects, limits=_LIMITS)
+        # a jar that accepts nothing (``allowed_domains=[]`` refuses every domain): see the module note
+        client.cookies.jar.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
         per_loop[key] = client
     return client
 

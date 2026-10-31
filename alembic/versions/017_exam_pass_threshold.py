@@ -4,8 +4,11 @@ Revision ID: 017_exam_pass_threshold
 Revises: 016_exam_deletions
 
 Owner decision 31.10: the threshold of "the student passed" belongs to the exam (1..100 %, 60 by default); every
-existing exam gets 60.  ``DEFAULT 60`` is a constant, so PostgreSQL adds the column without rewriting the table; the CHECK
-goes in ``NOT VALID`` and is validated afterwards (a validation scans the table but does not block writers).
+existing exam gets 60.  ``DEFAULT 60`` is a constant, so PostgreSQL adds the column without rewriting the table.  The CHECK goes in
+``NOT VALID`` and is validated afterwards, but Alembic runs the whole migration in ONE transaction: ``ADD CONSTRAINT`` holds
+``ACCESS EXCLUSIVE`` on ``generated_exams`` until the commit, so ``VALIDATE`` scans the table under that lock.  That is acceptable
+here (the table holds one row per exam - hundreds, not millions - and the scan takes milliseconds); a table that grows large
+would need ``VALIDATE`` in its own transaction (``autocommit_block``).
 
 Additive and reversible: ``downgrade`` drops the constraint and the column only.
 """

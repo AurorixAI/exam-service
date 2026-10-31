@@ -111,14 +111,14 @@ def test_the_library_query_runs_on_postgresql(monkeypatch):
                     group_id=group if i % 4 == 0 else None, created_at=base + timedelta(minutes=i),
                 )
 
-        async def group_access(actor, group_id):
-            return {"id": group_id, "teacher_id": "T1"}
+        async def my_groups(actor):
+            return {group}
 
-        async def no_substitution(actor, group_id):
-            return None
+        async def no_substitution(actor):
+            return {}
 
-        monkeypatch.setattr(core_auth, "require_group_access", group_access)
-        monkeypatch.setattr(core_auth, "substitute_lessons", no_substitution)
+        monkeypatch.setattr(core_auth, "teacher_group_ids", my_groups)
+        monkeypatch.setattr(core_auth, "assigned_substitution_lessons", no_substitution)
         Session = sessionmaker(bind=engine)
 
         def override_db():

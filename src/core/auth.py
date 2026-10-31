@@ -359,6 +359,48 @@ async def lesson_access(actor: ExamActor, group_id: str) -> Optional[dict]:
     return data
 
 
+async def teacher_group_ids(actor: ExamActor) -> set[str]:
+    """ONE call: the ids of the groups the actor TEACHES (``GET /org/groups?teacher_id=<self>``; a teacher's list is his own groups, a substitute's lessons are not groups).
+
+    Unavailable auth-service is a 503: without this list nobody can tell which exams are his, and a silently shorter library is worse than «try again».
+    """
+    url = f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/groups"
+    try:
+        async with pooled_client(timeout=5.0) as client:
+            response = await client.get(url, params={"teacher_id": actor.user_id}, headers=dict(actor.auth_headers))
+    except httpx.HTTPError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Не удалось проверить доступ к группам. Повторите попытку.") from exc
+    if response.status_code != 200:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Не удалось проверить доступ к группам. Повторите попытку.")
+    try:
+        rows = response.json()
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Не удалось проверить доступ к группам. Повторите попытку.") from exc
+    return {str(row["id"]) for row in rows if isinstance(row, dict) and row.get("id")}
+
+
+async def assigned_substitution_lessons(actor: ExamActor) -> dict[str, set]:
+    """ONE call: ``{group_id: {(lesson_id, lesson_date)}}`` of the lessons the actor is the SUBSTITUTE in (``GET /org/substitutions/mine`` -> ``assignedToMe``: today and the coming days).
+
+    Best effort: if it fails, the substitute lessons simply are not listed (and a line is logged); the teacher's own library is never refused because of it.
+    """
+    url = f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/substitutions/mine"
+    try:
+        async with pooled_client(timeout=5.0) as client:
+            response = await client.get(url, headers=dict(actor.auth_headers))
+        if response.status_code != 200:
+            raise ValueError(f"HTTP {response.status_code}")
+        assigned = response.json().get("assignedToMe") or []
+    except (httpx.HTTPError, ValueError, AttributeError) as exc:
+        log.warning("substitute lessons of user %s are not listed in the library: %s", actor.user_id, type(exc).__name__)
+        return {}
+    lessons: dict[str, set] = {}
+    for item in assigned:
+        if isinstance(item, dict) and item.get("groupId") and item.get("lessonId") and item.get("lessonDate"):
+            lessons.setdefault(str(item["groupId"]), set()).add((str(item["lessonId"]), str(item["lessonDate"])))
+    return lessons
+
+
 async def substitute_lessons(actor: ExamActor, group_id: str) -> Optional[set]:
     """``{(lesson_id, lesson_date)}`` of the group the actor substitutes in, or ``None`` (he does not)."""
     data = await lesson_access(actor, group_id)

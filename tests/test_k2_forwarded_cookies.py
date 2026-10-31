@@ -55,6 +55,7 @@ def test_the_call_to_auth_me_carries_the_access_cookie_only_and_is_asked_again_o
             return {"id": "u1", "default_org_id": "o1", "org_role": "teacher"}
 
     class FakeClient:
+        cookies = __import__('httpx').Cookies()   # the pooled client sets the cookie policy on its jar
         def __init__(self, *a, **k): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *a): return False
@@ -75,6 +76,7 @@ def test_a_401_from_auth_is_a_401_here_at_once(monkeypatch):
         status_code = 401
 
     class FakeClient:
+        cookies = __import__('httpx').Cookies()   # the pooled client sets the cookie policy on its jar
         def __init__(self, *a, **k): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *a): return False

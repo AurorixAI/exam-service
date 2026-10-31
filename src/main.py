@@ -223,14 +223,18 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(httpx.HTTPError)
     async def upstream_error_handler(req: Request, exc: httpx.HTTPError):
-        """EX-28: content-service (or auth-service) down or failing is «try again in a minute» - 503 with Retry-After, never a bare 500.
+        """EX-28: content-service (or auth-service) down is «try again in a minute»: 503 + Retry-After - for network errors, timeouts and its own 5xx ONLY.
 
-        Content calls raise ``raise_for_status()`` errors and, after three retries, connection errors; auth calls are caught where
-        they are made.  A 404 of the catalogue is a 404 here too (the textbook/paragraph does not exist), not a server fault.
+        A 404 of the catalogue is a 404 here too.  Any other 4xx (a wrong service token, a request it refuses) is NOT transient: a plain 502 without
+        «повторите» and without Retry-After, and the code is logged for the operator.
         """
         response = getattr(exc, "response", None)
-        if response is not None and response.status_code == 404:
+        code = response.status_code if response is not None else None
+        if code == 404:
             return JSONResponse(status_code=404, content={"detail": "Не найдено в каталоге задач"})
+        if code is not None and code < 500:
+            log.error("upstream refused %s %s with HTTP %s", req.method, req.url.path, code)
+            return JSONResponse(status_code=502, content={"detail": "Каталог задач отклонил запрос. Сообщите в поддержку, если ошибка повторяется."})
         log.warning("upstream failure on %s %s: %s", req.method, req.url.path, type(exc).__name__)
         return JSONResponse(
             status_code=503,

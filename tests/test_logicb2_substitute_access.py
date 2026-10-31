@@ -64,6 +64,7 @@ def test_lesson_access_fails_closed(monkeypatch):
 
     def client_for(answer):
         class C:
+            cookies = __import__('httpx').Cookies()   # the pooled client sets the cookie policy on its jar
             def __init__(self, *a, **kw): ...
             async def __aenter__(self): return self
             async def __aexit__(self, *a): return False
@@ -106,6 +107,7 @@ def test_the_start_gate_of_a_lesson_exam_is_open_to_the_substitute_of_that_lesso
             return [{"id": "lesson-l1", "groupId": GROUP, "occurrenceDate": "2026-10-26", "startTime": "10:00", "endTime": "11:30"}]
 
     class C:
+        cookies = __import__('httpx').Cookies()   # the pooled client sets the cookie policy on its jar
         def __init__(self, *a, **kw): ...
         async def __aenter__(self): return self
         async def __aexit__(self, *a): return False

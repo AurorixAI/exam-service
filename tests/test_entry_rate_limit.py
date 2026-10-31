@@ -91,6 +91,7 @@ def roster(monkeypatch):
             return self._payload
 
     class _AuthClient:
+        cookies = __import__('httpx').Cookies()   # the pooled client sets the cookie policy on its jar
         def __init__(self, *args, **kwargs):
             pass
 
@@ -995,6 +996,7 @@ class _AuthReply:
 
 def _use_auth_reply(monkeypatch, payload, status=200):
     class _Client:
+        cookies = __import__('httpx').Cookies()   # the pooled client sets the cookie policy on its jar
         def __init__(self, *args, **kwargs):
             pass
 

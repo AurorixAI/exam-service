@@ -147,6 +147,7 @@ class FakeAuth:
         outer = self
 
         class Client:
+            cookies = __import__('httpx').Cookies()   # the pooled client sets the cookie policy on its jar
             def __init__(self, *a, **kw):
                 pass
 

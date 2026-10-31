@@ -185,6 +185,7 @@ def test_open_lobby_of_a_substitute_is_for_the_lesson_the_exam_is_bound_to(monke
             return [{"id": "lesson-l1", "groupId": GROUP, "occurrenceDate": "2099-10-26", "startTime": "10:00", "endTime": "11:30"}]
 
     class C:
+        cookies = __import__('httpx').Cookies()   # the pooled client sets the cookie policy on its jar
         def __init__(self, *a, **kw): ...
         async def __aenter__(self): return self
         async def __aexit__(self, *a): return False
