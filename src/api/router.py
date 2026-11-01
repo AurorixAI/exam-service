@@ -504,7 +504,7 @@ class DraftExamResponse(BaseModel):
     scheduled_lesson_id: Optional[str] = None
     scheduled_lesson_date: Optional[str] = None
     pass_threshold_pct: int = DEFAULT_PASS_THRESHOLD_PCT
-    # True once the exam has begun (or a work is submitted): the threshold can no longer change (PATCH /exams/{id}/pass-threshold answers 409)
+    # True once the exam is not a draft or a lobby any more: the threshold can no longer change (PATCH /exams/{id}/pass-threshold answers 409)
     pass_threshold_locked: bool = False
     settings: Dict[str, Any]
     # Only lifecycle metadata is returned.  The snapshot and answer key remain
@@ -2760,15 +2760,6 @@ def _exam_summary(
     )
 
 
-def _has_submitted_work(db: Session, exam_id: str) -> bool:
-    """Is there a SUBMITTED work in this exam (what locks the pass threshold)?"""
-    return (
-        db.query(ExamSession.id)
-        .filter(ExamSession.exam_id == exam_id, ExamSession.status == "submitted")
-        .first()
-    ) is not None
-
-
 def _submitted_counts(db: Session, exam_ids: list[str]) -> dict[str, int]:
     """{exam id: submitted works}, one query for the whole page."""
     if not exam_ids:
@@ -3323,19 +3314,15 @@ class UpdatePassThresholdRequest(BaseModel):
     pass_threshold_pct: int = Field(..., ge=1, le=100)
 
 
-PASS_THRESHOLD_LOCKED_MESSAGE = "Порог нельзя изменить: по экзамену уже есть сданные работы"
+# ONE rule (owner 31.10): the threshold is the author's to set BEFORE the exam begins - a draft (with or without variants) and a lobby.  From the start
+# of the exam (active), and in every later or other status (closed, archived, print_ready), it is shut.  Nothing else is looked at: a submitted work
+# exists only once the exam is active (see tests/test_wb_p1_exams.py: «a submitted work ⇒ the status is not draft/lobby», on every path that moves a status back).
 PASS_THRESHOLD_STARTED_MESSAGE = "Порог нельзя изменить: экзамен уже начался"
-# The threshold is the owner's to set BEFORE the exam begins: a draft and a lobby.  From the start (active), and after it (closed, archived), it is shut.
-_PASS_THRESHOLD_SHUT_STATUSES = frozenset({"active", "closed", "archived"})
+_PASS_THRESHOLD_OPEN_STATUSES = frozenset({"draft", "variants_ready", "lobby"})
 
 
-def _pass_threshold_lock_message(db: Session, exam: GeneratedExam) -> Optional[str]:
-    """Why the threshold may not change now (the text of the 409), or ``None`` when it may: a submitted work first (the older rule), then «the exam has begun»."""
-    if _has_submitted_work(db, exam.id):
-        return PASS_THRESHOLD_LOCKED_MESSAGE
-    if exam.status in _PASS_THRESHOLD_SHUT_STATUSES:
-        return PASS_THRESHOLD_STARTED_MESSAGE
-    return None
+def _pass_threshold_is_shut(exam: GeneratedExam) -> bool:
+    return exam.status not in _PASS_THRESHOLD_OPEN_STATUSES
 
 
 @router.patch("/exams/{exam_id}/pass-threshold", summary="Изменить проходной порог экзамена")
@@ -3347,15 +3334,11 @@ def update_pass_threshold(
 ):
     """The pass threshold (1..100 % of the maximum score) of one exam.
 
-    It may change while the exam has NOT begun (a draft, a lobby), and, as before, only while no work is SUBMITTED and the exam's time is not up:
-    after that every number that counts «passed» (Аналитика, Отчёт, the text of the report) would silently move under results people already saw
-    - 409 (the text says which: «сданные работы» or «экзамен уже начался»).  The exam row is locked for the check
-    (lock order of every writer: exam -> sessions), so two requests cannot both pass it.
+    It may change only while the exam has NOT begun (a draft, a lobby): from the start, every number that counts «passed» (Аналитика, Отчёт, the text of
+    the report) is about to be seen by people - 409.  The exam row is locked for the check (lock order of every writer: exam -> sessions), so a start
+    and a change cannot both pass it.
     """
     exam = _get_exam_for_teacher_operator(db, exam_id, actor)
-    # An exam whose time is up counts as over even if the sweeper has not closed it yet (it runs every 30 s): closing it
-    # now submits the unfinished works, and a submitted work locks the threshold.
-    _check_and_auto_close_exam(db, exam)
     locked = (
         db.query(GeneratedExam)
         .filter(GeneratedExam.id == exam.id)
@@ -3368,10 +3351,9 @@ def update_pass_threshold(
     if exam_pass_threshold_pct(locked) == req.pass_threshold_pct:
         db.commit()
         return {"exam_id": locked.id, "pass_threshold_pct": req.pass_threshold_pct}
-    reason = _pass_threshold_lock_message(db, locked)
-    if reason:
+    if _pass_threshold_is_shut(locked):
         db.rollback()
-        raise CodedHTTPException(409, "PASS_THRESHOLD_LOCKED", reason)
+        raise CodedHTTPException(409, "PASS_THRESHOLD_LOCKED", PASS_THRESHOLD_STARTED_MESSAGE)
     locked.pass_threshold_pct = req.pass_threshold_pct
     db.commit()
     return {"exam_id": locked.id, "pass_threshold_pct": req.pass_threshold_pct}
@@ -4281,7 +4263,7 @@ def get_exam_draft(
         scheduled_lesson_id=exam.scheduled_lesson_id,
         scheduled_lesson_date=exam.scheduled_lesson_date,
         pass_threshold_pct=exam_pass_threshold_pct(exam),
-        pass_threshold_locked=_pass_threshold_lock_message(db, exam) is not None,
+        pass_threshold_locked=_pass_threshold_is_shut(exam),
         settings=exam.settings or {},
         print_package=_print_package_metadata(db, exam.id),
         skills_covered=exam.skills_covered or [],

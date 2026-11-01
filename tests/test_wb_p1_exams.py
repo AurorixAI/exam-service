@@ -33,7 +33,6 @@ from tests.conftest import (
 )
 
 API = "/api/v1"
-MESSAGE_LOCKED = "Порог нельзя изменить: по экзамену уже есть сданные работы"
 MESSAGE_STARTED = "Порог нельзя изменить: экзамен уже начался"
 BASE = datetime(2026, 9, 1, 8, 0, 0)  # fixed: the order of the library never depends on today's date
 
@@ -175,9 +174,9 @@ def test_threshold_can_change_before_the_exam_begins(client, db, status):
     assert again.status_code == 200 and again.json()["pass_threshold_pct"] == 80
 
 
-@pytest.mark.parametrize("status", ["active", "closed", "archived"])
-def test_threshold_is_shut_once_the_exam_has_begun(client, db, status):
-    """Kills the status rule being removed: active (from the start), closed and archived answer 409 «экзамен уже начался»; the flag of the draft answer agrees."""
+@pytest.mark.parametrize("status", ["active", "closed", "archived", "print_ready"])
+def test_threshold_is_shut_once_the_exam_is_not_a_draft_or_a_lobby(client, db, status):
+    """ONE rule: every status but draft / variants_ready / lobby answers 409 with ONE text; the flag of the draft answer agrees.  Kills the status rule being removed or narrowed."""
     exam = _exam(db, threshold=60, status=status)
     response = client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 90})
     assert response.status_code == 409
@@ -189,42 +188,90 @@ def test_threshold_is_shut_once_the_exam_has_begun(client, db, status):
     assert client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 60}).status_code == 200   # the same number is not a change
 
 
-def test_threshold_is_locked_after_the_first_submitted_work(client, db):
-    """Kills the check being removed, or looking at the wrong status."""
-    exam = _exam(db, threshold=70)
+def test_a_submitted_work_does_not_add_a_second_rule_or_a_second_text(client, db):
+    """The older «есть сданная работа» rule is gone: the status decides, and the text is the same one."""
+    exam = _exam(db, threshold=70)                                            # active
     _submit(client, db, exam, "ANVAR", 5)
     response = client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 50})
-    assert response.status_code == 409
-    assert response.json()["detail"] == MESSAGE_LOCKED
-    assert response.json()["code"] == "PASS_THRESHOLD_LOCKED"
-    db.expire_all()
-    assert db.get(GeneratedExam, exam.id).pass_threshold_pct == 70
-    assert client.get(f"{API}/exams/{exam.id}/draft").json()["pass_threshold_locked"] is True
-    # saving the same number again is not a change
-    assert client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 70}).status_code == 200
+    assert response.status_code == 409 and response.json()["detail"] == MESSAGE_STARTED
+    # and a lobby that (by a defect elsewhere) held a submitted row would still be open: the rule looks at the status only
+    exam.status = "lobby"
+    db.commit()
+    assert client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 50}).status_code == 200
 
 
-def test_an_exam_whose_time_is_up_locks_the_threshold_even_before_the_sweeper_closes_it(client, db):
-    """R3 #3: time over, students still «in progress», nobody has submitted: the sweeper (every 30 s) has not closed the exam yet.
-    Changing the threshold now would grade the works that are about to be auto-submitted by a different number."""
+def test_a_running_exam_whose_time_is_up_is_shut_like_any_running_exam(client, db):
     exam = _exam(db, threshold=60)
     exam.settings = {**exam.settings, "started_at": (datetime.utcnow() - timedelta(minutes=exam.total_time_minutes + 5)).isoformat()}
-    db.add(ExamSession(id="SES_LATE", exam_id=exam.id, student_name="Late", variant_number=1, answers={"T1": "3"}, max_score=10, status="in_progress", session_token="tok-late"))
-    db.commit()
-    response = client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 90})
-    assert response.status_code == 409 and response.json()["detail"] == MESSAGE_LOCKED
-    db.expire_all()
-    assert db.get(GeneratedExam, exam.id).pass_threshold_pct == 60
-    assert db.get(ExamSession, "SES_LATE").status == "submitted"
-
-
-def test_a_running_exam_says_it_has_begun_not_that_works_are_submitted(client, db):
-    exam = _exam(db, threshold=60)
-    exam.settings = {**exam.settings, "started_at": (datetime.utcnow() - timedelta(minutes=1)).isoformat()}
-    db.add(ExamSession(id="SES_ON", exam_id=exam.id, student_name="On", variant_number=1, answers={}, max_score=10, status="in_progress", session_token="tok-on"))
+    db.add(ExamSession(id="SES_LATE", exam_id=exam.id, student_name="Late", variant_number=1, answers={}, max_score=10, status="in_progress", session_token="tok-late"))
     db.commit()
     response = client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 90})
     assert response.status_code == 409 and response.json()["detail"] == MESSAGE_STARTED
+    assert db.get(ExamSession, "SES_LATE").status == "in_progress"           # the request closes nothing: it only refuses
+
+
+# ── the invariant behind the one rule: «a submitted work exists ⇒ the status is not draft / variants_ready / lobby» ─────────────────────────────
+
+def _assert_no_started_exam_looks_unstarted(db):
+    """The whole database: no draft / variants_ready / lobby exam holds a submitted (or in-progress) work."""
+    db.expire_all()
+    bad = (
+        db.query(GeneratedExam.id, GeneratedExam.status)
+        .join(ExamSession, ExamSession.exam_id == GeneratedExam.id)
+        .filter(GeneratedExam.status.in_(["draft", "variants_ready", "lobby"]), ExamSession.status.in_(["submitted", "in_progress"]))
+        .all()
+    )
+    assert bad == []
+
+
+def test_invariant_a_work_is_submitted_only_in_a_running_exam(client, db):
+    """submit refuses in a lobby (410): the only way to a submitted work is an active exam."""
+    exam = _exam(db, status="lobby")
+    db.add(ExamSession(id="SES_LOBBY", exam_id=exam.id, student_name="w", variant_number=1, answers={}, max_score=10, status="waiting", session_token=session_token_for("SES_LOBBY")))
+    db.commit()
+    response = client.post(f"{API}/exam-sessions/SES_LOBBY/submit", json={"answers": {}, "time_spent_seconds": 1}, headers=session_headers("SES_LOBBY"))
+    assert response.status_code in (409, 410)
+    _assert_no_started_exam_looks_unstarted(db)
+
+
+def test_invariant_no_path_moves_an_exam_with_works_back_to_a_draft_or_a_lobby(client, db, monkeypatch):
+    """Every road back (cancel delivery, the lesson cancelled, unbind by «assign», variants, restore from the archive, clone) either refuses or leaves a held exam closed."""
+    from src.api import router
+
+    held = _exam(db, _tasks(5), threshold=70)                                 # active, with a submitted work
+    _submit(client, db, held, "ANVAR", 3)
+    # 1. the teacher cancels the delivery
+    assert client.post(f"{API}/exams/{held.id}/delivery/cancel", json={"reason": "Урок отменён"}).status_code in (409, 422)
+    # 2. the lesson is cancelled / the recurrence ends (internal calls of auth-service): a started exam blocks them
+    monkeypatch.setattr(router, "_require_internal_service_token", lambda token: None)
+    body = {"org_id": TEST_ORG_ID, "group_id": held.group_id, "lesson_id": held.scheduled_lesson_id, "lesson_date": held.scheduled_lesson_date, "reason": "Болезнь"}
+    assert client.post(f"{API}/internal/lesson-bindings/release", json=body).status_code == 409
+    # 3. «assign» without a lesson (unbind) or to another group
+    assert client.post(f"{API}/exams/{held.id}/assign", json={"group_id": TEST_GROUP_ID}).status_code == 409
+    # 4. variants only for a draft
+    assert client.post(f"{API}/exams/{held.id}/generate-variants", params={"variants_count": 2}).status_code == 400
+    _assert_no_started_exam_looks_unstarted(db)
+    # 5. closed -> archived -> restored: it comes back CLOSED (held), never as a draft
+    assert client.post(f"{API}/exams/{held.id}/close").status_code == 200
+    assert client.delete(f"{API}/exams/{held.id}").status_code == 200
+    restored = client.post(f"{API}/exams/{held.id}/restore")
+    assert restored.status_code == 200 and restored.json()["status"] == "closed"
+    # 6. an exam that was archived WITHOUT any attempt comes back as a draft - and has no work to lose
+    fresh = _exam(db, exam_id="EXAM_NOWORK", status="archived")
+    assert client.post(f"{API}/exams/{fresh.id}/restore").json()["status"] in ("draft", "variants_ready")
+    # 7. a clone is a new exam without sessions
+    clone_id = client.post(f"{API}/exams/{held.id}/clone", json={}).json()["exam_id"]
+    assert db.query(ExamSession).filter(ExamSession.exam_id == clone_id).count() == 0
+    _assert_no_started_exam_looks_unstarted(db)
+
+
+def test_invariant_print_exams_have_no_attempt_rows(db):
+    """Results of a printed exam are teacher-checked on paper: the only code that creates an ExamSession is the public online start, which refuses a print exam (410)."""
+    import inspect
+    from src.api import router
+
+    creators = [name for name, fn in inspect.getmembers(router, inspect.isfunction) if "ExamSession(" in inspect.getsource(fn)]
+    assert creators == ["_admit_student_to_exam"]
 
 
 @pytest.mark.parametrize("bad", [0, 101, "x"])
