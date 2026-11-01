@@ -27,6 +27,7 @@ from unittest.mock import patch, MagicMock
 from datetime import date as _date
 
 from tests.conftest import (
+    business_today,
     TEST_GROUP_ID,
     TEST_LESSON_ID,
     make_task,
@@ -142,7 +143,7 @@ class TestPublishExam:
     """
 
     def _lesson(self, **extra):
-        payload = {"lesson_id": TEST_LESSON_ID, "lesson_date": _date.today().isoformat()}
+        payload = {"lesson_id": TEST_LESSON_ID, "lesson_date": business_today().isoformat()}
         payload.update(extra)
         return payload
 
@@ -549,7 +550,7 @@ class TestFullStudentJourney:
             "teacher_name": "Мария Петровна",
             "group_id": TEST_GROUP_ID,
             "lesson_id": TEST_LESSON_ID,
-            "lesson_date": _date.today().isoformat(),
+            "lesson_date": business_today().isoformat(),
         })
         assert pub.status_code == 200
         assert pub.json()["status"] == "lobby"

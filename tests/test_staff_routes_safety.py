@@ -34,6 +34,7 @@ from src.domain import report_generator
 from src.models import ExamPrintPackage, ExamReport, ExamSession, GeneratedExam
 from src.repositories.exam_repo import ExamReportRepository
 from tests.conftest import (
+    business_today,
     TEST_GROUP_ID,
     TEST_ORG_ID,
     TEST_USER_ID,
@@ -363,7 +364,7 @@ def test_assign_changes_nothing_before_the_lesson_lookup(client, db, monkeypatch
     monkeypatch.setattr(router_module, "_resolve_lesson_occurrence", lookup)
     resp = client.post(
         f"{API}/exams/{exam.id}/assign",
-        json={"group_id": TEST_GROUP_ID, "publish": True, "lesson_id": "LSN_X", "lesson_date": datetime.utcnow().date().isoformat()},
+        json={"group_id": TEST_GROUP_ID, "publish": True, "lesson_id": "LSN_X", "lesson_date": business_today().isoformat()},
     )
     assert resp.status_code == 200, resp.text
     assert seen == {"pending": False, "group": None}

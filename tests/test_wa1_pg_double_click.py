@@ -26,7 +26,7 @@ from src.core.auth import require_exam_staff
 from src.core.database import get_db
 from src.models.exam_models import ExamLifecycleEvent, GeneratedExam
 from src.models.shared import Base
-from tests.conftest import TEST_GROUP_ID, TEST_LESSON_ID, TEST_ORG_ID, TEST_USER_ID, make_actor, make_task
+from tests.conftest import business_today, TEST_GROUP_ID, TEST_LESSON_ID, TEST_ORG_ID, TEST_USER_ID, make_actor, make_task
 
 PG_URL = os.getenv("EXAM_WA1_PG_URL")
 pytestmark = pytest.mark.skipif(not PG_URL, reason="set EXAM_WA1_PG_URL (a throwaway Postgres) to run")
@@ -81,7 +81,7 @@ def _exam(factory, status, exam_id="EXAM_PG1"):
         db.add(GeneratedExam(
             id=exam_id, title="PG", variants=[{"variant_number": 1, "tasks": [make_task()]}], settings={}, status=status,
             org_id=TEST_ORG_ID, created_by=TEST_USER_ID, group_id=TEST_GROUP_ID, group_name="8А", class_level=8,
-            scheduled_lesson_id=TEST_LESSON_ID, scheduled_lesson_date=date.today().isoformat(), access_code="PGCODE01",
+            scheduled_lesson_id=TEST_LESSON_ID, scheduled_lesson_date=business_today().isoformat(), access_code="PGCODE01",
             skills_covered=[], toc_ids_used=[],
         ))
         db.commit()
@@ -143,7 +143,7 @@ def _events(factory, event_type):
 
 
 def _lobby_body():
-    return {"lesson_id": TEST_LESSON_ID, "lesson_date": date.today().isoformat()}
+    return {"lesson_id": TEST_LESSON_ID, "lesson_date": business_today().isoformat()}
 
 
 @pytest.mark.parametrize(

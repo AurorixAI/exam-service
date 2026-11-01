@@ -17,7 +17,7 @@ import requests
 from src.core.config import get_settings
 from src.domain import gemini_client, report_generator
 from src.models import ExamReport, ExamSession
-from tests.conftest import make_exam_in_db, make_session_in_db, make_task
+from tests.conftest import business_today, make_exam_in_db, make_session_in_db, make_task
 from tests.test_staff_routes_safety import _graded_exam
 
 API = "/api/v1"
@@ -649,7 +649,7 @@ def test_postgres_two_parallel_forces_pay_once(stub_auth_service, monkeypatch):
                 id="EXAM_PG3", title="PG", variants=[{"variant_number": 1, "tasks": [make_task("TASK_001", answer="3")]}],
                 settings={}, status="closed", org_id=TEST_ORG_ID, created_by=TEST_USER_ID, group_id=TEST_GROUP_ID,
                 group_name="8А", class_level=8, scheduled_lesson_id=TEST_LESSON_ID,
-                scheduled_lesson_date=date.today().isoformat(), access_code="PGCODE03", skills_covered=[], toc_ids_used=[],
+                scheduled_lesson_date=business_today().isoformat(), access_code="PGCODE03", skills_covered=[], toc_ids_used=[],
             ))
             db.flush()
             db.add(ExamSession(

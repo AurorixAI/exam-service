@@ -14,12 +14,12 @@ import src.api.router as router
 from src.core.config import get_settings
 from src.models.exam_models import ExamLifecycleEvent, ExamSession
 from tests.conftest import (
-    TEST_GROUP_ID, TEST_LESSON_ID, TEST_ORG_ID, make_exam_in_db, make_session_in_db, make_task,
+    TEST_GROUP_ID, TEST_LESSON_ID, TEST_ORG_ID, business_today, make_exam_in_db, make_session_in_db, make_task,
 )
 
 REAL_CANONICAL = router._canonical_student_for_exam      # the conftest stub replaces it at fixture time
 TOKEN = "logicb-internal-token"
-TODAY = date.today().isoformat()
+TODAY = business_today().isoformat()
 H = {"X-Internal-Service-Token": TOKEN}
 LESSON = {"org_id": TEST_ORG_ID, "group_id": TEST_GROUP_ID, "lesson_id": TEST_LESSON_ID, "lesson_date": TODAY}
 GROUP = {"org_id": TEST_ORG_ID, "group_id": TEST_GROUP_ID}

@@ -28,6 +28,14 @@ from src.core.config import Settings, get_settings
 from src.models.shared import Base
 from src.models.exam_models import ExamLifecycleEvent, GeneratedExam, ExamSession  # noqa: register tables
 
+def business_today() -> _date:
+    """The business day (Asia/Tashkent) the router asks for. Never ``date.today()`` in a test: the machine's (UTC) day is another day from 19:00 to
+    24:00 UTC and the exam is then «not for today» (LESSONS 76/82)."""
+    from src.api import router
+
+    return router._business_today()
+
+
 # ── SQLite compatibility shim (test-only) ──────────────────────────────────
 # Production runs Postgres; the models use the Postgres ARRAY type
 # (skills_covered / toc_ids_used). SQLite can neither create ARRAY columns nor
@@ -307,7 +315,7 @@ def make_exam_in_db(db, tasks: list = None, status: str = "active") -> Generated
         group_name="8А",
         class_level=8,
         scheduled_lesson_id=TEST_LESSON_ID,
-        scheduled_lesson_date=_date.today().isoformat(),
+        scheduled_lesson_date=business_today().isoformat(),
     )
     db.add(exam)
     db.commit()
