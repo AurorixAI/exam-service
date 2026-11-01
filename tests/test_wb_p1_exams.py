@@ -34,6 +34,7 @@ from tests.conftest import (
 
 API = "/api/v1"
 MESSAGE_LOCKED = "Порог нельзя изменить: по экзамену уже есть сданные работы"
+MESSAGE_STARTED = "Порог нельзя изменить: экзамен уже начался"
 BASE = datetime(2026, 9, 1, 8, 0, 0)  # fixed: the order of the library never depends on today's date
 
 
@@ -158,19 +159,34 @@ def test_a_clone_inherits_the_threshold(client, db, actor):
     assert db.get(GeneratedExam, response.json()["exam_id"]).pass_threshold_pct == 75
 
 
-def test_threshold_can_change_until_the_first_work_is_submitted(client, db):
-    exam = _exam(db, threshold=60)
+@pytest.mark.parametrize("status", ["draft", "variants_ready", "lobby"])
+def test_threshold_can_change_before_the_exam_begins(client, db, status):
+    """Owner's rule: a draft and a lobby may still change the threshold; students waiting in the lobby do not lock it."""
+    exam = _exam(db, threshold=60, status=status)
     assert client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 70}).json() == {
         "exam_id": exam.id, "pass_threshold_pct": 70,
     }
     db.expire_all()
     assert db.get(GeneratedExam, exam.id).pass_threshold_pct == 70
-    # students who are still solving do not lock it: only a SUBMITTED work does
-    for status in ("waiting", "in_progress"):
-        db.add(ExamSession(id=f"SES_{status}", exam_id=exam.id, student_name=status, variant_number=1, answers={}, max_score=100, status=status, session_token=f"tok-{status}"))
+    assert client.get(f"{API}/exams/{exam.id}/draft").json()["pass_threshold_locked"] is False
+    db.add(ExamSession(id="SES_waiting", exam_id=exam.id, student_name="w", variant_number=1, answers={}, max_score=100, status="waiting", session_token="tok-w"))
     db.commit()
     again = client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 80})
     assert again.status_code == 200 and again.json()["pass_threshold_pct"] == 80
+
+
+@pytest.mark.parametrize("status", ["active", "closed", "archived"])
+def test_threshold_is_shut_once_the_exam_has_begun(client, db, status):
+    """Kills the status rule being removed: active (from the start), closed and archived answer 409 «экзамен уже начался»; the flag of the draft answer agrees."""
+    exam = _exam(db, threshold=60, status=status)
+    response = client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 90})
+    assert response.status_code == 409
+    assert response.json()["detail"] == MESSAGE_STARTED
+    assert response.json()["code"] == "PASS_THRESHOLD_LOCKED"
+    db.expire_all()
+    assert db.get(GeneratedExam, exam.id).pass_threshold_pct == 60
+    assert client.get(f"{API}/exams/{exam.id}/draft").json()["pass_threshold_locked"] is True
+    assert client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 60}).status_code == 200   # the same number is not a change
 
 
 def test_threshold_is_locked_after_the_first_submitted_work(client, db):
@@ -202,12 +218,13 @@ def test_an_exam_whose_time_is_up_locks_the_threshold_even_before_the_sweeper_cl
     assert db.get(ExamSession, "SES_LATE").status == "submitted"
 
 
-def test_an_exam_still_running_keeps_the_threshold_editable(client, db):
+def test_a_running_exam_says_it_has_begun_not_that_works_are_submitted(client, db):
     exam = _exam(db, threshold=60)
     exam.settings = {**exam.settings, "started_at": (datetime.utcnow() - timedelta(minutes=1)).isoformat()}
     db.add(ExamSession(id="SES_ON", exam_id=exam.id, student_name="On", variant_number=1, answers={}, max_score=10, status="in_progress", session_token="tok-on"))
     db.commit()
-    assert client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 90}).status_code == 200
+    response = client.patch(f"{API}/exams/{exam.id}/pass-threshold", json={"pass_threshold_pct": 90})
+    assert response.status_code == 409 and response.json()["detail"] == MESSAGE_STARTED
 
 
 @pytest.mark.parametrize("bad", [0, 101, "x"])
