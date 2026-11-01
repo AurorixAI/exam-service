@@ -86,7 +86,12 @@ class GateWiring(unittest.TestCase):
                 self.assertNotIn("gate.outputs.reason", line)
 
     def test_the_deploy_still_runs_only_for_main_and_develop(self):
-        self.assertRegex(job("deploy"), r"if: github\.ref_name == 'main' \|\| github\.ref_name == 'develop'")
+        deploy = job("deploy")
+        self.assertIn("(github.ref_name == 'main' || github.ref_name == 'develop')", deploy)
+        # 01.11: the test jobs can be SKIPPED by the gate; a job downstream of a skipped one is skipped too unless its condition calls a
+        # status function - the first prod skip deployed nothing. The deploy states !cancelled() and the verdict of tests-ok explicitly.
+        self.assertIn("!cancelled()", deploy)
+        self.assertIn("needs.tests-ok.result == 'success'", deploy)
 
 
 class ReuseWiring(unittest.TestCase):

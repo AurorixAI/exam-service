@@ -108,7 +108,10 @@ jobs:
             --skip "${{ needs.gate.outputs.skip_tests }}" --tests "${{ needs.test.result }}" --guards "${{ needs.guards.result }}"
 
   deploy:
-    if: github.ref_name == 'main' || github.ref_name == 'develop'
+    # The test jobs may be SKIPPED by the gate (the same sha passed them on develop). GitHub skips every job downstream of a skipped one
+    # unless its condition calls a status function, so the deploy states it: it runs only when the verdict job tests-ok passed (that job
+    # fails closed: no proof of green tests, no deploy) and never when the run was cancelled. (01.11: without this the first prod skip deployed nothing.)
+    if: ${{ !cancelled() && needs.tests-ok.result == 'success' && (github.ref_name == 'main' || github.ref_name == 'develop') }}
     needs: tests-ok
     runs-on: ubuntu-latest
     steps:
