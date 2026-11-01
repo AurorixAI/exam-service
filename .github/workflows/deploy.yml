@@ -3,7 +3,15 @@ name: Deploy
 # develop -> stage.algolab.me   (algo-preview stack, built from ~/algo/preview-src)
 # main    -> algolab.me         (algo-staging stack — despite the name, production)
 #
-# Deploy only runs if the test job passes.
+# Deploy only runs if the test job passes (tests-ok).
+#
+# CI speed pack #140:
+#  A. The same sha goes through this workflow twice (develop, then main). When the sha
+#     arriving on main has already passed the tests in a run on develop, the job `gate`
+#     says so (.github/scripts/ci_gate.py, fail-closed) and the test job is skipped.
+#  B. The deploy of main reuses the image that stage built for this revision when the
+#     server has one with the same revision, source archive, build configuration and
+#     service (.github/scripts/release_image.py); otherwise it builds, as before.
 
 on:
   push:
@@ -26,17 +34,53 @@ env:
   PREVIEW_CONTAINER: algo-preview-exam
 
 jobs:
-  test:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      skip_tests: ${{ steps.g.outputs.skip_tests }}
+      reason: ${{ steps.g.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Did this exact commit already pass the tests on develop?
+        id: g
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/ci_gate.py gate --repo "${{ github.repository }}" --sha "${{ github.sha }}" \
+            --ref-name "${{ github.ref_name }}" --expect-tests 1 --test-jobs '^test$'
+
+  guards:
+    name: deploy guards
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # Always, also when the gate skips the tests: the logic of the gate, of the image reuse and of the deploy checks is itself code.
       - name: Verify deployment guards without deploying
-        run: python3 .github/scripts/test_deploy_workflow_guards.py
+        run: |
+          for t in .github/scripts/test_*.py; do
+            echo "== $t"
+            python3 "$t"
+          done
+
+  test:
+    needs: gate
+    # Skipped only when the gate proved it. A failed or silent gate leaves skip_tests empty: the tests run.
+    if: ${{ !cancelled() && needs.gate.outputs.skip_tests != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: pip install -r requirements.txt pytest
@@ -47,9 +91,25 @@ jobs:
       - name: Run tests
         run: pytest tests/ -q --tb=short
 
+  tests-ok:
+    if: ${{ always() }}
+    needs: [gate, guards, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tests must pass (or the gate proved it on develop)
+        env:
+          GATE_REASON: ${{ needs.gate.outputs.reason }}
+        run: |
+          echo "gate: ${{ needs.gate.result }}, skip_tests=${{ needs.gate.outputs.skip_tests }}, tests: ${{ needs.test.result }}"
+          echo "gate reason: $GATE_REASON"
+          python3 .github/scripts/ci_gate.py verdict --gate "${{ needs.gate.result }}" \
+            --skip "${{ needs.gate.outputs.skip_tests }}" --tests "${{ needs.test.result }}" --guards "${{ needs.guards.result }}"
+
   deploy:
     if: github.ref_name == 'main' || github.ref_name == 'develop'
-    needs: test
+    needs: tests-ok
     runs-on: ubuntu-latest
     steps:
       - name: Set up deploy key
@@ -118,28 +178,54 @@ jobs:
           previous_image=$(docker inspect --format '{{.Image}}' "$container")
           rollback_tag="algolab-rollback-$project-$service:${sha:0:12}-$run_id"
           docker image tag "$previous_image" "$rollback_tag"
+          # What the build of THIS stack is made of besides the source (dockerfile, target, build args resolved from its env-file): the image that
+          # stage built for this revision is the right one for production only if this fingerprint is the same (release_image.py).
+          release_tool="$root/$srcdir/.github/scripts/release_image.py"
+          fingerprint=$(cd "$root" && docker compose -f "$compose" -p "$project" --env-file "$envfile" config --format json \
+            | python3 "$release_tool" fingerprint --service "$service") || fingerprint=""
           python3 - "$release_dir" "$service" "$sha" "$ref" "$archive_sha" \
-            "$previous_image" "$rollback_tag" "$released_at" <<'PY_RELEASE'
+            "$previous_image" "$rollback_tag" "$released_at" "$fingerprint" <<'PY_RELEASE'
           import json, pathlib, sys
-          release, service, sha, ref, archive, previous, rollback, at = sys.argv[1:]
+          release, service, sha, ref, archive, previous, rollback, at, fingerprint = sys.argv[1:]
           path = pathlib.Path(release)
           build = {"context": str(path / "source"), "labels": {
               "org.opencontainers.image.revision": sha,
               "io.algolab.source.archive.sha256": archive,
+              "io.algolab.build.fingerprint": fingerprint,
+              "io.algolab.service": service,
           }}
           (path / "source.compose.json").write_text(json.dumps({"services": {service: {"build": build}}}))
           (path / "release-record.json").write_text(json.dumps({
               "service": service, "source_sha": sha, "source_ref": ref,
               "source_archive_sha256": archive, "previous_image_id": previous,
-              "rollback_tag": rollback, "released_at": at,
+              "rollback_tag": rollback, "released_at": at, "build_fingerprint": fingerprint,
           }, indent=2) + "\n")
           PY_RELEASE
           cd "$root"
           export RELEASE_SHA="$sha" RELEASE_REF="$ref" RELEASED_AT="$released_at"
-          docker compose -f "$compose" -f "$release_dir/source.compose.json" \
-            -p "$project" --env-file "$envfile" build "$service"
-          docker compose -f "$compose" -f "$release_dir/source.compose.json" \
-            -p "$project" --env-file "$envfile" \
+          compose_files=(-f "$compose" -f "$release_dir/source.compose.json")
+          reuse_id=""
+          if [ -n "$fingerprint" ]; then
+            reuse_id=$(python3 "$release_tool" find --sha "$sha" --fingerprint "$fingerprint" \
+              --archive "$archive_sha" --service "$service") || reuse_id=""
+          fi
+          if [ -n "$reuse_id" ]; then
+            reuse_tag="algolab-reuse-$project-$service:${sha:0:12}-${fingerprint:0:12}"
+            docker image tag "$reuse_id" "$reuse_tag"
+            python3 - "$release_dir" "$service" "$reuse_tag" <<'PY_REUSE'
+          import json, pathlib, sys
+          release, service, tag = sys.argv[1:]
+          (pathlib.Path(release) / "reuse.compose.json").write_text(json.dumps({"services": {service: {"image": tag}}}))
+          PY_REUSE
+            compose_files+=(-f "$release_dir/reuse.compose.json")
+            python3 "$release_tool" note --file "$release_dir/release-record.json" image_source=reused "reused_image_id=$reuse_id" || true
+            echo "Образ переиспользован: $reuse_id (ревизия $sha, отпечаток сборки ${fingerprint:0:12}) -> $reuse_tag; сборка пропущена"
+          else
+            python3 "$release_tool" note --file "$release_dir/release-record.json" image_source=built || true
+            echo "Образа этой ревизии с таким отпечатком сборки на сервере нет - собираю (отпечаток ${fingerprint:0:12})"
+            docker compose "${compose_files[@]}" -p "$project" --env-file "$envfile" build "$service"
+          fi
+          docker compose "${compose_files[@]}" -p "$project" --env-file "$envfile" \
             up -d --no-build --no-deps "$service"
           # Only this application changes; DB/Redis/dependencies stay running.
           docker exec algo-staging-nginx nginx -t
