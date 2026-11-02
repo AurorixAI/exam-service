@@ -53,7 +53,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import and_, case, func, inspect as sa_inspect, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from src.core import auth as core_auth
 from src.core.auth import (
@@ -2680,6 +2680,13 @@ def _exam_deadline_passed(db: Session, exam: GeneratedExam) -> bool:
     return int((datetime.utcnow() - exam_started_at).total_seconds()) >= total_seconds
 
 
+def _without_task_json(query):
+    """EX-07: a list of exams (the library, the live board, the monitor, the sweeper) shows scalar columns; the task JSON of every
+    variant (hundreds of KB per exam) is left in the table.  Whoever really needs it (grading, a finalize, print) reads
+    ``exam.variants`` and the deferred column loads on that first access - one SELECT of one column."""
+    return query.options(defer(GeneratedExam.variants))
+
+
 def _check_and_auto_close_exam(db: Session, exam: Optional[GeneratedExam]) -> bool:
     """
     Checks if an active exam's total duration has expired.
@@ -2860,7 +2867,7 @@ def list_exams(
         page_limit, page_offset = 100, 0
     total = query.count() if (paged or include_meta) else None
     exams = (
-        query
+        _without_task_json(query)
         .order_by(
             GeneratedExam.is_pinned.desc(),   # pinned first
             GeneratedExam.created_at.desc(),
@@ -3060,7 +3067,7 @@ def get_admin_exam_monitor(
 
     # Auto-finalisation remains server authoritative even if no teacher page
     # is open. Re-evaluate the matching page after these transitions.
-    candidate_rows = scoped.order_by(GeneratedExam.updated_at.desc()).all()
+    candidate_rows = _without_task_json(scoped.filter(GeneratedExam.status == "active")).order_by(GeneratedExam.updated_at.desc()).all()
     for exam in candidate_rows:
         if exam.status == "active":
             _check_and_auto_close_exam(db, exam)
@@ -3076,7 +3083,8 @@ def get_admin_exam_monitor(
 
     total = scoped.count()
     rows = (
-        scoped.order_by(GeneratedExam.updated_at.desc(), GeneratedExam.created_at.desc())
+        _without_task_json(scoped)
+        .order_by(GeneratedExam.updated_at.desc(), GeneratedExam.created_at.desc())
         .offset(offset)
         .limit(limit)
         .all()
@@ -3138,7 +3146,7 @@ def get_live_exam_dashboard_summary(
     """
     recent_cutoff = datetime.utcnow() - timedelta(hours=6)
     candidates = (
-        db.query(GeneratedExam)
+        _without_task_json(db.query(GeneratedExam))
         .filter(
             GeneratedExam.org_id == actor.org_id,
             or_(

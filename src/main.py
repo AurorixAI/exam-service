@@ -24,7 +24,7 @@ from src.core.config import get_settings
 from src.core.exceptions import ExamServiceError
 from src.core.http_pool import close_pools
 from src.core.middleware import RequestIDMiddleware, configure_logging
-from src.api.router import CodedHTTPException, _check_and_auto_close_exam, router
+from src.api.router import CodedHTTPException, _check_and_auto_close_exam, _without_task_json, router
 from src.core.database import SessionLocal, transient_db_failure
 from src.core.db_timezone import utc_connect_args, verify_database_timezone
 from src.models.exam_models import GeneratedExam
@@ -104,7 +104,7 @@ def _close_expired_exams_once() -> None:
     db = SessionLocal()
     try:
         active_exams = (
-            db.query(GeneratedExam)
+            _without_task_json(db.query(GeneratedExam))  # EX-07: the sweep reads the clock of the exam, not its tasks (twice a minute, every worker)
             .filter(GeneratedExam.status == "active")
             .all()
         )
