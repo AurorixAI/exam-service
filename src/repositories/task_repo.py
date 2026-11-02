@@ -91,23 +91,6 @@ class TextbookRepository:
         resp.raise_for_status()
         return resp.json()
 
-    def get_toc_skills(self, toc_id: int) -> List[dict]:
-        resp = content_client.get(f"{BASE}/toc/{toc_id}/skills")
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_coverage(self, textbook_id: str) -> List[dict]:
-        resp = content_client.get(f"{BASE}/textbooks/{textbook_id}/coverage")
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_by_id(self, textbook_id: str) -> Optional[dict]:
-        resp = content_client.get(f"{BASE}/textbooks/{textbook_id}")
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        return resp.json()
-
     def get_skill_tree(self, class_level: Optional[int] = None) -> List[dict]:
         params: dict = {"with_task_counts": True}
         if class_level:

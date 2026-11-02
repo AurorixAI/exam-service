@@ -696,7 +696,7 @@ def test_content_service_failure_is_503_with_retry_after(client, failure):
     repo = MagicMock()
     repo.get_toc.side_effect = failure
     with patch("src.api.router.TextbookRepository", return_value=repo):
-        response = client.get(f"{API}/textbooks/x/toc")
+        response = client.get(f"{API}/textbooks/x/toc/tree")
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "30"
     assert "Internal Server Error" not in response.text
@@ -708,7 +708,7 @@ def test_a_refusal_of_content_service_is_not_a_try_again(client, code):
     repo = MagicMock()
     repo.get_toc.side_effect = _upstream_status(code)
     with patch("src.api.router.TextbookRepository", return_value=repo):
-        response = client.get(f"{API}/textbooks/x/toc")
+        response = client.get(f"{API}/textbooks/x/toc/tree")
     assert response.status_code == 502
     assert "Retry-After" not in response.headers
     assert "Повторите" not in response.text and "минуту" not in response.text
@@ -726,7 +726,7 @@ def test_a_missing_catalogue_entry_stays_a_404(client):
     repo = MagicMock()
     repo.get_toc.side_effect = _upstream_status(404)
     with patch("src.api.router.TextbookRepository", return_value=repo):
-        assert client.get(f"{API}/textbooks/x/toc").status_code == 404
+        assert client.get(f"{API}/textbooks/x/toc/tree").status_code == 404
 
 
 # ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────

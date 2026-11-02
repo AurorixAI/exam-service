@@ -54,13 +54,9 @@ def test_ex35_any_localhost_port_is_allowed_only_in_development(monkeypatch, app
 # ── EX-36: the textbook catalogue ────────────────────────────────────────────────────────────────────────────
 CATALOGUE = [
     "/textbooks",
-    "/textbooks/TB1",
-    "/textbooks/TB1/toc",
     "/textbooks/TB1/toc/tree",
-    "/textbooks/TB1/coverage",
     "/textbooks/TB1/tasks?limit=200&offset=0",
     "/textbooks/skills/tree",
-    "/toc/7/skills",
 ]
 
 

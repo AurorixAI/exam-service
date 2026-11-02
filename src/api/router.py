@@ -361,17 +361,6 @@ class TextbookInfo(BaseModel):
     cover_image_url: Optional[str] = None
 
 
-class TextbookDetail(TextbookInfo):
-    subtitle: Optional[str] = None
-    publisher: Optional[str] = None
-    isbn: Optional[str] = None
-    edition: Optional[str] = None
-    country: str = "KZ"
-    language: str = "ru"
-    total_pages: Optional[int] = None
-    is_active: bool = True
-
-
 class TocNode(BaseModel):
     id: int
     parent_id: Optional[int] = None
@@ -423,25 +412,6 @@ class TextbookTaskInfo(BaseModel):
     question_latex: Optional[str] = None
     answer_type: str = "exact_number"
     has_template: bool = False
-
-
-class SkillInParagraph(BaseModel):
-    skill_id: str
-    skill_name: str
-    role: str = "primary"
-    confidence: float = 0.8
-    is_main: bool = False
-    tasks_count: int = 0
-
-
-class CoverageItem(BaseModel):
-    toc_id: int
-    level: Union[str, int] = 1
-    number: Optional[str] = None
-    title: str = ""
-    skills_mapped: int = 0
-    tasks_available: int = 0
-    is_digitized: bool = True
 
 
 class PublishExamResponse(BaseModel):
@@ -5755,34 +5725,6 @@ def list_textbooks(
     return [TextbookInfo(**r) for r in rows]
 
 
-@router.get("/textbooks/{textbook_id}/toc", response_model=List[TocNode],
-            dependencies=[Depends(require_exam_staff)],
-            summary="Оглавление учебника")
-def get_toc(textbook_id: str):
-    rows = TextbookRepository().get_toc(textbook_id)
-    if not rows:
-        raise HTTPException(404, "Учебник не найден или пуст")
-    return [TocNode(**r) for r in rows]
-
-
-@router.get("/textbooks/{textbook_id}/coverage", response_model=List[CoverageItem],
-            dependencies=[Depends(require_exam_staff)],
-            summary="Покрытие учебника задачами")
-def get_coverage(textbook_id: str):
-    rows = TextbookRepository().get_coverage(textbook_id)
-    return [CoverageItem(**r) for r in rows]
-
-
-@router.get("/toc/{toc_id}/skills", response_model=List[SkillInParagraph],
-            dependencies=[Depends(require_exam_staff)],
-            summary="Навыки параграфа")
-def get_toc_skills(toc_id: int):
-    rows = TextbookRepository().get_toc_skills(toc_id)
-    return [SkillInParagraph(**r) for r in rows]
-
-
-# ── must be before /{textbook_id} to avoid route shadowing ────────────────
-
 @router.get("/textbooks/skills/tree", response_model=List[SkillTreeNode],
             dependencies=[Depends(require_exam_staff)],
             summary="Дерево навыков (L1→L4) для режима «По программе»")
@@ -5807,16 +5749,6 @@ def get_skill_tree(
         else:
             roots.append(node)
     return roots
-
-
-@router.get("/textbooks/{textbook_id}", response_model=TextbookDetail,
-            dependencies=[Depends(require_exam_staff)],
-            summary="Полная информация об учебнике")
-def get_textbook(textbook_id: str):
-    row = TextbookRepository().get_by_id(textbook_id)
-    if not row:
-        raise HTTPException(404, "Учебник не найден")
-    return TextbookDetail(**row)
 
 
 @router.get("/textbooks/{textbook_id}/toc/tree", response_model=List[TocNode],
