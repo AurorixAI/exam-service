@@ -5389,7 +5389,9 @@ def get_session_status(
     db: Session = Depends(get_db),
     session_token: Optional[str] = Header(None, alias="X-Exam-Session-Token"),
 ):
-    exam = ExamRepository(db).get_by_access_code(code)
+    # WC-B EX-06: the lobby poll (every student, every 1.5 s) never reads the task JSON of the exam; the branch that builds
+    # the student's tasks reads ``exam.variants`` itself, and the deferred column loads on that first access (once per student).
+    exam = ExamRepository(db).get_by_access_code(code, without_tasks=True)
     if not exam:
         raise HTTPException(404, "Экзамен не найден")
     if exam.delivery_mode == "print":
