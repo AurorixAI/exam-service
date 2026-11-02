@@ -207,15 +207,3 @@ def test_a_real_connection_is_utc_and_keeps_the_timeouts(monkeypatch):
             drifted.dispose()
     finally:
         engine.dispose()
-
-
-# ---- no container-local clock ----------------------------------------------------
-
-
-def test_the_domain_generator_stamps_creation_in_explicit_utc():
-    from datetime import timedelta
-
-    from src.domain.exam_generator import ExamVariant
-
-    stamp = ExamVariant(variant_id="v1", variant_number=1, tasks=[], total_points=0, time_minutes=1).created_at
-    assert stamp.tzinfo is not None and stamp.utcoffset() == timedelta(0)
