@@ -116,23 +116,11 @@ def test_switch_on_without_any_key_makes_no_request(monkeypatch, wire):
     assert wire.posts == []
 
 
-@pytest.mark.parametrize("purpose", ["report_narrative", "task_templatize", "other"])
+@pytest.mark.parametrize("purpose", ["report_narrative", "other"])
 def test_the_switch_stops_every_paid_call_of_the_service(monkeypatch, wire, purpose):
     set_env(monkeypatch, flag="false", azure=True, gemini=True)
     with pytest.raises(gemini_client.NarrativeDisabledError):
         gemini_client.call_gemini(SECRET_PROMPT, purpose=purpose)
-    assert wire.posts == []                                   # incl. the variant templating chain
-
-
-def test_the_variant_templatizer_makes_no_request_while_the_switch_is_off(monkeypatch, wire):
-    from src.domain import llm_templatizer
-
-    set_env(monkeypatch, flag="false", azure=True, gemini=True)
-    monkeypatch.setattr(gemini_client, "get_model", lambda *_: "m", raising=False)
-    try:
-        llm_templatizer.templatize_via_llm("Найдите x", "x+1=4", "3", "exact_number")
-    except Exception:
-        pass
     assert wire.posts == []
 
 

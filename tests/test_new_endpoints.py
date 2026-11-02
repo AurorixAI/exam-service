@@ -3,7 +3,6 @@ Tests for newly added endpoints:
   - POST /exams/{id}/close
   - GET  /exams/{id}/sessions
   - GET  /exams/{id}/analytics
-  - POST /exams/{id}/generate-variants
 """
 from __future__ import annotations
 
@@ -300,38 +299,3 @@ class TestAnalytics:
     def test_analytics_nonexistent_exam(self, client):
         resp = client.get("/api/v1/exams/NOEXIST/analytics")
         assert resp.status_code == 404
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Generate variants
-# ═══════════════════════════════════════════════════════════════════════════
-
-class TestGenerateVariants:
-    def test_generate_variants_calls_orchestrator(self, client, db):
-        tasks = [make_task(f"T{i}", answer=str(i)) for i in range(3)]
-        exam = make_exam_in_db(db, tasks=tasks, status="draft")
-
-        # Mock the orchestrator
-        mock_report = MagicMock()
-        mock_report.variants = [MagicMock(to_dict=lambda: {"variant_number": i+1, "tasks": tasks}) for i in range(3)]
-        mock_report.total_variants = 3
-        mock_report.templatized_count = 2
-        mock_report.original_count = 1
-
-        with patch("src.api.router.VariantOrchestrator") as MockOrch:
-            MockOrch.return_value.generate_variants.return_value = mock_report
-            resp = client.post(f"/api/v1/exams/{exam.id}/generate-variants?variants_count=3")
-
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["variants_count"] == 3
-        assert data["status"] == "variants_ready"
-
-    def test_generate_variants_nonexistent_exam(self, client):
-        resp = client.post("/api/v1/exams/NOEXIST/generate-variants?variants_count=3")
-        assert resp.status_code == 404
-
-    def test_generate_variants_for_active_exam_fails(self, client, db):
-        exam = make_exam_in_db(db, status="active")
-        resp = client.post(f"/api/v1/exams/{exam.id}/generate-variants?variants_count=3")
-        assert resp.status_code == 400

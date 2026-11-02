@@ -235,7 +235,7 @@ def test_invariant_a_work_is_submitted_only_in_a_running_exam(client, db):
 
 
 def test_invariant_no_path_moves_an_exam_with_works_back_to_a_draft_or_a_lobby(client, db, monkeypatch):
-    """Every road back (cancel delivery, the lesson cancelled, unbind by «assign», variants, restore from the archive, clone) either refuses or leaves a held exam closed."""
+    """Every road back (cancel delivery, the lesson cancelled, unbind by «assign», restore from the archive, clone) either refuses or leaves a held exam closed."""
     from src.api import router
 
     held = _exam(db, _tasks(5), threshold=70)                                 # active, with a submitted work
@@ -248,18 +248,16 @@ def test_invariant_no_path_moves_an_exam_with_works_back_to_a_draft_or_a_lobby(c
     assert client.post(f"{API}/internal/lesson-bindings/release", json=body).status_code == 409
     # 3. «assign» without a lesson (unbind) or to another group
     assert client.post(f"{API}/exams/{held.id}/assign", json={"group_id": TEST_GROUP_ID}).status_code == 409
-    # 4. variants only for a draft
-    assert client.post(f"{API}/exams/{held.id}/generate-variants", params={"variants_count": 2}).status_code == 400
     _assert_no_started_exam_looks_unstarted(db)
-    # 5. closed -> archived -> restored: it comes back CLOSED (held), never as a draft
+    # 4. closed -> archived -> restored: it comes back CLOSED (held), never as a draft
     assert client.post(f"{API}/exams/{held.id}/close").status_code == 200
     assert client.delete(f"{API}/exams/{held.id}").status_code == 200
     restored = client.post(f"{API}/exams/{held.id}/restore")
     assert restored.status_code == 200 and restored.json()["status"] == "closed"
-    # 6. an exam that was archived WITHOUT any attempt comes back as a draft - and has no work to lose
+    # 5. an exam that was archived WITHOUT any attempt comes back as a draft - and has no work to lose
     fresh = _exam(db, exam_id="EXAM_NOWORK", status="archived")
     assert client.post(f"{API}/exams/{fresh.id}/restore").json()["status"] in ("draft", "variants_ready")
-    # 7. a clone is a new exam without sessions
+    # 6. a clone is a new exam without sessions
     clone_id = client.post(f"{API}/exams/{held.id}/clone", json={}).json()["exam_id"]
     assert db.query(ExamSession).filter(ExamSession.exam_id == clone_id).count() == 0
     _assert_no_started_exam_looks_unstarted(db)

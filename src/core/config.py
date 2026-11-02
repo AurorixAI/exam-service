@@ -59,9 +59,8 @@ class Settings(BaseSettings):
     # INTERNAL_SERVICE_TOKEN; with neither (development) a random per-process key and a warning.
     entry_limit_secret: str = ""
 
-    # Redis — template cache
+    # Redis
     redis_url: str = "redis://localhost:6379"
-    redis_template_cache_ttl: int = 3600  # 1 hour
 
     # Emergency switch for every paid report-narrative model call (REPORT_NARRATIVE_ENABLED).
     # On by default: the narrative is a product feature.  "false" / "0" / "no" / "off" turns it off; the
@@ -81,7 +80,6 @@ class Settings(BaseSettings):
 
     # Exam parameters
     max_tasks_per_exam: int = 50
-    max_variants: int = 30
     default_time_minutes: int = 45
 
     # CORS

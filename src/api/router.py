@@ -100,11 +100,6 @@ from src.domain.print_package import (
 )
 from src.domain.print_pdf import render_student_exam_pdf, render_teacher_key_pdf
 
-try:
-    from src.domain.variant_orchestrator import VariantOrchestrator
-except Exception:  # pragma: no cover
-    VariantOrchestrator = None  # type: ignore
-
 log = logging.getLogger("exam_router")
 
 router = APIRouter()
@@ -130,8 +125,6 @@ class GenerateExamRequest(BaseModel):
     tasks_count: int = Field(10, ge=1, le=50)
     difficulty_distribution: Optional[Dict[str, float]] = None  # easy/medium/hard → %
     time_minutes: int = Field(45, ge=5, le=180)
-    variants_count: int = Field(1, ge=1, le=30)
-    generate_variants: bool = False
     # Questions always preserve the prepared section order.  Only online
     # multiple-choice options may be shuffled per student.
     shuffle_options: bool = True
@@ -2437,17 +2430,6 @@ def generate_exam(
         tasks_per_variant=len(tasks),
         pass_threshold_pct=req.pass_threshold_pct,
     )
-
-    # Optional: auto-generate variants via VariantOrchestrator
-    if req.generate_variants and req.variants_count > 1:
-        try:
-            orch = VariantOrchestrator(db=db)
-            report = orch.generate_variants(tasks, req.variants_count, seed=42)
-            exam.variants = [v.to_dict() for v in report.variants]
-            exam.variants_count = report.total_variants
-            exam.status = "variants_ready"
-        except Exception as exc:
-            log.warning("Variant generation failed, keeping single variant: %s", exc)
 
     if req.delivery_mode == "print":
         # This remains editable while the exam is a draft.  The exact
@@ -6015,52 +5997,6 @@ def close_exam(
         "exam_id": exam_id,
         "status": "closed",
         "finalized_sessions": finalized_count,
-    }
-
-
-@router.post("/exams/{exam_id}/generate-variants",
-             summary="Запустить генерацию вариантов для экзамена")
-def generate_variants(
-    exam_id: str,
-    variants_count: int = Query(5, ge=2, le=30),
-    db: Session = Depends(get_db),
-    actor: ExamActor = Depends(require_exam_staff),
-):
-    exam = _get_exam_for_teacher_operator(db, exam_id, actor)
-    if exam.status not in ("draft", "variants_ready"):
-        raise HTTPException(400, "Генерация вариантов возможна только для черновиков")
-
-    tasks_raw = (exam.variants or [{}])[0].get("tasks", [])
-    if not tasks_raw:
-        raise HTTPException(400, "Экзамен не содержит задач")
-
-    try:
-        orch = VariantOrchestrator(db=db)
-        report = orch.generate_variants(tasks_raw, variants_count, seed=42)
-        new_variants = [v.to_dict() for v in report.variants]
-    except Exception as exc:
-        log.error("Variant generation failed for %s: %s", exam_id, exc)
-        raise HTTPException(500, f"Ошибка генерации вариантов: {exc}")
-
-    # The variants are written under the exam's row lock, on the state they were generated from: a twin request, or a
-    # replaced task, while the generator ran must not be silently overwritten.
-    exam = _lock_exam_for_transition(
-        db, exam, {"draft", "variants_ready"}, "Генерация вариантов возможна только для черновиков"
-    )
-    if (exam.variants or [{}])[0].get("tasks", []) != tasks_raw:
-        db.rollback()
-        raise HTTPException(409, "Черновик изменился, повторите")
-    try:
-        ExamRepository(db).update_variants(exam, new_variants, report.total_variants)
-    except Exception as exc:
-        log.error("Variant generation failed for %s: %s", exam_id, exc)
-        raise HTTPException(500, f"Ошибка генерации вариантов: {exc}")
-    return {
-        "exam_id": exam_id,
-        "status": "variants_ready",
-        "variants_count": report.total_variants,
-        "templatized_tasks": report.tasks_templatized,
-        "original_tasks": report.tasks_fallback,
     }
 
 

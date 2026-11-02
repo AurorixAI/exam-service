@@ -120,38 +120,6 @@ class TaskMaster(Base):
     toc_entry = relationship("TextbookToc", back_populates="tasks")
 
 
-# ── task_templates (variant generation cache) ─────────────────────────────
-
-class TaskTemplateDB(Base):
-    __tablename__ = "task_templates"
-
-    id = Column(String(30), primary_key=True)
-    original_task_id = Column(String(30), ForeignKey("tasks_master.id"))
-    skill_id = Column(String(30), ForeignKey("knowledge_hierarchy.id"))
-
-    template_text = Column(Text)
-    template_latex = Column(Text)
-    parameters = Column(JSONB)
-    constraints = Column(JSONB)
-    answer_formula = Column(Text)
-
-    # Extended fields
-    task_type = Column(String(30))
-    text_template = Column(Text)
-    original_values = Column(JSONB)
-    param_details = Column(JSONB)
-    answer_formula_sympy = Column(Text)
-    constraints_repr = Column(Text)
-
-    generation_method = Column(String(20), default="llm")
-    quality_score = Column(Float, default=0.0)
-    tested_combinations = Column(Integer, default=0)
-    successful_combinations = Column(Integer, default=0)
-    is_active = Column(Boolean, default=True)
-
-    created_at = Column(DateTime, server_default=func.now())
-
-
 # ── textbooks ──────────────────────────────────────────────────────────────
 
 class Textbook(Base):

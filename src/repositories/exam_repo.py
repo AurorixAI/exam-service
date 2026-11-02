@@ -57,12 +57,6 @@ class ExamRepository:
         self.db.refresh(exam)
         return exam
 
-    def update_variants(self, exam: GeneratedExam, variants: list, count: int) -> None:
-        exam.variants = variants
-        exam.variants_count = count
-        exam.status = "variants_ready"
-        self.db.commit()
-
     def delete(self, exam: GeneratedExam) -> None:
         self.db.query(ExamReport).filter(ExamReport.exam_id == exam.id).delete()
         self.db.query(ExamSession).filter(ExamSession.exam_id == exam.id).delete()

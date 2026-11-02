@@ -710,37 +710,6 @@ def test_round_open_lobby_refuses_when_the_group_changed_during_the_lookup(clien
     assert _fresh(db, exam.id).status == "variants_ready"
 
 
-class _Report:
-    total_variants, tasks_templatized, tasks_fallback = 2, 1, 1
-
-    class _Variant:
-        def to_dict(self):
-            return {"variant_number": 1, "tasks": []}
-
-    variants = [_Variant(), _Variant()]
-
-
-@pytest.mark.parametrize("change", [{"status": "closed"}, {"variants": [{"variant_number": 1, "tasks": [{"task_id": "OTHER"}]}]}])
-def test_round_generate_variants_writes_nothing_when_the_exam_changed_meanwhile(client, db, monkeypatch, change):
-    exam = _exam(db, "variants_ready")
-
-    class Orchestrator:
-        def __init__(self, db):
-            pass
-
-        def generate_variants(self, tasks, count, seed):
-            db.query(GeneratedExam).filter(GeneratedExam.id == exam.id).update(change)
-            db.commit()
-            return _Report()
-
-    monkeypatch.setattr(router_module, "VariantOrchestrator", Orchestrator)
-    before = _fresh(db, exam.id).variants_count
-    resp = client.post(f"{API}/exams/{exam.id}/generate-variants?variants_count=2")
-    assert resp.status_code in (400, 409), resp.text
-    stored = _fresh(db, exam.id)
-    assert stored.variants_count == before and stored.status == change.get("status", "variants_ready")
-
-
 def test_round_print_start_reads_the_package_state_after_the_lock(client, db, monkeypatch):
     exam = _exam(db, "print_ready", delivery="print")
     _package(db, exam, "ready")

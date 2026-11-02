@@ -66,7 +66,6 @@ def _refused_calls(exam):
         "replace-task": ("post", f"/exams/{exam.id}/draft/replace-task", {"variant_number": 1, "task_id": "TASK_001", "old_task_id": "TASK_001", "new_task_id": "TASK_002"}),
         "publish": ("post", f"/exams/{exam.id}/publish", {"lesson_id": TEST_LESSON_ID, "lesson_date": d}),
         "assign": ("post", f"/exams/{exam.id}/assign", {"group_id": TEST_GROUP_ID, "lesson_id": TEST_LESSON_ID, "lesson_date": d}),
-        "generate-variants": ("post", f"/exams/{exam.id}/generate-variants?variants_count=3", None),
         "entry-limits reset": ("post", f"/exams/{exam.id}/entry-limits/reset", None),
         "print-layout": ("put", f"/exams/{exam.id}/print-layout", {"layout": {}}),
         "print-package prepare": ("post", f"/exams/{exam.id}/print-package/prepare", {"group_id": TEST_GROUP_ID, "lesson_id": TEST_LESSON_ID, "lesson_date": d}),

@@ -358,7 +358,6 @@ class TestSettings:
             app_env="testing",
         )
         assert s.max_tasks_per_exam == 50
-        assert s.max_variants == 30
         assert s.default_time_minutes == 45
         assert s.gemini_model == "gemini-2.5-flash"
 
