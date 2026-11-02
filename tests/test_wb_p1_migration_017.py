@@ -51,7 +51,7 @@ def test_017_gives_every_existing_exam_60_enforces_1_100_and_is_reversible(monke
             _insert(conn, "EXAM_OLD2", status="archived")
             assert "pass_threshold_pct" not in {c["name"] for c in sa.inspect(conn).get_columns("generated_exams")}
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "017_exam_pass_threshold")
         inspector = sa.inspect(engine)
         column = next(c for c in inspector.get_columns("generated_exams") if c["name"] == "pass_threshold_pct")
         assert column["nullable"] is False
@@ -71,7 +71,7 @@ def test_017_gives_every_existing_exam_60_enforces_1_100_and_is_reversible(monke
             with engine.begin() as conn:
                 _insert(conn, f"EXAM_EDGE{edge}", pass_threshold_pct=edge)
 
-        command.downgrade(config, "-1")
+        command.downgrade(config, "016_exam_deletions")
         inspector = sa.inspect(engine)
         assert "pass_threshold_pct" not in {c["name"] for c in inspector.get_columns("generated_exams")}
         with engine.connect() as conn:

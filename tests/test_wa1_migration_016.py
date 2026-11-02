@@ -40,14 +40,14 @@ def test_016_upgrades_downgrades_and_upgrades_again_without_touching_exams(monke
             ))
             assert "exam_deletions" not in sa.inspect(conn).get_table_names()
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "016_exam_deletions")
         inspector = sa.inspect(engine)
         columns = {c["name"]: c for c in inspector.get_columns("exam_deletions")}
         assert set(columns) == {"id", "exam_id", "org_id", "title", "deleted_by", "deleted_at", "reason"}
         assert inspector.get_foreign_keys("exam_deletions") == []  # must outlive the exam
         assert {i["name"] for i in inspector.get_indexes("exam_deletions")} >= {"idx_exam_deletions_org_time", "idx_exam_deletions_exam"}
 
-        command.downgrade(config, "-1")
+        command.downgrade(config, "015_repair_derivative_distractor")
         assert "exam_deletions" not in sa.inspect(engine).get_table_names()
 
         command.upgrade(config, "head")
