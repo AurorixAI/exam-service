@@ -6,7 +6,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, defer
 
@@ -36,9 +35,11 @@ class ExamRepository:
 
     def get_by_access_code(self, code: str, *, without_tasks: bool = False) -> Optional[GeneratedExam]:
         clean = (code or "").strip().upper()
+        # EX-47: every code is issued upper-case (``_generate_access_code``: A-Z0-9), so the column is compared as it is and the unique index
+        # ``access_code`` serves the lookup; ``upper(column)`` could not use it (a scan of the table on every poll and entry).
         return (
             self._query(without_tasks)
-            .filter(func.upper(GeneratedExam.access_code) == clean)
+            .filter(GeneratedExam.access_code == clean)
             .first()
         )
 
