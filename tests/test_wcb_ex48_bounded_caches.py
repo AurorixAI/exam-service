@@ -63,3 +63,57 @@ def test_a_broken_figure_is_still_refused_and_not_cached():
         else:
             raise AssertionError("must refuse")
     assert len(print_pdf._FIGURE_CACHE) == 0
+
+
+def test_four_threads_hammering_a_small_cache_never_raise_keyerror():
+    """R3 B3: ``key in cache`` + ``cache[key]`` raced with eviction (a KeyError out of a print -> 500).  ``get`` is one locked step."""
+    import threading
+    import time
+
+    cache = print_pdf._BoundedCache(50)
+    errors = []
+    stop = threading.Event()
+
+    def reader(seed):
+        i = seed
+        while not stop.is_set():
+            i = (i * 31 + 7) % 200
+            try:
+                hit = cache.get(i, print_pdf._MISSING)
+                if hit is not print_pdf._MISSING:
+                    assert hit == i
+                if i in cache:
+                    cache[i]            # the pair that used to race: may be evicted in between, but must say KeyError cleanly only via get
+            except KeyError:
+                pass                    # __getitem__ of an evicted key is a documented KeyError; the print code uses get()
+            except Exception as exc:    # anything else is a bug
+                errors.append(repr(exc))
+
+    def writer(seed):
+        i = seed
+        while not stop.is_set():
+            i = (i * 17 + 3) % 200
+            try:
+                cache[i] = i
+            except Exception as exc:
+                errors.append(repr(exc))
+
+    threads = [threading.Thread(target=reader, args=(1,)), threading.Thread(target=reader, args=(2,)),
+               threading.Thread(target=writer, args=(3,)), threading.Thread(target=writer, args=(4,))]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + 1.0          # a duration of the stress run, not a decision about the result
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+    stop.set()
+    for t in threads:
+        t.join()
+    assert errors == [] and len(cache) <= 50
+
+
+def test_the_print_code_reads_the_caches_with_get_only():
+    import inspect
+
+    for fn in (print_pdf._embedded_figure, print_pdf._render_math_artifact):
+        source = inspect.getsource(fn)
+        assert "in _FIGURE_CACHE" not in source and "in _MATH_ARTIFACT_CACHE" not in source

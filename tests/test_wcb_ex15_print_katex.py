@@ -171,19 +171,76 @@ def test_the_document_budget_limits_the_browser_time(monkeypatch):
 
 
 def test_the_whole_paper_is_still_printed_with_a_refused_formula(monkeypatch):
-    """The PDF of a variant with 12 formulas, one of them refused: a PDF comes out, every formula is on it (the refused one through matplotlib)."""
-    from src.domain.print_package import build_default_print_layout, build_print_snapshot
+    """The PDF of a variant with 3 formulas, one of them refused by KaTeX: a PDF comes out and the refused formula IS drawn (matplotlib), not dropped."""
     from tests.test_print_pdf import _print_snapshot
 
     snapshot = _print_snapshot()
     task = snapshot["variants"][0]["tasks"][0]
     task["question_latex"] = "$" + r"\frac{1}{2}" + "$ и $" + r"\sqrt{3}" + "$ и $" + r"\notaknowncommand{7" + "$"
-    fake = Fake(monkeypatch, refuse={r"\notaknowncommand{7"})
+    fake = Fake(monkeypatch, refuse={r"\sqrt{3}", r"\notaknowncommand{7"})
     pdf = print_pdf.render_student_exam_pdf(snapshot, 1)
     assert pdf.startswith(b"%PDF")
-    assert fake.count("node") >= 1
-    assert any("notaknowncommand" in latex for latex in print_pdf._KATEX_BROKEN)     # remembered: not sent to KaTeX a second time
+    assert r"\notaknowncommand{7" in print_pdf._KATEX_BROKEN
+    assert r"\sqrt{3}" in print_pdf._KATEX_BROKEN                                    # remembered: not sent to KaTeX a second time
     assert fake.count("node") == 1 and fake.count("chromium") == 1                   # ONE page for the whole variant, no single launches
+    # R3 M1: the refused formula really has a picture (the readable fallback), and so has the good one
+    node_calls = fake.count("node")
+    drawn = print_pdf._render_math_artifact(r"\sqrt{3}", 12.0, "#101B35")
+    assert drawn is not None and drawn.png.startswith(b"\x89PNG") and drawn.width > 0 and drawn.height > 0
+    assert fake.count("node") == node_calls                                          # the refused formula did not go back to KaTeX
+
+
+# ── R3 B2: a passing refusal of KaTeX is not remembered, a lasting one is ──────────────────────────────────────────────────
+def test_a_timeout_is_not_remembered_the_next_print_asks_katex_again(monkeypatch):
+    latex = r"\frac{3}{7}"
+    fake = Fake(monkeypatch, chromium_hang_batches={0})
+    first = print_pdf._render_math_artifact(latex, 12.0, "#101B35")
+    assert first is not None                                             # the matplotlib picture: the paper is never empty
+    assert fake.count("chromium") == 1 and len(print_pdf._MATH_ARTIFACT_CACHE) == 0     # nothing remembered
+    healed = print_pdf._render_math_artifact(latex, 12.0, "#101B35")   # the browser is healthy now
+    assert fake.count("chromium") == 2                                   # KaTeX was asked again
+    assert healed is not first and len(print_pdf._MATH_ARTIFACT_CACHE) == 1      # and its (fake KaTeX) picture is what is remembered now
+    n = len(fake.calls)
+    assert print_pdf._render_math_artifact(latex, 12.0, "#101B35") is healed and len(fake.calls) == n
+
+
+def test_a_spent_document_budget_is_not_remembered_either(monkeypatch):
+    latex = r"\frac{5}{9}"
+    fake = Fake(monkeypatch)
+    token = print_pdf._katex_deadline.set(fake.now - 1)                  # the document's 60 s are gone
+    try:
+        assert print_pdf._render_math_artifact(latex, 12.0, "#101B35") is not None
+    finally:
+        print_pdf._katex_deadline.reset(token)
+    assert len(print_pdf._MATH_ARTIFACT_CACHE) == 0 and fake.count("chromium") == 0
+    assert print_pdf._render_math_artifact(latex, 12.0, "#101B35") is not None        # next print, a fresh budget
+    assert fake.count("chromium") == 1
+
+
+def test_a_formula_katex_refused_is_remembered_with_its_fallback(monkeypatch):
+    latex = r"\frac{2}{11}"
+    fake = Fake(monkeypatch, refuse={latex})
+    first = print_pdf._render_math_artifact(latex, 12.0, "#101B35")
+    assert first is not None
+    n = len(fake.calls)
+    assert print_pdf._render_math_artifact(latex, 12.0, "#101B35") is first and len(fake.calls) == n      # a lasting reason: cached
+
+
+def test_without_katex_installed_the_fallback_is_remembered(monkeypatch):
+    """No node/Chromium on this machine is not a passing failure: every print would otherwise redraw every formula with matplotlib."""
+    monkeypatch.setattr(print_pdf.shutil, "which", lambda name: None)
+    monkeypatch.setattr(print_pdf, "_MATH_ARTIFACT_CACHE", print_pdf._BoundedCache(10))
+    latex = r"\frac{4}{13}"
+    first = print_pdf._render_math_artifact(latex, 12.0, "#101B35")
+    assert first is not None and print_pdf._render_math_artifact(latex, 12.0, "#101B35") is first
+
+
+def test_the_broken_set_is_bounded(monkeypatch):
+    broken = print_pdf._BoundedCache(2000)
+    for i in range(2500):
+        broken.add(f"x^{{{i}")
+    assert len(broken) == 2000 and "x^{0" not in broken and "x^{2499" in broken
+    assert isinstance(print_pdf._KATEX_BROKEN, print_pdf._BoundedCache)
 
 
 @pytest.mark.skipif(not (shutil.which("node") and (ROOT / "node_modules" / "katex").is_dir()), reason="needs node and `npm install` (katex)")

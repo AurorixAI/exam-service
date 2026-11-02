@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from contextvars import ContextVar
 from typing import Any, Iterable
@@ -101,33 +102,58 @@ class _FigureArtifact:
     height: float
 
 
+_MISSING = object()
+
+
 class _BoundedCache:
-    """A small least-recently-used map (EX-48): ``in``, ``[]`` and ``[]=`` like a dict, but it never holds more than ``maxsize`` entries -
-    the caches of a worker that lives for weeks must not grow with every formula and figure ever printed."""
+    """A small least-recently-used map (EX-48), safe for the threads of one worker (up to 3 prints run at once): it never holds more than
+    ``maxsize`` entries - the caches of a worker that lives for weeks must not grow with every formula and figure ever printed.
+
+    Read with ``get`` (ONE locked step); ``key in cache`` followed by ``cache[key]`` is two steps and a neighbour thread may evict the entry between them.
+    """
 
     def __init__(self, maxsize: int):
         self.maxsize = maxsize
         self._items: OrderedDict = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key, default=None):
+        with self._lock:
+            try:
+                value = self._items[key]
+            except KeyError:
+                return default
+            self._items.move_to_end(key)
+            return value
 
     def __contains__(self, key) -> bool:
-        return key in self._items
+        with self._lock:
+            return key in self._items
 
     def __getitem__(self, key):
-        value = self._items[key]
-        self._items.move_to_end(key)
+        value = self.get(key, _MISSING)
+        if value is _MISSING:
+            raise KeyError(key)
         return value
 
     def __setitem__(self, key, value) -> None:
-        self._items[key] = value
-        self._items.move_to_end(key)
-        while len(self._items) > self.maxsize:
-            self._items.popitem(last=False)
+        with self._lock:
+            self._items[key] = value
+            self._items.move_to_end(key)
+            while len(self._items) > self.maxsize:
+                self._items.popitem(last=False)
+
+    def add(self, key) -> None:
+        """Set-like use (``_KATEX_BROKEN``): remember the key."""
+        self[key] = True
 
     def __len__(self) -> int:
-        return len(self._items)
+        with self._lock:
+            return len(self._items)
 
     def clear(self) -> None:
-        self._items.clear()
+        with self._lock:
+            self._items.clear()
 
 
 # The key is the digest of the picture, not the picture: the base64 text (up to 8 MB, ``_MAX_PRINT_FIGURE_BYTES``) was the cache key and stayed in
@@ -138,8 +164,9 @@ _FIGURE_CACHE = _BoundedCache(32)
 def _embedded_figure(data_base64: str) -> _FigureArtifact:
     """Decode an image embedded in the protected print snapshot (cached by the digest of its text, 32 pictures at most)."""
     key = hashlib.sha256(data_base64.encode("utf-8", "surrogatepass")).hexdigest()
-    if key in _FIGURE_CACHE:
-        return _FIGURE_CACHE[key]
+    cached = _FIGURE_CACHE.get(key, _MISSING)
+    if cached is not _MISSING:
+        return cached
     figure = _decode_embedded_figure(data_base64)
     _FIGURE_CACHE[key] = figure
     return figure
@@ -426,8 +453,8 @@ _MATH_ARTIFACT_CACHE = _BoundedCache(2000)
 log = logging.getLogger(__name__)
 
 # EX-15.  A formula KaTeX itself refuses is refused every time: it goes straight to the fallback renderer and never again to node+Chromium
-# (NOT into ``_MATH_ARTIFACT_CACHE`` as None - that would skip the matplotlib fallback too).
-_KATEX_BROKEN: set[str] = set()
+# (NOT into ``_MATH_ARTIFACT_CACHE`` as None - that would skip the matplotlib fallback too).  Bounded like the other caches (R3 M4).
+_KATEX_BROKEN = _BoundedCache(2000)
 # Time one document may spend in node/Chromium.  Past it every remaining formula takes the fallback path at once: a hung browser would
 # otherwise cost its 20 s per formula - minutes in one of the three heavy slots, with the teacher looking at a blank tab.
 KATEX_DOCUMENT_BUDGET_S = 60.0
@@ -474,6 +501,17 @@ _CHILD_ENV_KEYS = (
 
 def _child_process_env() -> dict[str, str]:
     return {key: os.environ[key] for key in _CHILD_ENV_KEYS if key in os.environ}
+
+
+def _katex_installed() -> bool:
+    """node, Chromium, the script and the KaTeX stylesheet exist on this machine (without them KaTeX is not 'temporarily' down - it is not there)."""
+    project_root = Path(__file__).resolve().parents[2]
+    return bool(
+        (project_root / "scripts" / "render_katex_html.cjs").is_file()
+        and (project_root / "node_modules" / "katex" / "dist" / "katex.min.css").is_file()
+        and (shutil.which("chromium") or shutil.which("chromium-browser"))
+        and shutil.which("node")
+    )
 
 
 def _render_katex_artifacts(
@@ -552,7 +590,9 @@ def _render_katex_batch(batch, batch_index, node, chromium, script, temporary, e
     marker = _FAILED_MARKER.search(html)
     if marker:
         refused = {int(i) for i in marker.group(1).split(",") if i}
-        _KATEX_BROKEN.update(batch[i][0] for i in refused if i < len(batch))
+        for i in refused:
+            if i < len(batch):
+                _KATEX_BROKEN.add(batch[i][0])
     if len(refused) >= len(batch):
         return  # nothing to draw: no browser for a batch of broken formulas
     chromium_budget = _katex_time_left(20)
@@ -629,17 +669,26 @@ def _render_math_artifact(latex: str, font_size: float, color: str) -> _MathArti
     if not formula:
         return None
     cache_key = (formula, float(font_size), color)
-    if cache_key in _MATH_ARTIFACT_CACHE:
-        return _MATH_ARTIFACT_CACHE[cache_key]
+    cached = _MATH_ARTIFACT_CACHE.get(cache_key, _MISSING)
+    if cached is not _MISSING:
+        return cached
     katex = _render_katex_artifact(formula, font_size, color)
     if katex:
         _MATH_ARTIFACT_CACHE[cache_key] = katex
         return katex
 
+    # R3 B2: KaTeX gave nothing.  If it is a lasting reason (KaTeX refused this very formula, or KaTeX is not installed here) the fallback result is
+    # remembered; if it is a passing one (the document's browser budget, a timeout, a failed batch) it is NOT - the next print asks KaTeX again.
+    lasting = formula in _KATEX_BROKEN or not _katex_installed()
+
+    def remember(value) -> None:
+        if lasting:
+            _MATH_ARTIFACT_CACHE[cache_key] = value
+
     cases = _CASES_BLOCK.match(source)
     if cases:
         artifact = _render_cases_artifact(cases.group(1), font_size, color)
-        _MATH_ARTIFACT_CACHE[cache_key] = artifact
+        remember(artifact)
         return artifact
     try:
         from matplotlib.font_manager import FontProperties
@@ -678,7 +727,7 @@ def _render_math_artifact(latex: str, font_size: float, color: str) -> _MathArti
             rendered = render_formula(fallback)
         png = _make_math_background_transparent(rendered, color)
         if not png:
-            _MATH_ARTIFACT_CACHE[cache_key] = None
+            remember(None)
             return None
         width_px, height_px = ImageReader(BytesIO(png)).getSize()
         if not width_px or not height_px:
@@ -688,10 +737,10 @@ def _render_math_artifact(latex: str, font_size: float, color: str) -> _MathArti
             width=width_px * 72 / dpi,
             height=height_px * 72 / dpi,
         )
-        _MATH_ARTIFACT_CACHE[cache_key] = artifact
+        remember(artifact)
         return artifact
     except Exception:
-        _MATH_ARTIFACT_CACHE[cache_key] = None
+        remember(None)
         return None
 
 
