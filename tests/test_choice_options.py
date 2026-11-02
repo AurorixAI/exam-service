@@ -16,7 +16,8 @@ os.environ.setdefault("APP_ENV", "testing")
 
 import pytest
 
-from src.api.router import _build_mc_options, _build_mc_options_latex, _check_answer
+from src.api.router import _build_mc_options, _build_mc_options_latex
+from src.domain.answer_utils import check_answer as _check_answer
 from src.domain.answer_value import answers_equivalent, exact_number
 from src.domain.print_package import build_default_print_layout, build_print_snapshot, print_choice_options
 from src.domain.print_pdf import _teacher_choice_label

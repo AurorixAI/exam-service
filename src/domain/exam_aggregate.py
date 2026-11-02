@@ -7,7 +7,7 @@ this code that had drifted apart (pass threshold 50 % against 60 %, answered tas
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from src.domain.distractor_utils import resolve_analytics_explanation
 from src.domain.grading import check_task_answer, regrade_if_stale, stored_verdicts

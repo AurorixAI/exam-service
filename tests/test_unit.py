@@ -21,13 +21,12 @@ os.environ.setdefault("APP_ENV", "testing")
 
 import pytest
 from src.api.router import (
-    _check_answer,
-    _normalise_answer,
     _difficulty_counts,
     _should_show_mc,
     _build_mc_options,
     _generate_access_code,
 )
+from src.domain.answer_utils import check_answer as _check_answer, normalise_answer as _normalise_answer
 from src.core.exceptions import (
     ExamServiceError,
     ExamNotFoundError,
@@ -35,7 +34,6 @@ from src.core.exceptions import (
     SessionNotFoundError,
     SessionAlreadySubmittedError,
     NoTasksAvailableError,
-    InvalidExamConfigError,
 )
 from src.core.config import get_settings, Settings
 from src.core.auth import ExamActor, require_group_access
@@ -342,10 +340,6 @@ class TestExceptions:
         err = NoTasksAvailableError("Нет задач")
         assert "Нет задач" in str(err)
 
-    def test_invalid_exam_config(self):
-        err = InvalidExamConfigError("Bad config")
-        assert err.code == "INVALID_EXAM_CONFIG"
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Settings
@@ -357,8 +351,6 @@ class TestSettings:
             database_url="sqlite:///:memory:",
             app_env="testing",
         )
-        assert s.max_tasks_per_exam == 50
-        assert s.default_time_minutes == 45
         assert s.gemini_model == "gemini-2.5-flash"
 
     def test_is_development_false_by_default(self):

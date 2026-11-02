@@ -34,7 +34,3 @@ class NoTasksAvailableError(ExamServiceError):
     def __init__(self, detail: str):
         super().__init__(detail, "NO_TASKS_AVAILABLE")
 
-
-class InvalidExamConfigError(ExamServiceError):
-    def __init__(self, detail: str):
-        super().__init__(detail, "INVALID_EXAM_CONFIG")

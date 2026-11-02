@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     # cannot stop the service from starting.
     report_narrative_enabled: str = "true"
 
-    # Gemini AI — variant templatization / fallback
+    # Gemini AI — report narrative fallback
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
 
@@ -77,10 +77,6 @@ class Settings(BaseSettings):
     azure_deepseek_api_key: str = ""
     azure_deepseek_endpoint: str = ""
     azure_deepseek_model: str = "deepseek-v4-flash"
-
-    # Exam parameters
-    max_tasks_per_exam: int = 50
-    default_time_minutes: int = 45
 
     # CORS
     cors_origins: List[str] = ["http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000"]

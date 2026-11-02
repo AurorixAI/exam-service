@@ -2,33 +2,12 @@
 Exam Service — unified API router.
 Merges exam_router.py + textbook_exam.py from monolith into one module.
 
-Endpoints:
-  TEACHER
-    POST /exams/generate              — create draft exam (topics or textbook mode)
-    POST /exams/{id}/publish          — publish → access_code
-    GET  /exams/{id}                  — exam detail (teacher view)
-    GET  /exams                       — list teacher's exams (library)
-    POST /exams/{id}/pin              — toggle is_pinned flag
-    POST /exams/{id}/clone            — duplicate a template for a new group
-    POST /exams/{id}/assign           — assign group_id + optional publish
-    GET  /exams/{id}/analytics        — live class analytics (no LLM, instant)
-    POST /exams/{id}/report           — generate on-demand LLM narrative report
-    GET  /exams/{id}/report           — retrieve cached report
-  STUDENT (public, by access_code)
-    GET  /exams/by-code/{code}        — exam info
-    POST /exams/by-code/{code}/start  — start session
-    POST /exam-sessions/{id}/submit   — submit answers
-    GET  /exam-sessions/{id}/results  — results
-  TEXTBOOK (catalog)
-    GET  /textbooks                   — list textbooks
-    GET  /textbooks/{id}/toc          — table of contents
-    GET  /textbooks/{id}/coverage     — digitization coverage
-    GET  /toc/{id}/skills             — skills for a paragraph
+Endpoints: see the route decorators below (``router`` is mounted under /api/v1; the OpenAPI document lists every route).
 """
 from __future__ import annotations
 
 from src.domain.exam_aggregate import DEFAULT_PASS_THRESHOLD_PCT, aggregate_exam, exam_pass_threshold_pct
-from src.domain.task_display import question_display_fields, report_display_projection
+from src.domain.task_display import report_display_projection
 
 import asyncio
 import base64
@@ -51,7 +30,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.concurrency import run_in_threadpool
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import and_, case, func, inspect as sa_inspect, or_, select
+from sqlalchemy import and_, func, inspect as sa_inspect, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, defer
 
@@ -69,13 +48,7 @@ from src.core.abuse_limit import EntryTicket, admit_code_lookup, admit_identity_
 from src.core.config import get_settings
 from src.core.http_pool import pooled_client
 from src.core.database import get_db, wrote_since_commit
-from src.core.exceptions import (
-    ExamNotFoundError,
-    ExamNotActiveError,
-    SessionNotFoundError,
-    SessionAlreadySubmittedError,
-    NoTasksAvailableError,
-)
+from src.core.exceptions import NoTasksAvailableError
 from src.models import ExamDeletion, ExamLifecycleEvent, ExamPrintPackage, ExamReport, GeneratedExam, ExamSession
 from src.repositories.task_repo import TaskRepository, TextbookRepository
 from src.repositories.exam_repo import ExamRepository, SessionRepository, ExamReportRepository
@@ -291,12 +264,10 @@ AnswerTaskId = Annotated[str, Field(max_length=100)]
 
 class SaveProgressRequest(BaseModel):
     answers: Dict[AnswerTaskId, AnswerText] = Field(default_factory=dict, max_length=MAX_ANSWERS_PER_REQUEST)
-    time_spent_seconds: Optional[int] = None
 
 
 class SubmitExamRequest(BaseModel):
     answers: Dict[AnswerTaskId, AnswerText] = Field(max_length=MAX_ANSWERS_PER_REQUEST)  # {task_id: answer_string}
-    time_spent_seconds: int = 0
 
 
 class SubmitExamResponse(BaseModel):
@@ -1807,7 +1778,6 @@ def _build_mc_options_latex(task: dict, options: List[str]) -> List[str]:
     return [display_by_value.get(opt, "") for opt in options]
 
 
-from src.domain.answer_utils import normalise_answer as _normalise_answer, check_answer as _check_answer
 from src.domain.distractor_utils import (
     build_analytics_hit,
     match_distractor as _match_distractor,
@@ -2356,7 +2326,6 @@ def generate_exam(
         raise HTTPException(400, "Укажите skill_ids или paragraph_ids")
 
     task_repo = TaskRepository()
-    exam_repo = ExamRepository(db)
 
     tasks = _order_tasks_by_section(
         [_normalize_content_task(t) for t in _build_task_pool(req, task_repo)]
@@ -3174,7 +3143,6 @@ def toggle_pin_exam(
     actor: ExamActor = Depends(require_exam_staff),
 ):
     """Toggle is_pinned on a teacher's exam."""
-    exam_repo = ExamRepository(db)
     exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     exam.is_pinned = not bool(exam.is_pinned)
     db.commit()
@@ -3593,7 +3561,6 @@ def publish_exam(
     db: Session = Depends(get_db),
     actor: ExamActor = Depends(require_exam_staff),
 ):
-    exam_repo = ExamRepository(db)
     exam = _get_exam_for_teacher_operator(db, exam_id, actor)
     if exam.delivery_mode == "print":
         raise HTTPException(409, "Печатный экзамен не публикуется в лобби. Подготовьте комплект для занятия.")
@@ -5580,7 +5547,7 @@ def submit_exam(
         raise HTTPException(410, "Экзамен уже завершён; сохранённые ответы отправлены на проверку")
     if exam.status != "active":
         raise HTTPException(410, "Экзамен уже завершён; сохранённые ответы отправлены на проверку")
-    if exam.status == "lobby" or session.status == "waiting":
+    if session.status == "waiting":
         raise HTTPException(400, "Экзамен ещё не начат преподавателем")
 
     _validate_answer_keys(exam, session, req.answers)
