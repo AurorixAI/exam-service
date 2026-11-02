@@ -275,8 +275,11 @@ async def _slow_report_scenario():
             assert again.status_code == 200 and again.json()["submitted_count"] == 3  # and it is in the database
 
 
-def test_a_double_click_on_generate_report_is_two_200s_and_one_report():
-    """Both requests saw no report and both generate it: the loser's INSERT used to violate the unique key -> 500."""
+def test_a_double_click_on_generate_report_is_one_200_two_409s_and_one_report():
+    """Both requests saw no report and both generated it: the loser's INSERT used to violate the unique key -> 500 (#95).  Since 5da21fd (A3 EX-40) only
+    one report per exam is generated at a time and the others are refused with 409 REPORT_IN_PROGRESS (not paid for three times;
+    tests/test_wa3_paid_llm.py:563-568); REPORT_COOLDOWN is the same refusal when the race is lost after the first report is already written.
+    What this test keeps from #95: never a 500, and exactly one report in the database."""
     asyncio.run(_double_click_scenario())
 
 
@@ -302,7 +305,9 @@ async def _double_click_scenario():
                 with engine.connect() as conn:
                     conn.execute(sa.text("DROP TRIGGER IF EXISTS slow_report ON exam_reports"))
                 engine.dispose()
-            assert [first.status_code, second.status_code, third.status_code] == [200, 200, 200], (first.text, second.text)
+            answers = [first, second, third]
+            assert sorted(r.status_code for r in answers) == [200, 409, 409], [(r.status_code, r.text[:120]) for r in answers]
+            assert {r.json()["code"] for r in answers if r.status_code == 409} <= {"REPORT_IN_PROGRESS", "REPORT_COOLDOWN"}
             assert _reports_in_db() == 1
 
 
