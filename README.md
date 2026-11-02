@@ -1,10 +1,10 @@
 # exam-service
 
-Сервис управления экзаменами. Учитель создаёт экзамен, генерирует варианты через Gemini AI, студенты проходят — сервис сохраняет ответы и считает результаты.
+Сервис управления экзаменами. Учитель собирает экзамен из задач банка (варианты — «Оригинал» или «Перемешать»), студенты проходят — сервис сохраняет ответы, считает результаты и строит отчёт (текст отчёта — Gemini/Azure).
 
 - **Port**: 8003
 - **DB**: `algo_exam` (PostgreSQL 15)
-- **Cache**: Redis (кэш шаблонов, TTL 1ч)
+- **Redis**: лимиты входа и счётчики (общие для воркеров), готовность
 - **Framework**: FastAPI + SQLAlchemy ORM + Alembic
 - **Main file**: `src/main.py`
 
@@ -14,15 +14,12 @@
 |---|---|---|---|
 | `DATABASE_URL` | ✅ | PostgreSQL DSN | `postgresql://algo:pass@algo-postgres-exam:5432/algo_exam` |
 | `REDIS_URL` | ✅ | Redis DSN | `redis://algo-redis-exam:6379` |
-| `GEMINI_API_KEY` | ✅ | Gemini AI (генерация вариантов) | `AIza...` |
+| `GEMINI_API_KEY` | ✅ | Gemini AI (текст отчёта; запасной путь после Azure) | `AIza...` |
 | `REPORT_NARRATIVE_ENABLED` | — | Аварийный выключатель платных вызовов нарратива отчёта (по умолчанию `true`; `false`/`0`/`no` — 0 платных вызовов) | `false` |
 | `APP_ENV` | — | `production` / `development` | `production` |
 | `CONTENT_SERVICE_URL` | — | URL content-service | `http://content-api:8004` |
 | `AUTH_SERVICE_URL` | — | URL auth-service | `http://algo-auth:8000` |
 | `CORS_ORIGINS` | — | JSON-массив origins | `["https://algolab.me"]` |
-| `MAX_TASKS_PER_EXAM` | — | Лимит заданий на экзамен | `50` |
-| `MAX_VARIANTS` | — | Лимит вариантов | `30` |
-| `DEFAULT_TIME_MINUTES` | — | Время по умолчанию (мин) | `45` |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` / `DB_POOL_TIMEOUT` | — | Пул соединений на воркер (по умолчанию 10 + 20, ожидание 10 с) | `10` / `20` / `10` |
 | `DB_LOCK_TIMEOUT_MS` / `DB_STATEMENT_TIMEOUT_MS` / `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | — | Таймауты, которые сервер БД применяет к каждому соединению | `5000` / `15000` / `30000` |
 | `WORKER_THREADS` | — | Потоков на воркер для блокирующих обработчиков (anyio) | `40` |
@@ -37,10 +34,9 @@ docker compose up -d --build
 
 # Миграции
 docker exec algo-exam alembic upgrade head
-
-# Prod
-docker compose -f docker-compose.prod.yml up -d
 ```
+
+Прод и stage разворачиваются только из репозитория `algo-infrastructure` (там compose-файлы стеков); отдельного prod-compose в этом репозитории нет.
 
 ## API
 
