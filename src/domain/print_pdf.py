@@ -8,6 +8,8 @@ auditable after the lesson has finished.
 from __future__ import annotations
 
 import base64
+import hashlib
+from collections import OrderedDict
 from html import escape
 from io import BytesIO
 from pathlib import Path
@@ -99,8 +101,51 @@ class _FigureArtifact:
     height: float
 
 
-@lru_cache(maxsize=128)
+class _BoundedCache:
+    """A small least-recently-used map (EX-48): ``in``, ``[]`` and ``[]=`` like a dict, but it never holds more than ``maxsize`` entries -
+    the caches of a worker that lives for weeks must not grow with every formula and figure ever printed."""
+
+    def __init__(self, maxsize: int):
+        self.maxsize = maxsize
+        self._items: OrderedDict = OrderedDict()
+
+    def __contains__(self, key) -> bool:
+        return key in self._items
+
+    def __getitem__(self, key):
+        value = self._items[key]
+        self._items.move_to_end(key)
+        return value
+
+    def __setitem__(self, key, value) -> None:
+        self._items[key] = value
+        self._items.move_to_end(key)
+        while len(self._items) > self.maxsize:
+            self._items.popitem(last=False)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def clear(self) -> None:
+        self._items.clear()
+
+
+# The key is the digest of the picture, not the picture: the base64 text (up to 8 MB, ``_MAX_PRINT_FIGURE_BYTES``) was the cache key and stayed in
+# memory next to the decoded image.  32 pictures of a worker: the pictures of a few exams in a row.
+_FIGURE_CACHE = _BoundedCache(32)
+
+
 def _embedded_figure(data_base64: str) -> _FigureArtifact:
+    """Decode an image embedded in the protected print snapshot (cached by the digest of its text, 32 pictures at most)."""
+    key = hashlib.sha256(data_base64.encode("utf-8", "surrogatepass")).hexdigest()
+    if key in _FIGURE_CACHE:
+        return _FIGURE_CACHE[key]
+    figure = _decode_embedded_figure(data_base64)
+    _FIGURE_CACHE[key] = figure
+    return figure
+
+
+def _decode_embedded_figure(data_base64: str) -> _FigureArtifact:
     """Decode an image embedded in the protected print snapshot.
 
     The API validates the source type, byte size and signature before the
@@ -375,7 +420,8 @@ _KATEX_RASTER_DPI = 288
 # from many browser launches to only a few.
 _KATEX_BATCH_SIZE = 32
 _KATEX_BATCH_ROW_HEIGHT = 112
-_MATH_ARTIFACT_CACHE: dict[tuple[str, float, str], _MathArtifact | None] = {}
+# 2 000 formulas ~ 10-60 MB of PNG: the formulas of many exams in a row, not all the formulas the worker ever printed (EX-48)
+_MATH_ARTIFACT_CACHE = _BoundedCache(2000)
 
 log = logging.getLogger(__name__)
 
