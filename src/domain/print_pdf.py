@@ -14,11 +14,14 @@ from pathlib import Path
 from dataclasses import dataclass
 from functools import lru_cache
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
+from contextvars import ContextVar
 from typing import Any, Iterable
 
 from reportlab.lib.colors import HexColor, white
@@ -374,6 +377,23 @@ _KATEX_BATCH_SIZE = 32
 _KATEX_BATCH_ROW_HEIGHT = 112
 _MATH_ARTIFACT_CACHE: dict[tuple[str, float, str], _MathArtifact | None] = {}
 
+log = logging.getLogger(__name__)
+
+# EX-15.  A formula KaTeX itself refuses is refused every time: it goes straight to the fallback renderer and never again to node+Chromium
+# (NOT into ``_MATH_ARTIFACT_CACHE`` as None - that would skip the matplotlib fallback too).
+_KATEX_BROKEN: set[str] = set()
+# Time one document may spend in node/Chromium.  Past it every remaining formula takes the fallback path at once: a hung browser would
+# otherwise cost its 20 s per formula - minutes in one of the three heavy slots, with the teacher looking at a blank tab.
+KATEX_DOCUMENT_BUDGET_S = 60.0
+_katex_deadline: ContextVar[float | None] = ContextVar("katex_deadline", default=None)
+_FAILED_MARKER = re.compile(r"<!--failed:([0-9,]*)-->")
+
+
+def _katex_time_left(cap: float) -> float:
+    """Seconds a node/Chromium call may take: its own limit, cut by what is left of the document's budget (<= 0: none)."""
+    deadline = _katex_deadline.get()
+    return cap if deadline is None else min(cap, deadline - time.monotonic())
+
 
 def _crop_transparent_math_png(png: bytes) -> bytes:
     """Crop a transparent browser screenshot to its mathematical glyphs."""
@@ -429,7 +449,7 @@ def _render_katex_artifacts(
     if not script.is_file() or not stylesheet.is_file() or not chromium or not node:
         return {}
 
-    unique_requests = list(dict.fromkeys(requests))
+    unique_requests = [request for request in dict.fromkeys(requests) if request[0] not in _KATEX_BROKEN]
     rendered: dict[tuple[str, float, str], _MathArtifact] = {}
 
     try:
@@ -438,77 +458,113 @@ def _render_katex_artifacts(
             environment = {**_child_process_env(), "KATEX_CSS_PATH": str(stylesheet)}
             for batch_index in range(0, len(unique_requests), _KATEX_BATCH_SIZE):
                 batch = unique_requests[batch_index:batch_index + _KATEX_BATCH_SIZE]
-                html = subprocess.run(
-                    [node, str(script)],
-                    input=json.dumps({
-                        "formulas": [
-                            {
-                                "latex": latex,
-                                "fontSize": font_size * KATEX_PRINT_SCALE,
-                                "color": color,
-                            }
-                            for latex, font_size, color in batch
-                        ],
-                        "rowHeight": _KATEX_BATCH_ROW_HEIGHT,
-                    }),
-                    text=True,
-                    capture_output=True,
-                    check=True,
-                    timeout=8,
-                    env=environment,
-                ).stdout
-                html_path = temporary / f"formula-{batch_index}.html"
-                png_path = temporary / f"formula-{batch_index}.png"
-                browser_profile = temporary / f"chromium-profile-{batch_index}"
-                browser_profile.mkdir()
-                html_path.write_text(html, encoding="utf-8")
-                subprocess.run(
-                    [
-                        chromium,
-                        "--headless=new",
-                        "--no-sandbox",
-                        f"--user-data-dir={browser_profile}",
-                        "--disable-gpu",
-                        "--disable-dev-shm-usage",
-                        "--allow-file-access-from-files",
-                        "--hide-scrollbars",
-                        "--force-device-scale-factor=3",
-                        "--default-background-color=00000000",
-                        f"--window-size=1600,{_KATEX_BATCH_ROW_HEIGHT * len(batch)}",
-                        f"--screenshot={png_path}",
-                        html_path.as_uri(),
-                    ],
-                    capture_output=True,
-                    check=True,
-                    timeout=20,
-                    env=_child_process_env(),
-                )
-                from PIL import Image as PillowImage
-
-                screenshot = PillowImage.open(png_path).convert("RGBA")
-                for row_index, request in enumerate(batch):
-                    top = round(screenshot.height * row_index / len(batch))
-                    bottom = round(screenshot.height * (row_index + 1) / len(batch))
-                    row = screenshot.crop((0, top, screenshot.width, bottom))
-                    row_buffer = BytesIO()
-                    row.save(row_buffer, format="PNG")
-                    png = _crop_transparent_math_png(
-                        _make_math_background_transparent(row_buffer.getvalue(), request[2])
+                # EX-15: a batch that fails (node, Chromium, a timeout) costs only its own formulas - the batches already rendered are kept
+                # and the next one is tried; the document's time budget ends the whole thing, whatever fails.
+                node_budget = _katex_time_left(8)
+                if node_budget <= 0.5:
+                    log.warning("KaTeX budget of the document is spent: %d formulas go to the fallback renderer", len(unique_requests) - batch_index)
+                    break
+                try:
+                    _render_katex_batch(
+                        batch, batch_index, node, chromium, script, temporary, environment, node_budget, rendered,
                     )
-                    width_px, height_px = ImageReader(BytesIO(png)).getSize()
-                    if width_px and height_px:
-                        rendered[request] = _MathArtifact(
-                            png=png,
-                            width=width_px * 72 / _KATEX_RASTER_DPI,
-                            height=height_px * 72 / _KATEX_RASTER_DPI,
-                        )
+                except subprocess.TimeoutExpired as exc:
+                    # a hung node/Chromium: the next batch would hang the same way - the rest of the document uses the fallback
+                    log.warning("KaTeX batch timed out (%s): the rest of this document uses the fallback renderer", exc.cmd[0] if exc.cmd else "?")
+                    if _katex_deadline.get() is not None:
+                        _katex_deadline.set(time.monotonic())
+                    break
+                except Exception as exc:
+                    log.warning("KaTeX batch of %d formulas failed (%s): its formulas use the fallback renderer", len(batch), type(exc).__name__)
     except Exception:
-        return {}
+        log.exception("KaTeX renderer unavailable: formulas use the fallback renderer")
     return rendered
+
+
+def _render_katex_batch(batch, batch_index, node, chromium, script, temporary, environment, node_budget, rendered) -> None:
+    """One batch: node writes the page, Chromium screenshots it, the rows are cropped into ``rendered`` (formulas KaTeX refused are skipped)."""
+    html = subprocess.run(
+        [node, str(script)],
+        input=json.dumps({
+            "formulas": [
+                {
+                    "latex": latex,
+                    "fontSize": font_size * KATEX_PRINT_SCALE,
+                    "color": color,
+                }
+                for latex, font_size, color in batch
+            ],
+            "rowHeight": _KATEX_BATCH_ROW_HEIGHT,
+        }),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=node_budget,
+        env=environment,
+    ).stdout
+    refused: set[int] = set()
+    marker = _FAILED_MARKER.search(html)
+    if marker:
+        refused = {int(i) for i in marker.group(1).split(",") if i}
+        _KATEX_BROKEN.update(batch[i][0] for i in refused if i < len(batch))
+    if len(refused) >= len(batch):
+        return  # nothing to draw: no browser for a batch of broken formulas
+    chromium_budget = _katex_time_left(20)
+    if chromium_budget <= 0.5:
+        raise subprocess.TimeoutExpired([chromium], 0)
+    html_path = temporary / f"formula-{batch_index}.html"
+    png_path = temporary / f"formula-{batch_index}.png"
+    browser_profile = temporary / f"chromium-profile-{batch_index}"
+    browser_profile.mkdir()
+    html_path.write_text(html, encoding="utf-8")
+    subprocess.run(
+        [
+            chromium,
+            "--headless=new",
+            "--no-sandbox",
+            f"--user-data-dir={browser_profile}",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--allow-file-access-from-files",
+            "--hide-scrollbars",
+            "--force-device-scale-factor=3",
+            "--default-background-color=00000000",
+            f"--window-size=1600,{_KATEX_BATCH_ROW_HEIGHT * len(batch)}",
+            f"--screenshot={png_path}",
+            html_path.as_uri(),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=chromium_budget,
+        env=_child_process_env(),
+    )
+    from PIL import Image as PillowImage
+
+    screenshot = PillowImage.open(png_path).convert("RGBA")
+    for row_index, request in enumerate(batch):
+        if row_index in refused:
+            continue
+        top = round(screenshot.height * row_index / len(batch))
+        bottom = round(screenshot.height * (row_index + 1) / len(batch))
+        row = screenshot.crop((0, top, screenshot.width, bottom))
+        row_buffer = BytesIO()
+        row.save(row_buffer, format="PNG")
+        png = _crop_transparent_math_png(
+            _make_math_background_transparent(row_buffer.getvalue(), request[2])
+        )
+        width_px, height_px = ImageReader(BytesIO(png)).getSize()
+        if width_px and height_px:
+            rendered[request] = _MathArtifact(
+                png=png,
+                width=width_px * 72 / _KATEX_RASTER_DPI,
+                height=height_px * 72 / _KATEX_RASTER_DPI,
+            )
 
 
 def _render_katex_artifact(latex: str, font_size: float, color: str) -> _MathArtifact | None:
     """Render one source formula through the KaTeX batcher."""
+    if latex in _KATEX_BROKEN or _katex_time_left(1.0) <= 0.5:
+        return None  # KaTeX refused this very formula before / the document's browser time is spent: the fallback renderer takes it at once
     return _render_katex_artifacts([(latex, font_size, color)]).get((latex, font_size, color))
 
 
@@ -1849,15 +1905,19 @@ def _render(snapshot: dict[str, Any], variant_number: int, *, key: bool) -> byte
         raise ValueError(f"В подготовленном комплекте нет варианта №{variant_number}")
     title = snapshot.get("exam", {}).get("title") or "Экзамен"
     doc = _PdfDocument(title, key=key)
-    _prewarm_variant_math(doc, variant, key=key)
-    _header(doc, snapshot, variant_number, key=key)
-    if key:
-        _draw_teacher_key(doc, variant)
-    else:
-        _draw_student_sections(doc, variant)
-    if not key:
-        _draw_answer_sheet(doc, variant)
-    return doc.finish()
+    deadline_token = _katex_deadline.set(time.monotonic() + KATEX_DOCUMENT_BUDGET_S)   # EX-15: one budget of node/Chromium time per document
+    try:
+        _prewarm_variant_math(doc, variant, key=key)
+        _header(doc, snapshot, variant_number, key=key)
+        if key:
+            _draw_teacher_key(doc, variant)
+        else:
+            _draw_student_sections(doc, variant)
+        if not key:
+            _draw_answer_sheet(doc, variant)
+        return doc.finish()
+    finally:
+        _katex_deadline.reset(deadline_token)
 
 
 def render_student_exam_pdf(snapshot: dict[str, Any], variant_number: int) -> bytes:
