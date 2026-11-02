@@ -6,6 +6,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import List, Optional
 
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, defer
 
@@ -178,6 +179,32 @@ class SessionRepository:
             self.db.commit()
             self.db.refresh(session)
         return session
+
+    def list_for_identity(self, exam_id: str, keys: set) -> List[ExamSession]:
+        """EX-46: the attempts of ONE student of an exam, in the order of ``list_by_exam``.
+
+        ``keys`` are the identities of the student as the router normalizes them (stripped, lower-case: the canonical id and the display id).
+        An attempt belongs to him when its ``student_id`` or its ``display_id`` is one of them - the rule of ``_find_student_session``, which
+        still makes the final choice among these rows.  The entry of a class used to read EVERY attempt of the exam (all columns, the answer
+        JSON included) twice per student; it reads the student's own one or two.  A non-ASCII key is not narrowed in SQL (``lower`` of a
+        database may fold it differently from Python): the whole list comes back and the router's rule alone decides, as before.
+        """
+        if not keys:
+            return []
+        if not all(key.isascii() for key in keys):
+            return self.list_by_exam(exam_id)
+        return (
+            self.db.query(ExamSession)
+            .filter(
+                ExamSession.exam_id == exam_id,
+                or_(
+                    func.lower(func.trim(ExamSession.student_id)).in_(keys),
+                    func.lower(func.trim(ExamSession.display_id)).in_(keys),
+                ),
+            )
+            .order_by(ExamSession.started_at.desc())
+            .all()
+        )
 
     def list_by_exam(self, exam_id: str) -> List[ExamSession]:
         return (

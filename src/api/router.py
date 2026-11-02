@@ -1724,9 +1724,15 @@ def _exam_started_at_of_snapshot(exam: GeneratedExam) -> Optional[datetime]:
     return _settings_started_at(exam)
 
 
+def _student_sessions(db: Session, exam_id: str, student_id: Optional[str], identifier: Optional[str] = None) -> list:
+    """EX-46: the attempts of this ONE student, for ``_find_student_session`` & co - not every attempt of the class (answer JSON included)."""
+    keys = {key for key in (_norm_ident(student_id), _norm_ident(identifier)) if key}
+    return SessionRepository(db).list_for_identity(exam_id, keys)
+
+
 def _has_resumable_session(db: Session, exam_id: str, student: dict) -> bool:
     """O17: the student has an attempt IN PROGRESS in this exam (the only thing a student who left the group may come back to)."""
-    sessions = SessionRepository(db).list_by_exam(exam_id)
+    sessions = _student_sessions(db, exam_id, student.get("id"), student.get("display_id"))
     found = _find_student_session(sessions, ("in_progress",), student.get("id"), student.get("display_id"))
     db.commit()  # ends the read transaction
     return found is not None
@@ -5050,7 +5056,7 @@ async def check_student_for_exam(
 
 
 def _check_student_outcome(db: Session, exam: GeneratedExam, student: dict) -> CheckStudentExamResponse:
-    all_sessions = SessionRepository(db).list_by_exam(exam.id)
+    all_sessions = _student_sessions(db, exam.id, student.get("id"), student.get("display_id"))
     submitted_sess = _find_submitted_session(
         all_sessions,
         student.get("id"),
@@ -5178,7 +5184,7 @@ def _admit_student_to_exam(
         raise HTTPException(500, "Экзамен не содержит вариантов")
     exam_is_lobby = view.status == "lobby"
 
-    all_sessions = SessionRepository(db).list_by_exam(exam_id)
+    all_sessions = _student_sessions(db, exam_id, canonical_student_id, canonical_display_id)
 
     # 1. Single attempt guard: Check if already submitted
     submitted_sess = _find_submitted_session(
