@@ -879,13 +879,16 @@ def _bind_preconditions(db: Session, exam: GeneratedExam, *, group_id: Optional[
 
 
 def _lock_exam_for_binding(db: Session, exam: GeneratedExam, *, group_before: Optional[str], org_id: str, lesson_id: Optional[str] = None,
-                           lesson_date: Optional[str] = None) -> GeneratedExam:
+                           lesson_date: Optional[str] = None, group_target: Optional[str] = None) -> GeneratedExam:
     """Take the exam's row lock and decide again, in ONE order, what was decided before it: the group is still ``group_before`` (the rights of the operator and the lookup of the
     lesson were made for IT), the slot of the lesson is free (``lesson_id`` / ``lesson_date``; an assignment without a lesson has none), the state.  Call it AFTER the last
-    network call and BEFORE the first change; lock order everywhere: exam -> sessions.  A refusal rolls back: nothing changed, the lock is gone."""
+    network call and BEFORE the first change; lock order everywhere: exam -> sessions.  A refusal rolls back: nothing changed, the lock is gone.
+
+    ``group_target``: the group the request binds the exam to.  The group is also unchanged when it is already THAT group: it is the twin of a double click (the same
+    request, a moment earlier) that set it, not somebody else's change - the second click then finds the opened lobby and repeats the answer."""
     locked = _lock_exam_row(db, exam)
     try:
-        if str(locked.group_id or "") != str(group_before or ""):
+        if str(locked.group_id or "") not in {str(group_before or ""), str(group_target or "\0")}:
             raise HTTPException(409, BINDING_GROUP_CHANGED_MESSAGE)
         if lesson_id and lesson_date:
             _ensure_lesson_slot_is_available(db, locked, org_id=org_id, lesson_id=lesson_id, lesson_date=lesson_date)
@@ -3486,6 +3489,7 @@ def assign_exam(
         org_id=actor.org_id,
         lesson_id=req.lesson_id if req.publish else None,
         lesson_date=req.lesson_date if req.publish else None,
+        group_target=str(group["id"]),
     )
     if exam.status == "lobby" and not req.publish:  # the same rule as above, on the locked row
         db.rollback()
@@ -3600,7 +3604,8 @@ def publish_exam(
         lesson_id=req.lesson_id,
         lesson_date=req.lesson_date,
     ), db)
-    exam = _lock_exam_for_binding(db, exam, group_before=group_before, org_id=actor.org_id, lesson_id=req.lesson_id, lesson_date=req.lesson_date)
+    exam = _lock_exam_for_binding(db, exam, group_before=group_before, org_id=actor.org_id, lesson_id=req.lesson_id, lesson_date=req.lesson_date,
+                                  group_target=str(group["id"]))
     previous_status = exam.status
     previous_group_id = exam.group_id
     previous_lesson_id = exam.scheduled_lesson_id

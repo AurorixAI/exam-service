@@ -186,3 +186,24 @@ def test_a_double_click_on_prepare_creates_one_package(pg):
 
         assert db.query(ExamPrintPackage).count() == 1
     assert _events(pg, "print_package_prepared") == 1
+
+
+@pytest.mark.parametrize("path", ["assign", "publish"])
+def test_a_double_click_on_an_exam_without_a_group_is_two_200s_and_one_result(pg, path):
+    """Wave E R3 (В1): the gate re-checks the group under the lock; the TWIN of the double click is not a foreign change - the group it finds is the one the request binds to."""
+    _exam(pg, "variants_ready")
+    with pg() as db:
+        exam = db.get(GeneratedExam, "EXAM_PG1")
+        exam.group_id, exam.group_name = None, None
+        exam.access_code, exam.scheduled_lesson_id, exam.scheduled_lesson_date = None, None, None
+        db.commit()
+    payload = {"group_id": TEST_GROUP_ID, **_lobby_body()}
+    if path == "assign":
+        payload["publish"] = True
+    responses = _twice_responses("post", f"/exams/EXAM_PG1/{path}", json=payload)
+    assert [r.status_code for r in responses] == [200, 200], [r.text for r in responses]
+    assert len({r.json()["access_code"] for r in responses}) == 1
+    with pg() as db:
+        stored = db.get(GeneratedExam, "EXAM_PG1")
+        assert stored.status == "lobby" and stored.group_id == TEST_GROUP_ID and stored.access_code == responses[0].json()["access_code"]
+    assert _events(pg, "exam_lobby_opened") == 1
