@@ -1357,6 +1357,23 @@ def _ensure_lesson_slot_is_available(
         )
 
 
+LESSON_CANCELLED_MESSAGE = "Назначенный урок отменён. Экзамен недоступен."
+LESSON_COMPLETED_MESSAGE = "Экзамен этого урока завершён."
+
+
+def _lesson_state_refusal(lesson_status: Optional[str], *, not_started: str) -> Optional[HTTPException]:
+    """What the state of the bound lesson says to somebody who wants the exam NOW (the teacher starting it, a student entering the lobby): ONE answer per state (wave E,
+    EX-43 / РАСХ-13).  In progress - nothing (``None``); cancelled / completed - 410, the exam of that lesson is over (a student of a finished lesson was told «станет
+    доступен», the teacher of a cancelled one «сначала начните урок»); any other state - 409 with the text of the caller (it differs: the teacher is told what to do, the student to wait)."""
+    if lesson_status == "in_progress":
+        return None
+    if lesson_status == "cancelled":
+        return HTTPException(410, LESSON_CANCELLED_MESSAGE)
+    if lesson_status == "completed":
+        return HTTPException(410, LESSON_COMPLETED_MESSAGE)
+    return HTTPException(409, not_started)
+
+
 async def _require_lesson_in_progress(exam: GeneratedExam, actor: ExamActor) -> None:
     """An exam starts only after its exact lesson has been started."""
     _require_bound_exam(exam)
@@ -1371,28 +1388,12 @@ async def _require_lesson_in_progress(exam: GeneratedExam, actor: ExamActor) -> 
         lesson_date=exam.scheduled_lesson_date,
         require_current_or_future=False,
     )
-    url = (
-        f"{get_settings().auth_service_url.rstrip('/')}/api/v1/auth/org/groups/"
-        f"{exam.group_id}/attendance"
+    lesson_status = await _lesson_attendance_status(
+        actor, group_id=str(exam.group_id), lesson_id=exam.scheduled_lesson_id, lesson_date=exam.scheduled_lesson_date
     )
-    try:
-        async with pooled_client(timeout=5.0) as client:
-            response = await client.get(
-                url,
-                params={
-                    "date_from": exam.scheduled_lesson_date,
-                    "date_to": exam.scheduled_lesson_date,
-                },
-                headers=dict(actor.auth_headers),
-            )
-    except httpx.HTTPError as exc:
-        raise HTTPException(503, "Не удалось проверить статус урока. Повторите попытку.") from exc
-    if response.status_code != 200:
-        raise HTTPException(503, "Не удалось проверить статус урока")
-    attendance = response.json()
-    lesson_key = f"{exam.scheduled_lesson_date}_{exam.scheduled_lesson_id}"
-    if (attendance.get("statuses") or {}).get(lesson_key) != "in_progress":
-        raise HTTPException(409, "Сначала начните назначенный урок, затем запускайте экзамен")
+    refusal = _lesson_state_refusal(lesson_status, not_started="Сначала начните назначенный урок, затем запускайте экзамен")
+    if refusal is not None:
+        raise refusal
 
 
 async def _require_public_lobby_available(exam: GeneratedExam) -> None:
@@ -1445,11 +1446,9 @@ async def _require_public_lobby_available(exam: GeneratedExam) -> None:
         )
         raise HTTPException(503, "Не удалось проверить статус назначенного урока")
 
-    lesson_status = response.json().get("status")
-    if lesson_status == "cancelled":
-        raise HTTPException(410, "Назначенный урок отменён. Экзамен недоступен.")
-    if lesson_status != "in_progress":
-        raise HTTPException(409, "Экзамен станет доступен после начала урока преподавателем")
+    refusal = _lesson_state_refusal(response.json().get("status"), not_started="Экзамен станет доступен после начала урока преподавателем")
+    if refusal is not None:
+        raise refusal
 
 
 def _count_answered(answers: Any) -> int:
