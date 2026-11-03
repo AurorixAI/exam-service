@@ -843,6 +843,59 @@ def _lock_exam_for_transition(
     return locked
 
 
+# ── assign / publish / open-lobby: ONE gate and ONE set of refusals (wave E, decision 9) ─────────────────────────────────────────────────────────────
+# The three routes bind an exam to a lesson.  Each had its own order of checks and its own words for one reason (an exam with attempts was «имеет попытки группы…» /
+# «имеет попытки…» / «в лобби уже есть участники»).  Order, the same everywhere: the exam's rights (``_get_exam_for_teacher_operator``) -> what the request and the row say
+# without any network (``_bind_preconditions``: print exam, no group, no lesson, the state) -> the rights on the target group and the lesson (the lookup, outside every lock)
+# -> UNDER the row lock (``_lock_exam_for_binding``): the group is still the one the rights were decided for, the slot is free, the state (status, then attempts).
+BINDABLE_STATUSES = frozenset({"draft", "variants_ready", "lobby"})
+BINDING_PRINT_MESSAGE = "Печатный экзамен не использует лобби. Подготовьте печатный комплект для занятия."
+BINDING_NO_GROUP_MESSAGE = "Нельзя открыть лобби для экзамена без группы. Сначала привяжите экзамен к группе."
+BINDING_NO_LESSON_MESSAGE = "Для лобби выберите конкретное занятие в расписании"
+BINDING_STATE_MESSAGE = "Назначить или перенести экзамен можно только до его запуска"
+BINDING_ATTEMPTS_MESSAGE = "У экзамена уже есть попытки учеников. Создайте копию экзамена, чтобы провести его для другого занятия или группы"
+BINDING_GROUP_CHANGED_MESSAGE = "Группа экзамена изменилась, повторите"
+
+
+def _refuse_unbindable_state(db: Session, exam: GeneratedExam) -> None:
+    """The state of the exam: only a draft / ready / lobby exam can be (re)bound, and only while nobody has an attempt in it."""
+    if exam.status not in BINDABLE_STATUSES:
+        raise HTTPException(409, BINDING_STATE_MESSAGE)
+    if _has_any_sessions(db, exam.id):
+        raise HTTPException(409, BINDING_ATTEMPTS_MESSAGE)
+
+
+def _bind_preconditions(db: Session, exam: GeneratedExam, *, group_id: Optional[str], lesson_id: Optional[str] = None, lesson_date: Optional[str] = None,
+                        lesson_required: bool = True) -> None:
+    """The refusals that need nothing but the request and the row (no network, no lock), in ONE order: a print exam, no group, no lesson, the state.  The state is asked
+    again under the lock (``_lock_exam_for_binding``) - this is only the answer that saves a network call."""
+    if exam.delivery_mode == "print":
+        raise HTTPException(409, BINDING_PRINT_MESSAGE)
+    if not group_id:
+        raise HTTPException(400, BINDING_NO_GROUP_MESSAGE)
+    if lesson_required and (not lesson_id or not lesson_date):
+        raise HTTPException(422, BINDING_NO_LESSON_MESSAGE)
+    _refuse_unbindable_state(db, exam)
+
+
+def _lock_exam_for_binding(db: Session, exam: GeneratedExam, *, group_before: Optional[str], org_id: str, lesson_id: Optional[str] = None,
+                           lesson_date: Optional[str] = None) -> GeneratedExam:
+    """Take the exam's row lock and decide again, in ONE order, what was decided before it: the group is still ``group_before`` (the rights of the operator and the lookup of the
+    lesson were made for IT), the slot of the lesson is free (``lesson_id`` / ``lesson_date``; an assignment without a lesson has none), the state.  Call it AFTER the last
+    network call and BEFORE the first change; lock order everywhere: exam -> sessions.  A refusal rolls back: nothing changed, the lock is gone."""
+    locked = _lock_exam_row(db, exam)
+    try:
+        if str(locked.group_id or "") != str(group_before or ""):
+            raise HTTPException(409, BINDING_GROUP_CHANGED_MESSAGE)
+        if lesson_id and lesson_date:
+            _ensure_lesson_slot_is_available(db, locked, org_id=org_id, lesson_id=lesson_id, lesson_date=lesson_date)
+        _refuse_unbindable_state(db, locked)
+    except HTTPException:
+        db.rollback()
+        raise
+    return locked
+
+
 def _print_inputs(exam: GeneratedExam) -> dict[str, Any]:
     """Everything a print snapshot is built from: if it differs after the lock, the snapshot is of a draft that no longer exists."""
     return deepcopy({
@@ -3410,29 +3463,12 @@ def assign_exam(
     # never receive an access code or enter an online lobby, including through
     # the legacy non-publishing assignment path.  A paper package is bound to
     # one concrete lesson exclusively by ``/print-package/prepare``.
-    if exam.delivery_mode == "print":
-        raise HTTPException(
-            422,
-            "Для формата «Печать» выберите занятие через подготовку печатного комплекта",
-        )
-    group = _await(require_group_access(actor, req.group_id), db)
-    if _has_any_sessions(db, exam_id):
-        raise HTTPException(
-            409,
-            f"Экзамен уже имеет попытки группы '{exam.group_name}'. "
-            "Создайте копию (клон), чтобы провести для другой группы."
-        )
-    if exam.status not in ("draft", "variants_ready", "lobby"):
-        raise HTTPException(409, "Назначить или перенести можно только экзамен до его запуска")
+    _bind_preconditions(db, exam, group_id=req.group_id, lesson_id=req.lesson_id, lesson_date=req.lesson_date, lesson_required=req.publish)
     if exam.status == "lobby" and not req.publish:
         raise HTTPException(409, "Для экзамена в лобби выберите новое занятие и подтвердите перенос")
-    if req.publish and (not req.lesson_id or not req.lesson_date):
-        raise HTTPException(422, "Для лобби выберите конкретное занятие в расписании")
+    group_before = exam.group_id
+    group = _await(require_group_access(actor, req.group_id), db)
 
-    previous_status = exam.status
-    previous_group_id = exam.group_id
-    previous_lesson_id = exam.scheduled_lesson_id
-    previous_lesson_date = exam.scheduled_lesson_date
     canonical_group = None
     if req.publish:
         # BEFORE any change to the exam: nothing may be pending in the session over a network call
@@ -3443,12 +3479,13 @@ def assign_exam(
             lesson_date=req.lesson_date,
         ), db)
 
-    exam = _lock_exam_for_transition(
+    exam = _lock_exam_for_binding(
         db,
         exam,
-        {"draft", "variants_ready", "lobby"},
-        "Назначить или перенести можно только экзамен до его запуска",
-        no_sessions_refusal="Экзамен уже имеет попытки. Создайте копию (клон), чтобы провести для другой группы.",
+        group_before=group_before,
+        org_id=actor.org_id,
+        lesson_id=req.lesson_id if req.publish else None,
+        lesson_date=req.lesson_date if req.publish else None,
     )
     if exam.status == "lobby" and not req.publish:  # the same rule as above, on the locked row
         db.rollback()
@@ -3469,13 +3506,6 @@ def assign_exam(
 
     access_code = None
     if req.publish:
-        _ensure_lesson_slot_is_available(
-            db,
-            exam,
-            org_id=actor.org_id,
-            lesson_id=req.lesson_id,
-            lesson_date=req.lesson_date,
-        )
         exam.group_id = str(canonical_group["id"])
         exam.group_name = canonical_group.get("name")
         exam.class_level = canonical_group.get("class_level")
@@ -3561,42 +3591,16 @@ def publish_exam(
     actor: ExamActor = Depends(require_exam_staff),
 ):
     exam = _get_exam_for_teacher_operator(db, exam_id, actor)
-    if exam.delivery_mode == "print":
-        raise HTTPException(409, "Печатный экзамен не публикуется в лобби. Подготовьте комплект для занятия.")
-    if exam.status not in ("draft", "variants_ready", "lobby"):
-        raise HTTPException(409, "В лобби можно вывести только экзамен до его запуска")
-
     target_group_id = req.group_id or exam.group_id
-    if not target_group_id:
-        raise HTTPException(
-            400,
-            "Нельзя активировать экзамен без привязки к группе. Сначала привяжите экзамен к классу."
-        )
-
-    if not req.lesson_id or not req.lesson_date:
-        raise HTTPException(422, "Для лобби выберите конкретное занятие в расписании")
-    if _has_any_sessions(db, exam_id):
-        raise HTTPException(409, "Экзамен уже имеет попытки. Для нового урока создайте его копию")
+    _bind_preconditions(db, exam, group_id=target_group_id, lesson_id=req.lesson_id, lesson_date=req.lesson_date)
+    group_before = exam.group_id
     group, _ = _await(_resolve_lesson_occurrence(
         actor,
         group_id=target_group_id,
         lesson_id=req.lesson_id,
         lesson_date=req.lesson_date,
     ), db)
-    _ensure_lesson_slot_is_available(
-        db,
-        exam,
-        org_id=actor.org_id,
-        lesson_id=req.lesson_id,
-        lesson_date=req.lesson_date,
-    )
-    exam = _lock_exam_for_transition(
-        db,
-        exam,
-        {"draft", "variants_ready", "lobby"},
-        "В лобби можно вывести только экзамен до его запуска",
-        no_sessions_refusal="Экзамен уже имеет попытки. Для нового урока создайте его копию",
-    )
+    exam = _lock_exam_for_binding(db, exam, group_before=group_before, org_id=actor.org_id, lesson_id=req.lesson_id, lesson_date=req.lesson_date)
     previous_status = exam.status
     previous_group_id = exam.group_id
     previous_lesson_id = exam.scheduled_lesson_id
@@ -3672,21 +3676,7 @@ def open_exam_lobby(
     actor: ExamActor = Depends(require_exam_staff),
 ):
     exam = _get_exam_for_teacher_operator(db, exam_id, actor, "open-lobby")
-    if exam.delivery_mode == "print":
-        raise HTTPException(409, "Печатный экзамен не использует лобби. Подготовьте печатный комплект.")
-
-    if not exam.group_id:
-        raise HTTPException(
-            400,
-            "Нельзя открыть лобби для экзамена без группы. Сначала привяжите экзамен к группе."
-        )
-
-    if exam.status not in ("draft", "variants_ready", "lobby"):
-        raise HTTPException(409, "Открыть лобби можно только до начала экзамена")
-    if _has_any_sessions(db, exam_id):
-        raise HTTPException(409, "В лобби уже есть участники. Для другого занятия создайте копию экзамена")
-    previous_status = exam.status
-    previous_group_id = exam.group_id
+    _bind_preconditions(db, exam, group_id=exam.group_id, lesson_id=req.lesson_id, lesson_date=req.lesson_date)
     previous_lesson_id = exam.scheduled_lesson_id
     previous_lesson_date = exam.scheduled_lesson_date
     resolved_group_id = str(exam.group_id)
@@ -3697,23 +3687,7 @@ def open_exam_lobby(
         lesson_date=req.lesson_date,
         substitute_bound_lesson=(previous_lesson_id, previous_lesson_date) if previous_lesson_id and previous_lesson_date else None,
     ), db)
-    _ensure_lesson_slot_is_available(
-        db,
-        exam,
-        org_id=actor.org_id,
-        lesson_id=req.lesson_id,
-        lesson_date=req.lesson_date,
-    )
-    exam = _lock_exam_for_transition(
-        db,
-        exam,
-        {"draft", "variants_ready", "lobby"},
-        "Открыть лобби можно только до начала экзамена",
-        no_sessions_refusal="В лобби уже есть участники. Для другого занятия создайте копию экзамена",
-    )
-    if str(exam.group_id) != resolved_group_id:  # the group the lesson was resolved for is not the locked row's group any more
-        db.rollback()
-        raise HTTPException(409, "Группа экзамена изменилась, повторите")
+    exam = _lock_exam_for_binding(db, exam, group_before=resolved_group_id, org_id=actor.org_id, lesson_id=req.lesson_id, lesson_date=req.lesson_date)
     previous_status = exam.status
     previous_group_id = exam.group_id
     previous_lesson_id = exam.scheduled_lesson_id

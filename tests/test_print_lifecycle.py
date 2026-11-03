@@ -52,8 +52,8 @@ def test_legacy_assignment_can_never_open_a_lobby_for_print_delivery(monkeypatch
                 actor,
             )
 
-        assert error.value.status_code == 422
-        assert "печатного комплекта" in str(error.value.detail)
+        assert error.value.status_code == 409           # wave E: the same refusal as publish / open-lobby (it was 422 here only)
+        assert error.value.detail == router.BINDING_PRINT_MESSAGE and "печатный комплект" in error.value.detail
         assert exam.status == "draft"
         assert exam.access_code is None
 

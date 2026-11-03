@@ -80,7 +80,7 @@ def test_online_rebind_rotates_the_public_access_code(monkeypatch) -> None:
     monkeypatch.setattr(router, "_ensure_lesson_slot_is_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(router, "_has_any_sessions", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(router, "_generate_access_code", lambda *_args: "NEW-CODE")
-    monkeypatch.setattr(router, "_lock_exam_for_transition", lambda _db, locked, *_args, **_kwargs: locked)  # no real row here
+    monkeypatch.setattr(router, "_lock_exam_row", lambda _db, locked: locked)  # no real row here (the gate of assign / publish / open-lobby takes the lock through it)
 
     async def move() -> None:
         # the teacher routes are plain ``def``: FastAPI runs them in a worker thread, so the test does the same
