@@ -5040,6 +5040,82 @@ async def start_exam(
         await _close_ticket(ticket)
 
 
+# ── the entry (start) and the poll (session-status) of a running exam: ONE builder of the student's tasks, ONE clock, ONE «time is up» (wave E, EX-41) ──────────
+TIME_UP_MESSAGE = "Время экзамена истекло. Ваши сохранённые ответы отправлены на проверку."
+
+
+def _build_student_tasks(view: Any, session: ExamSession) -> list[ExamTaskPublic]:
+    """The tasks of the student's variant as the student sees them (the options shuffled for HIS attempt)."""
+    variants = view.variants or []
+    variant_idx = max(0, min(session.variant_number - 1, len(variants) - 1))
+    variant = (variants or [{}])[variant_idx]
+    mc_mode = (view.settings or {}).get("mc_mode", "auto")
+    tasks_public = []
+    for t in variant.get("tasks", []):
+        show_mc = _should_show_mc(t, mc_mode)
+        options = _build_session_mc_options(view, session, t) if show_mc else []
+        answer_type = t.get("answer_type", "exact_number")
+        if show_mc and options:
+            answer_type = "multiple_choice"
+        elif answer_type == "multiple_choice" and not options:
+            answer_type = "exact_number"
+
+        tasks_public.append(ExamTaskPublic(
+            task_id=t.get("task_id", ""),
+            skill_id=t.get("skill_id", ""),
+            skill_name=t.get("skill_name", ""),
+            difficulty=t.get("difficulty", "B"),
+            text=t.get("question_text", t.get("text", "")),
+            question_latex=t.get("question_latex"),
+            options=options,
+            options_latex=_build_mc_options_latex(t, options) if options else None,
+            image_url=t.get("question_image_url"),
+            answer_type=answer_type,
+            points=10,
+        ))
+    return tasks_public
+
+
+def _stamp_attempt_start(db: Session, session: ExamSession, exam_start_time: Optional[datetime], now_utc: datetime) -> None:
+    """The attempt of a RUNNING exam has a start: a waiting one starts with the exam, an older one that is in progress without ``started_at`` (a row from before the
+    column was filled) gets it now - in the entry and in the poll alike, so its remaining time does not stand still at the full length on every request."""
+    if session.status == "waiting":
+        session.status = "in_progress"
+    elif session.status != "in_progress" or session.started_at:
+        return
+    session.started_at = exam_start_time or now_utc
+    db.commit()
+
+
+def _remaining_seconds(view: Any, session: ExamSession, exam_start_time: Optional[datetime], now_utc: datetime) -> tuple[int, int]:
+    """``(the whole time, the time left)`` in seconds, counted from the start of the exam (or of the attempt when the exam has none)."""
+    total_seconds = (view.total_time_minutes or 45) * 60
+    base_start = exam_start_time or _to_naive_utc(session.started_at) or now_utc
+    elapsed_seconds = max(0, int((now_utc - base_start).total_seconds()))
+    return total_seconds, max(0, total_seconds - elapsed_seconds)
+
+
+def _expire_attempt(db: Session, exam: GeneratedExam, view: Any, session_id: str, total_seconds: int) -> Optional[ExamSession]:
+    """The time of an attempt is out: lock ITS row, grade what was saved (once: a second tab or the finalizer may have done it), then let the exam close itself if this was
+    the last attempt.  ``None``: the attempt is gone (the teacher removed it meanwhile).  The commit first ends the read transaction - the shared exam lock of the entry is
+    gone before the finalizer takes its exclusive one; the grading commits, so the attempt lock is gone before the finalizer's exam -> sessions locks."""
+    db.commit()
+    locked = _lock_attempt(db, session_id)
+    if locked is None:
+        return None
+    if locked.status in ("in_progress", "waiting"):
+        _grade_and_submit_session(db, locked, view, locked.answers or {}, total_seconds)
+    else:
+        db.commit()
+    _check_and_auto_close_exam(db, exam)
+    return locked
+
+
+def _time_is_up_fields(session: ExamSession) -> dict[str, Any]:
+    """What the student is told when the time is out - the same in the answer of the entry and in the answer of the poll."""
+    return {"status": "submitted", "already_submitted": True, "saved_answers": session.answers or {}, "message": TIME_UP_MESSAGE}
+
+
 def _admit_student_to_exam(
     db: Session,
     exam_id: str,
@@ -5168,77 +5244,24 @@ def _admit_student_to_exam(
         return response
 
     # If exam is active and session is in_progress, calculate remaining time based on exam start time
-    if not session.started_at:
-        session.started_at = exam_start_time or now_utc
-        db.commit()
-
-    total_seconds = (view.total_time_minutes or 45) * 60
-    base_start = exam_start_time or _to_naive_utc(session.started_at) or now_utc
-    elapsed_seconds = max(0, int((now_utc - base_start).total_seconds()))
-    remaining_seconds = max(0, total_seconds - elapsed_seconds)
+    _stamp_attempt_start(db, session, exam_start_time, now_utc)
+    total_seconds, remaining_seconds = _remaining_seconds(view, session, exam_start_time, now_utc)
 
     # If time has expired, auto-submit session and auto-close exam
     if remaining_seconds <= 0:
-        # The attempt row is locked while it is graded: a save from a second tab must not interleave.  (The shared
-        # exam lock is gone with the commit above or just below - the finalizer needs the exclusive one.)
-        session_id_to_grade = session.id
-        db.commit()
-        locked = (
-            db.query(ExamSession)
-            .filter(ExamSession.id == session_id_to_grade)
-            .with_for_update()
-            .populate_existing()
-            .first()
-        )
+        locked = _expire_attempt(db, exam, view, session.id, total_seconds)
         if locked is None:  # the teacher removed the attempt while auth-service was answering
             raise HTTPException(404, "Сессия не найдена")
-        if locked.status in ("in_progress", "waiting"):
-            _grade_and_submit_session(db, locked, view, locked.answers or {}, total_seconds)
-        else:
-            db.commit()
-        _check_and_auto_close_exam(db, exam)
-        session = locked
         return StartExamResponse(
-            session_id=session.id,
-            variant_number=session.variant_number,
+            session_id=locked.id,
+            variant_number=locked.variant_number,
             time_minutes=view.total_time_minutes,
             time_remaining_seconds=0,
             tasks=[],
-            status="submitted",
-            already_submitted=True,
-            saved_answers=session.answers or {},
-            message="Время экзамена истекло. Ваши сохранённые ответы отправлены на проверку.",
+            **_time_is_up_fields(locked),
         )
 
-    # Build tasks for the student's assigned variant
-    variant_idx = max(0, min(session.variant_number - 1, len(variants) - 1))
-    variant = variants[variant_idx]
-    tasks_raw = variant.get("tasks", [])
-    mc_mode = (view.settings or {}).get("mc_mode", "auto")
-
-    tasks_public = []
-    for t in tasks_raw:
-        show_mc = _should_show_mc(t, mc_mode)
-        options = _build_session_mc_options(view, session, t) if show_mc else []
-        answer_type = t.get("answer_type", "exact_number")
-        if show_mc and options:
-            answer_type = "multiple_choice"
-        elif answer_type == "multiple_choice" and not options:
-            answer_type = "exact_number"
-
-        tasks_public.append(ExamTaskPublic(
-            task_id=t.get("task_id", ""),
-            skill_id=t.get("skill_id", ""),
-            skill_name=t.get("skill_name", ""),
-            difficulty=t.get("difficulty", "B"),
-            text=t.get("question_text", t.get("text", "")),
-            question_latex=t.get("question_latex"),
-            options=options,
-            options_latex=_build_mc_options_latex(t, options) if options else None,
-            image_url=t.get("question_image_url"),
-            answer_type=answer_type,
-            points=10,
-        ))
+    tasks_public = _build_student_tasks(view, session)
 
     response = StartExamResponse(
         session_id=session.id,
@@ -5331,62 +5354,17 @@ def get_session_status(
         now_utc = datetime.utcnow()
         exam_start_time = _settings_started_at(exam)
 
-        if session.status == "waiting":
-            session.status = "in_progress"
-            session.started_at = exam_start_time or now_utc
-            db.commit()
+        _stamp_attempt_start(db, session, exam_start_time, now_utc)
 
         # Check remaining time based on synchronized exam start time
-        base_start = exam_start_time or _to_naive_utc(session.started_at) or now_utc
-        elapsed_sec = max(0, int((now_utc - base_start).total_seconds()))
-        total_sec = (exam.total_time_minutes or 45) * 60
-        remaining_sec = max(0, total_sec - elapsed_sec)
+        total_sec, remaining_sec = _remaining_seconds(exam, session, exam_start_time, now_utc)
 
         # If time expired while waiting/reconnecting
         if remaining_sec <= 0:
-            # the attempt row is locked while it is graded (a save of a second tab must not interleave); the grading
-            # commits, so the lock is gone before the finalizer takes its exam -> sessions locks
-            locked = _lock_attempt(db, session.id)
-            if locked is not None and locked.status == "in_progress":
-                _grade_and_submit_session(db, locked, exam, locked.answers or {}, total_sec)
-            else:
-                db.commit()
-            _check_and_auto_close_exam(db, exam)
-            return {
-                "status": "submitted",
-                "already_submitted": True,
-                "message": "Время экзамена истекло",
-            }
-
-        # Build public tasks
-        variant_idx = max(0, min(session.variant_number - 1, len(exam.variants or []) - 1))
-        variant = (exam.variants or [{}])[variant_idx]
-        tasks_raw = variant.get("tasks", [])
-        mc_mode = (exam.settings or {}).get("mc_mode", "auto")
-
-        tasks_public = []
-        for t in tasks_raw:
-            show_mc = _should_show_mc(t, mc_mode)
-            options = _build_session_mc_options(exam, session, t) if show_mc else []
-            answer_type = t.get("answer_type", "exact_number")
-            if show_mc and options:
-                answer_type = "multiple_choice"
-            elif answer_type == "multiple_choice" and not options:
-                answer_type = "exact_number"
-
-            tasks_public.append(ExamTaskPublic(
-                task_id=t.get("task_id", ""),
-                skill_id=t.get("skill_id", ""),
-                skill_name=t.get("skill_name", ""),
-                difficulty=t.get("difficulty", "B"),
-                text=t.get("question_text", t.get("text", "")),
-                question_latex=t.get("question_latex"),
-                options=options,
-                options_latex=_build_mc_options_latex(t, options) if options else None,
-                image_url=t.get("question_image_url"),
-                answer_type=answer_type,
-                points=10,
-            ))
+            locked = _expire_attempt(db, exam, exam, session.id, total_sec)
+            if locked is None:
+                return {"status": "kicked", "message": "Сессия не найдена или удалена преподавателем"}
+            return _time_is_up_fields(locked)
 
         return {
             "status": "in_progress",
@@ -5394,7 +5372,7 @@ def get_session_status(
             "time_minutes": exam.total_time_minutes,
             "time_remaining_seconds": remaining_sec,
             "saved_answers": session.answers or {},
-            "tasks": [t.model_dump() for t in tasks_public],
+            "tasks": [t.model_dump() for t in _build_student_tasks(exam, session)],
         }
 
     return {
