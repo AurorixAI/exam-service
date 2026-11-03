@@ -1,0 +1,119 @@
+{
+ "_about": "isLessonBindable (front src/lib/exam-lessons.ts) and exam-service _lesson_is_bindable (src/api/router.py) are ONE rule: a lesson is offered for an exam unless it is completed / cancelled, of an earlier day, or of today with its planned end passed and not in progress. day: today|yesterday|tomorrow relative to the business day; now: business time HH:MM. A blank end time (empty / only spaces) is NO end time: the lesson is not judged over. ts_today notes where the front differs TODAY (it is the front's to fix: trim before the test).",
+ "cases": [
+  {
+   "id": "future-any",
+   "day": "tomorrow",
+   "end_time": "11:30",
+   "status": null,
+   "now": "23:00",
+   "bindable": true
+  },
+  {
+   "id": "earlier-day",
+   "day": "yesterday",
+   "end_time": "23:00",
+   "status": null,
+   "now": "10:00",
+   "bindable": false
+  },
+  {
+   "id": "completed",
+   "day": "tomorrow",
+   "end_time": "23:00",
+   "status": "completed",
+   "now": "10:00",
+   "bindable": false
+  },
+  {
+   "id": "cancelled",
+   "day": "today",
+   "end_time": "23:00",
+   "status": "cancelled",
+   "now": "10:00",
+   "bindable": false
+  },
+  {
+   "id": "today-before-end",
+   "day": "today",
+   "end_time": "11:30",
+   "status": null,
+   "now": "10:00",
+   "bindable": true
+  },
+  {
+   "id": "today-after-end",
+   "day": "today",
+   "end_time": "11:30",
+   "status": null,
+   "now": "15:00",
+   "bindable": false
+  },
+  {
+   "id": "today-in-progress-past-end",
+   "day": "today",
+   "end_time": "11:30",
+   "status": "in_progress",
+   "now": "12:45",
+   "bindable": true
+  },
+  {
+   "id": "today-end-at-now",
+   "day": "today",
+   "end_time": "11:30",
+   "status": null,
+   "now": "11:30",
+   "bindable": false
+  },
+  {
+   "id": "no-end-null",
+   "day": "today",
+   "end_time": null,
+   "status": null,
+   "now": "23:59",
+   "bindable": true
+  },
+  {
+   "id": "no-end-empty",
+   "day": "today",
+   "end_time": "",
+   "status": null,
+   "now": "23:59",
+   "bindable": true
+  },
+  {
+   "id": "no-end-spaces",
+   "day": "today",
+   "end_time": "   ",
+   "status": null,
+   "now": "23:59",
+   "bindable": true,
+   "ts_today": "false: isLessonBindable tests !lesson.endTime, a string of spaces is truthy and clockMinutes reads it as 0 (over)"
+  },
+  {
+   "id": "no-end-one-space",
+   "day": "today",
+   "end_time": " ",
+   "status": null,
+   "now": "10:00",
+   "bindable": true,
+   "ts_today": "false: same"
+  },
+  {
+   "id": "malformed-end-is-over",
+   "day": "today",
+   "end_time": "x",
+   "status": null,
+   "now": "10:00",
+   "bindable": false
+  },
+  {
+   "id": "hours-only",
+   "day": "today",
+   "end_time": "12",
+   "status": null,
+   "now": "10:00",
+   "bindable": true
+  }
+ ]
+}
