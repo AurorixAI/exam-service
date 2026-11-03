@@ -19,7 +19,8 @@
 | `APP_ENV` | — | `production` / `development` | `production` |
 | `CONTENT_SERVICE_URL` | — | URL content-service | `http://content-api:8004` |
 | `AUTH_SERVICE_URL` | — | URL auth-service | `http://algo-auth:8000` |
-| `CORS_ORIGINS` | — | JSON-массив origins | `["https://algolab.me"]` |
+| `CORS_ORIGINS` | — | JSON-массив origins; они же — разрешённые источники изменяющих запросов преподавателя (AD-2b). `*` при `APP_ENV` production/staging запрещён — сервис не стартует | `["https://app.algolab.me"]` |
+| `FRONTEND_URL` | — | Адрес продукта (только схема и хост учитываются); добавляется к разрешённым источникам AD-2b, чтобы отставший `CORS_ORIGINS` не ломал кабинет (урок 68). Не задан — решает один `CORS_ORIGINS` | `https://app.algolab.me` |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` / `DB_POOL_TIMEOUT` | — | Пул соединений на воркер (по умолчанию 10 + 20, ожидание 10 с) | `10` / `20` / `10` |
 | `DB_LOCK_TIMEOUT_MS` / `DB_STATEMENT_TIMEOUT_MS` / `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | — | Таймауты, которые сервер БД применяет к каждому соединению | `5000` / `15000` / `30000` |
 | `WORKER_THREADS` | — | Потоков на воркер для блокирующих обработчиков (anyio) | `40` |

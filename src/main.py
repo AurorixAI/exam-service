@@ -24,6 +24,7 @@ from src.core.config import get_settings
 from src.core.exceptions import ExamServiceError
 from src.core.http_pool import close_pools
 from src.core.middleware import RequestIDMiddleware, configure_logging
+from src.core.origin_guard import OriginGuardMiddleware, check_origin_settings
 from src.api.router import CodedHTTPException, _check_and_auto_close_exam, _without_task_json, router
 from src.core.database import SessionLocal, transient_db_failure
 from src.core.db_timezone import utc_connect_args, verify_database_timezone
@@ -145,6 +146,7 @@ async def lifespan(app: FastAPI):
     # Every handler that touches the database is a plain ``def`` (or hops to a thread with run_in_threadpool), so the
     # event loop only does I/O.  How many of them may block at once per worker is this limiter.
     anyio.to_thread.current_default_thread_limiter().total_tokens = settings.worker_threads
+    check_origin_settings()  # AD-2b: no ``*`` in CORS_ORIGINS on a deployed stack (the source check of mutating requests would refuse nobody)
     from src.domain.gemini_client import warn_if_switch_unrecognised
 
     warn_if_switch_unrecognised()  # an unknown REPORT_NARRATIVE_ENABLED value keeps paid calls ON: say so at start
@@ -190,6 +192,9 @@ def create_app() -> FastAPI:
         redoc_url="/redoc" if settings.is_development else None,
     )
 
+    # AD-2b: a POST/PUT/PATCH/DELETE that another site started is 403 before anything is read; the student's routes and /internal are listed one by one in
+    # origin_guard.EXEMPT. Added first = innermost: the 403 carries X-Request-ID (RequestID) and CORS headers only for an allowed origin.
+    app.add_middleware(OriginGuardMiddleware)
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(
         CORSMiddleware,
