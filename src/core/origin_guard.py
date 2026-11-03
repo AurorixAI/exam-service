@@ -81,7 +81,7 @@ EXEMPT_AREAS = ("/api/v1/internal",)
 
 
 def _template_regex(path: str) -> "re.Pattern":
-    return re.compile("^" + re.sub(r"\\\{[^/]+?\\\}", "[^/]+", re.escape(path)) + "$")
+    return re.compile("^" + re.sub(r"\\\{[^/]+?\\\}", "([^/]+)", re.escape(path)) + "$")
 
 
 _EXEMPT_PATTERNS = tuple((method, _template_regex(path)) for method, path in EXEMPT)
@@ -152,8 +152,17 @@ def request_is_foreign(headers: Mapping[str, str], origin_allowed: Callable[[str
     return False
 
 
+# Literal segments of the STAFF routes that a ``{name}`` of an exempt template must never stand for: ``POST /exams/by-code/print-package/start`` fits ``by-code/{code}/start``
+# (code = print-package) AND the staff route ``/exams/{exam_id}/print-package/start`` (exam_id = by-code); the router picks the second, so the exemption must not take it.
+RESERVED_PARAM_VALUES = frozenset({"by-code", "print-package"})
+
+
 def is_exempt(method: str, path: str) -> bool:
-    return any(m == method and pattern.match(path) for m, pattern in _EXEMPT_PATTERNS)
+    for m, pattern in _EXEMPT_PATTERNS:
+        found = pattern.match(path) if m == method else None
+        if found and not RESERVED_PARAM_VALUES.intersection(found.groups()):
+            return True
+    return False
 
 
 STRICT_ENVS = frozenset({"production", "prod", "staging", "stage", "preview"})
@@ -163,17 +172,22 @@ def check_origin_settings(environ: Optional[Mapping[str, str]] = None) -> None:
     """The settings the source check stands on, looked at when the service starts (the lifespan).
 
     * ``*`` in ``CORS_ORIGINS`` on production/staging stops the start: with it the Origin of a request is never refused and the check shrinks to ``Sec-Fetch-Site`` alone.
-      ``APP_ENV`` unset is read as production, as the settings read it.
+      ``APP_ENV`` unset is read as production, as the settings read it. Without an ``environ`` argument (the real start) the values come from ``get_settings()``, as the service reads them.
     * ``FRONTEND_URL`` with a path or a query is a warning (any environment): only its ``scheme://host`` is the allowed origin; the rest is a mistake.
     """
-    env = os.environ if environ is None else environ
-    app_env = (env.get("APP_ENV") or "production").strip().lower()
-    raw = (env.get("CORS_ORIGINS") or "").strip()
-    try:
-        parsed = json.loads(raw) if raw else []
-        listed = [str(item) for item in parsed] if isinstance(parsed, list) else [str(parsed)]
-    except ValueError:  # the settings refuse such a line themselves; a comma-separated one is judged here so that a mistake is not hidden
-        listed = [item.strip() for item in raw.split(",") if item.strip()]
+    if environ is None:
+        # What the service REALLY reads: the settings (any case of the name, the ``.env`` file), not ``os.environ`` (a lower-case name or a ``.env`` would slip past it).
+        settings = get_settings()
+        app_env, listed, env = settings.app_env.strip().lower(), [str(item) for item in settings.cors_origins], os.environ
+    else:
+        env = environ
+        app_env = (env.get("APP_ENV") or "production").strip().lower()
+        raw = (env.get("CORS_ORIGINS") or "").strip()
+        try:
+            parsed = json.loads(raw) if raw else []
+            listed = [str(item) for item in parsed] if isinstance(parsed, list) else [str(parsed)]
+        except ValueError:  # the settings refuse such a line themselves; a comma-separated one is judged here so that a mistake is not hidden
+            listed = [item.strip() for item in raw.split(",") if item.strip()]
     if app_env in STRICT_ENVS and "*" in [item.strip() for item in listed]:
         raise RuntimeError(
             f"CRITICAL: CORS_ORIGINS содержит * при APP_ENV={app_env}: проверка источника изменяющих запросов (AD-2b) тогда не отказывает никому. "

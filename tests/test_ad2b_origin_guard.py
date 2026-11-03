@@ -186,6 +186,28 @@ def test_the_exempt_routes_are_matched_by_method_and_segments_only():
         assert not origin_guard.is_exempt(method, concrete(path)), (method, path)
 
 
+def test_no_staff_route_is_hidden_behind_an_exempt_template_for_any_literal_segment_of_the_table():
+    """``/exams/by-code/print-package/start`` fits ``by-code/{code}/start`` (code=print-package) AND the staff route ``/exams/{exam_id}/print-package/start``
+    (exam_id=by-code): the router picks the staff one, so the exemption must not take it. Every placeholder of every staff route is filled with every literal segment
+    of the whole table (not only with ``x``): where the result is still a staff route's path, it is judged."""
+    literals = {seg for _, path in ROUTES for seg in path.split("/") if seg and not seg.startswith("{")}
+    staff_patterns = [(method, origin_guard._template_regex(path)) for method, path in STAFF_ROUTES]
+    checked = 0
+    for method, path in STAFF_ROUTES:
+        names = re.findall(r"\{[^}]+\}", path)
+        for name in names:
+            for literal in literals:
+                candidate = path.replace(name, literal)
+                candidate = re.sub(r"\{[^}]+\}", "x", candidate)
+                if any(m == method and pattern.match(candidate) for m, pattern in staff_patterns):
+                    checked += 1
+                    assert not origin_guard.is_exempt(method, candidate), (method, path, candidate)
+    assert checked > 100
+    assert not origin_guard.is_exempt("POST", "/api/v1/exams/by-code/print-package/start")
+    assert not origin_guard.is_exempt("POST", "/api/v1/exams/by-code/by-code/start")
+    assert origin_guard.is_exempt("POST", "/api/v1/exams/by-code/AB12CD/start")  # a real code still passes
+
+
 # ===================================================================================================== the sweep of every route
 
 
@@ -198,6 +220,12 @@ FOREIGN = [
     {"Origin": "http://localhost:3000", "Sec-Fetch-Site": "cross-site"},
 ]
 FOREIGN_IDS = ["foreign-origin", "null-origin", "cross-site", "suffix-attack", "foreign-referer", "own-origin-but-cross-site"]
+
+
+@pytest.mark.parametrize("headers", FOREIGN, ids=FOREIGN_IDS)
+def test_the_print_package_start_of_the_staff_is_judged_even_with_the_exam_id_by_code(headers):
+    response = plain_client().post(f"{API}/exams/by-code/print-package/start", headers=headers)
+    assert is_bad_origin(response), response.status_code
 
 
 @pytest.mark.parametrize("headers", FOREIGN, ids=FOREIGN_IDS)
@@ -366,6 +394,38 @@ def test_an_unset_app_env_is_read_as_production_like_the_settings_do():
 )
 def test_explicit_origins_and_non_deployed_environments_start(environ):
     origin_guard.check_origin_settings(environ)
+
+
+def test_the_real_start_reads_the_settings_not_os_environ(monkeypatch):
+    """R3 V-2: ``*`` in a lower-case variable name or in the .env file is what the service really reads; the start check must see it."""
+    from src.core.config import Settings
+
+    monkeypatch.delenv("CORS_ORIGINS", raising=False)
+    monkeypatch.setenv("cors_origins", '["*"]')  # lower case: pydantic-settings reads it, os.environ["CORS_ORIGINS"] does not exist
+    monkeypatch.setenv("app_env", "staging")
+    real = Settings()
+    assert real.cors_origins == ["*"] and real.app_env == "staging"
+    monkeypatch.setattr(origin_guard, "get_settings", lambda: real)
+    with pytest.raises(RuntimeError, match="CORS_ORIGINS"):
+        origin_guard.check_origin_settings()
+
+
+@pytest.mark.parametrize("env", ["staging", "production"])
+def test_a_wildcard_in_the_live_settings_stops_the_start(monkeypatch, env):
+    monkeypatch.setattr(get_settings(), "cors_origins", ["*"])
+    monkeypatch.setattr(get_settings(), "app_env", env)
+    with pytest.raises(RuntimeError, match="CORS_ORIGINS"):
+        origin_guard.check_origin_settings()
+
+
+def test_a_wildcard_in_the_live_settings_is_fine_for_testing_and_development_and_explicit_lists_start(monkeypatch):
+    monkeypatch.setattr(get_settings(), "cors_origins", ["*"])
+    for env in ("testing", "development"):
+        monkeypatch.setattr(get_settings(), "app_env", env)
+        origin_guard.check_origin_settings()
+    monkeypatch.setattr(get_settings(), "cors_origins", ["https://app.algolab.me"])
+    monkeypatch.setattr(get_settings(), "app_env", "production")
+    origin_guard.check_origin_settings()
 
 
 def test_the_lifespan_runs_the_start_check(monkeypatch):
