@@ -256,3 +256,12 @@ class VerifySiteServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReusedImageKeepsTheComposeTagTests(unittest.TestCase):
+    """LESSONS 92 (03.11.2026): after an image reuse the compose tag `<project>-<service>:latest` points at the reused image."""
+
+    def test_the_reuse_branch_tags_the_compose_image(self):
+        text = WORKFLOW.read_text()
+        reuse = text[text.index('reuse_tag="algolab-reuse-'):text.index("reuse.compose.json")]
+        self.assertIn('docker image tag "$reuse_id" "$project-$service:latest"', reuse)

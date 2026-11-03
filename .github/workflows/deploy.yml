@@ -215,6 +215,9 @@ jobs:
           if [ -n "$reuse_id" ]; then
             reuse_tag="algolab-reuse-$project-$service:${sha:0:12}-${fingerprint:0:12}"
             docker image tag "$reuse_id" "$reuse_tag"
+            # LESSONS 92 (03.11): the compose image of the stack follows the reused image too, otherwise a manual recreate
+            # (`compose up --no-build --force-recreate`) silently starts the OLD image that `latest` still points at.
+            docker image tag "$reuse_id" "$project-$service:latest"
             python3 - "$release_dir" "$service" "$reuse_tag" <<'PY_REUSE'
           import json, pathlib, sys
           release, service, tag = sys.argv[1:]
