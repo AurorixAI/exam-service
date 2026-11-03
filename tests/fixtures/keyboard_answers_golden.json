@@ -1,0 +1,19 @@
+{
+  "_about": "Typed answers (keyboard) against a stored key: ONE rule for diagnostic-service (tests/test_e7_keyboard_answers.py) and exam-service (answer_utils.check_open_answer). The same value written another way is correct (0,5 = 1/2 = \\dfrac{1}{2}; нет корней = \\varnothing), an unreduced fraction (42/10 for 21/5, 2/4, -6/2, 10/2), a number without the leading digit (.5) and a rounded decimal are not; a mixed number is whole + fraction (2 1/5 = 11/5). 'accept' - typed text both services grade correct for the key; 'reject' - both grade wrong; 'contested' - cases kept as a record, each with the verdict of each service (equal today).",
+  "cases": [
+    {"id": "fraction-key", "key": "21/5", "accept": ["21/5", "4,2", "4.2", "4,20", "\\frac{21}{5}", "\\dfrac{21}{5}", "$\\dfrac{21}{5}$", " 4,2 "], "reject": ["21/6", "4,3", "5/21", "0", "42/10", "2 1/5"]},
+    {"id": "latex-fraction-key", "key": "\\dfrac{21}{5}", "accept": ["21/5", "\\dfrac{21}{5}", "\\frac{21}{5}", "4,2", "4.2"], "reject": ["21/6", "4,3", "\\frac{21}{6}", "42/10"]},
+    {"id": "decimal-comma-key", "key": "4,2", "accept": ["4,2", "4.2", "21/5", "\\frac{21}{5}"], "reject": ["4,3", "42", "2,4", "42/10"]},
+    {"id": "half", "key": "0.5", "accept": ["0.5", "0,5", "1/2", "\\frac{1}{2}"], "reject": ["0.51", "1/3", "5", "2/4", ".5"]},
+    {"id": "negative", "key": "-3", "accept": ["-3", "−3", "-3.0"], "reject": ["3", "-2", "- 3 3", "-6/2"]},
+    {"id": "mixed-number-key", "key": "3 1/2", "accept": ["3 1/2", "7/2", "3,5", "3.5", "\\frac{7}{2}"], "reject": ["3 1/3", "7/3", "3,6"]},
+    {"id": "empty-set-latex-key", "key": "\\varnothing", "accept": ["\\varnothing", "∅", "\\emptyset", "$\\varnothing$", "нет корней", "Нет корней.", "корней нет", "нет решений", "решений нет", "пустое множество", "x \\in \\varnothing"], "reject": ["0", "{0}", "один корень", "нет корней и всё же есть"]},
+    {"id": "empty-set-words-key", "key": "нет корней", "accept": ["нет корней", "Нет корней", "корней нет", "\\varnothing", "∅", "\\emptyset"], "reject": ["0", "5"]},
+    {"id": "number-is-not-empty", "key": "5", "accept": ["5", "5.0"], "reject": ["нет корней", "\\varnothing", "∅", "10/2"]},
+    {"id": "mixed-number-as-typed", "key": "11/5", "accept": ["2 1/5", "11/5", "2,2"], "reject": ["21/5", "2 1/6", "2 2/5"]}
+  ],
+  "contested": [
+    {"key": "1/3", "typed": "0.3333333333", "diag": false, "exam": false, "note": "no numeric tolerance in either service (a rounded decimal is not the fraction)"},
+    {"key": "1/3", "typed": "0,333", "diag": false, "exam": false, "note": "both refuse a short rounding"}
+  ]
+}
