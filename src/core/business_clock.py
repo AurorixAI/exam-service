@@ -6,13 +6,15 @@ import: ``APP_ENV=development`` EXACTLY and ``ALGO_TEST_CLOCK=1``.  ``ALGO_TEST_
 start (``check_test_clock_allowed``, run at import).  Outside the mode the offset is 0 at once: no Redis call, no lock.  In the mode any failure to
 read the offset (no address, Redis down, not a number) is a loud ``TestClockError``, never a silent zero.
 
-Only the BUSINESS "now / today" shifts.  Row stamps (``created_at``, ``started_at``, the timers of a running exam) stay on the real clock.
+Everything the service reads as "now" shifts together: the business day, the row stamps (``created_at``, ``occurred_at``, ``started_at`` ...), the timers
+of a running exam, the cool-downs.  A shifted day is compared only with shifted stamps.
 """
 from __future__ import annotations
 
 import os
 import threading
 import time
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Mapping, Optional
 
 TEST_CLOCK_VARIABLE = "ALGO_TEST_CLOCK"
@@ -92,3 +94,20 @@ def current_offset_seconds() -> int:
         value = _read_offset()
         _offset_cache = (value, now + OFFSET_CACHE_SECONDS)
         return value
+
+
+def utc_now() -> datetime:
+    """Now as a naive UTC instant (the type of every UTC column) on the stand clock: real time + the shared offset.
+
+    Outside the test mode this is exactly ``datetime.utcnow()`` by value and type.  EVERY read of the time in ``src`` goes through here (or through
+    ``business_now``): a shifted business day is compared only with shifted stamps and timers (guard: ``tests/test_time_clock.py``)."""
+    moment = datetime.now(timezone.utc).replace(tzinfo=None)
+    offset = current_offset_seconds()  # 0 and no Redis call outside the test mode
+    return moment + timedelta(seconds=offset) if offset else moment
+
+
+def business_now(zone: tzinfo) -> datetime:
+    """Now, aware, in ``zone`` on the stand clock."""
+    moment = datetime.now(zone)
+    offset = current_offset_seconds()
+    return moment + timedelta(seconds=offset) if offset else moment

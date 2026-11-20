@@ -12,6 +12,7 @@ from datetime import datetime
 import pytest
 
 from src.api import router as router_module
+from src.core import business_clock
 from src.models.exam_models import ExamSession
 from src.repositories.exam_repo import ExamRepository
 from tests.conftest import TEST_SESSION_TOKEN, make_exam_in_db, make_session_in_db, make_task
@@ -30,6 +31,7 @@ class FrozenDatetime(datetime):
 @pytest.fixture(autouse=True)
 def _frozen_clock(monkeypatch):
     monkeypatch.setattr(router_module, "datetime", FrozenDatetime)
+    monkeypatch.setattr(business_clock, "utc_now", FrozenDatetime.utcnow)  # the router reads the time through the stand clock
 
 
 def big_variants(variants=8, tasks=25):

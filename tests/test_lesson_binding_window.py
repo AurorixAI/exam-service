@@ -339,7 +339,9 @@ def test_the_business_clock_is_read_in_tashkent_once(monkeypatch):
             seen.append(str(tz))
             return datetime(2026, 10, 16, 13, 45, tzinfo=tz)
 
-    monkeypatch.setattr(router, "datetime", Fixed)
+    from src.core import business_clock
+
+    monkeypatch.setattr(business_clock, "datetime", Fixed)  # the one place that reads the real clock
     instant = router._business_now()
     assert (instant.date(), instant.hour * 60 + instant.minute) == (date(2026, 10, 16), 13 * 60 + 45)
     assert router._business_today() == date(2026, 10, 16)

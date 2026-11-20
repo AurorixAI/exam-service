@@ -3,13 +3,14 @@ Exam Service — Exam, Session, and Report repositories (owned tables, read/writ
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import List, Optional
 
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, defer
 
+from src.core import business_clock
 from src.models import GeneratedExam, ExamSession, ExamReport
 
 
@@ -125,7 +126,7 @@ class ExamReportRepository:
 
         for field, value in values.items():
             setattr(existing, field, value)
-        existing.updated_at = datetime.now(timezone.utc)
+        existing.updated_at = business_clock.utc_now()
         self.db.commit()
         self.db.refresh(existing)
         return existing
@@ -166,7 +167,7 @@ class SessionRepository:
         session.total_tasks = total_tasks
         session.time_spent_seconds = time_spent
         session.status = "submitted"
-        session.submitted_at = datetime.now(timezone.utc)
+        session.submitted_at = business_clock.utc_now()
         if distractor_analytics is not None:
             session.distractor_analytics = distractor_analytics
         if commit:

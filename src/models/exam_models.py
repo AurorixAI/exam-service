@@ -22,6 +22,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB as PostgreSQLJSONB
 from sqlalchemy.sql import func
 
+from src.core.business_clock import utc_now
 from src.models.shared import Base
 
 # Keep SQLite-based unit fixtures usable, while accurately modelling the
@@ -106,8 +107,8 @@ class GeneratedExam(Base):
     source_exam_id = Column(String(30), nullable=True)  # set when cloned
 
     created_by = Column(String(100))   # user_id from auth
-    created_at = Column(DateTime, server_default=func.now())
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime, default=utc_now, server_default=func.now())
+    updated_at = Column(DateTime, default=utc_now, server_default=func.now(), onupdate=utc_now)
 
     __table_args__ = (
         Index(
@@ -135,7 +136,7 @@ class ExamLifecycleEvent(Base):
     exam_id = Column(String(30), ForeignKey("generated_exams.id", ondelete="CASCADE"), nullable=False)
     org_id = Column(String(36), nullable=False)
     event_type = Column(String(50), nullable=False)
-    occurred_at = Column(DateTime, nullable=False, server_default=func.now())
+    occurred_at = Column(DateTime, nullable=False, default=utc_now, server_default=func.now())
 
     # Context is copied at the time of the event, so a later group rename or
     # a lesson reschedule cannot rewrite the historical record.
@@ -183,7 +184,7 @@ class ExamPrintPackage(Base):
     snapshot = Column(JSONB, nullable=False, default=dict)
     snapshot_sha256 = Column(String(64), nullable=False)
     created_by = Column(String(100), nullable=False)
-    created_at = Column(DateTime, server_default=func.now())
+    created_at = Column(DateTime, default=utc_now, server_default=func.now())
     released_at = Column(DateTime, nullable=True)
 
     __table_args__ = (
@@ -206,7 +207,7 @@ class ExamDeletion(Base):
     org_id = Column(String(36), nullable=True)
     title = Column(String(300), nullable=True)
     deleted_by = Column(String(100), nullable=True)
-    deleted_at = Column(DateTime, nullable=False, server_default=func.now())
+    deleted_at = Column(DateTime, nullable=False, default=utc_now, server_default=func.now())
     reason = Column(String(500), nullable=True)
 
     __table_args__ = (
@@ -246,8 +247,8 @@ class ExamReport(Base):
 
     # State
     is_final = Column(Boolean, default=False)       # True when exam is closed
-    generated_at = Column(DateTime, server_default=func.now())
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    generated_at = Column(DateTime, default=utc_now, server_default=func.now())
+    updated_at = Column(DateTime, default=utc_now, server_default=func.now(), onupdate=utc_now)
 
 
 class ExamSession(Base):
@@ -284,5 +285,5 @@ class ExamSession(Base):
     status = Column(String(20), nullable=False, default="in_progress")
     # in_progress | submitted
 
-    started_at = Column(DateTime, server_default=func.now())
+    started_at = Column(DateTime, default=utc_now, server_default=func.now())
     submitted_at = Column(DateTime)

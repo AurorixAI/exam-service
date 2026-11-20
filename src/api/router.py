@@ -809,9 +809,7 @@ def _business_now() -> datetime:
     """ONE clock reading in business time (Asia/Tashkent): take the date and the minutes from the same value.
 
     TIME-TESTS: on the end-to-end stand the shared offset of the stand clock is added (0 and no Redis call everywhere else)."""
-    moment = datetime.now(_BUSINESS_TIMEZONE)
-    offset = business_clock.current_offset_seconds()
-    return moment + timedelta(seconds=offset) if offset else moment
+    return business_clock.business_now(_BUSINESS_TIMEZONE)
 
 
 def _business_today() -> date:
@@ -829,7 +827,7 @@ def get_dev_clock() -> dict:
         offset = business_clock.current_offset_seconds()
     except business_clock.TestClockError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    now_business = datetime.now(_BUSINESS_TIMEZONE) + timedelta(seconds=offset)
+    now_business = business_clock.business_now(_BUSINESS_TIMEZONE)
     return {
         "now_business": now_business.isoformat(timespec="seconds"),
         "now_utc": now_business.astimezone(timezone.utc).isoformat(timespec="seconds"),
@@ -1113,7 +1111,7 @@ def _record_exam_lifecycle_event(
     actor_id: Optional[str] = None,
 ) -> None:
     """Append an immutable operational event without changing task content."""
-    occurred_at = datetime.utcnow()
+    occurred_at = business_clock.utc_now()
     details = event.get("details") if isinstance(event.get("details"), dict) else {}
     persisted = ExamLifecycleEvent(
         id=str(uuid4()),
@@ -2062,7 +2060,7 @@ def _exam_remaining_seconds(db: Session, exam: GeneratedExam) -> Optional[int]:
     if exam.status != "active" or not started_at:
         return None
     total_seconds = (exam.total_time_minutes or 45) * 60
-    return max(0, total_seconds - max(0, int((datetime.utcnow() - started_at).total_seconds())))
+    return max(0, total_seconds - max(0, int((business_clock.utc_now() - started_at).total_seconds())))
 
 
 def _waiting_session_count(db: Session, exam_id: str) -> int:
@@ -2576,7 +2574,7 @@ def _live_exam_dashboard_payload(
     total_time_seconds = (exam.total_time_minutes or 45) * 60
 
     if exam.status == "active" and started_at:
-        elapsed_seconds = max(0, int((datetime.utcnow() - started_at).total_seconds()))
+        elapsed_seconds = max(0, int((business_clock.utc_now() - started_at).total_seconds()))
         time_remaining_seconds = max(0, total_time_seconds - elapsed_seconds)
     elif exam.status == "closed":
         time_remaining_seconds = 0
@@ -2683,7 +2681,7 @@ def _exam_deadline_passed(db: Session, exam: GeneratedExam) -> bool:
     if not exam_started_at:
         return False
     total_seconds = (exam.total_time_minutes or 45) * 60
-    return int((datetime.utcnow() - exam_started_at).total_seconds()) >= total_seconds
+    return int((business_clock.utc_now() - exam_started_at).total_seconds()) >= total_seconds
 
 
 def _without_task_json(query):
@@ -2728,7 +2726,7 @@ def _check_and_auto_close_exam(db: Session, exam: Optional[GeneratedExam]) -> bo
         db.commit()
         return False
 
-    now_utc = datetime.utcnow()
+    now_utc = business_clock.utc_now()
     total_seconds = (locked_exam.total_time_minutes or 45) * 60
     elapsed_seconds = int((now_utc - exam_started_at).total_seconds())
 
@@ -3150,7 +3148,7 @@ def get_live_exam_dashboard_summary(
     visible for six hours so the teacher sees the definitive ``exam finished``
     state instead of a card abruptly disappearing at zero.
     """
-    recent_cutoff = datetime.utcnow() - timedelta(hours=6)
+    recent_cutoff = business_clock.utc_now() - timedelta(hours=6)
     candidates = (
         _without_task_json(db.query(GeneratedExam))
         .filter(
@@ -3891,7 +3889,7 @@ def start_exam_live(
     exam.status = "active"
     sessions = SessionRepository(db).list_by_exam(exam_id)
     started_count = 0
-    now = datetime.utcnow()
+    now = business_clock.utc_now()
     st = dict(exam.settings or {})
     st["started_at"] = now.isoformat()
     exam.settings = st
@@ -3973,7 +3971,7 @@ def get_exam_lobby_status(
     time_elapsed_seconds = 0
 
     if exam.status == "active" and earliest_started_at:
-        now_utc = datetime.utcnow()
+        now_utc = business_clock.utc_now()
         time_elapsed_seconds = max(0, int((now_utc - earliest_started_at).total_seconds()))
         time_remaining_seconds = max(0, total_time_seconds - time_elapsed_seconds)
     elif exam.status == "closed":
@@ -4397,10 +4395,10 @@ def start_print_exam(
 
     exam.status = "active"
     settings = deepcopy(exam.settings or {})
-    settings["started_at"] = datetime.utcnow().isoformat()
+    settings["started_at"] = business_clock.utc_now().isoformat()
     exam.settings = settings
     package.status = "released"
-    package.released_at = datetime.utcnow()
+    package.released_at = business_clock.utc_now()
     _record_exam_lifecycle_event(
         db,
         exam,
@@ -4862,7 +4860,7 @@ def _exam_info_response(db: Session, exam: GeneratedExam) -> ExamInfoResponse:
         total_sec = (exam.total_time_minutes or 45) * 60
         if exam_start:
             started_at_str = exam_start.isoformat()
-            now_utc = datetime.utcnow()
+            now_utc = business_clock.utc_now()
             elapsed = max(0, int((now_utc - exam_start).total_seconds()))
             remaining_seconds = max(0, total_sec - elapsed)
         else:
@@ -5212,7 +5210,7 @@ def _admit_student_to_exam(
     # Determine global exam start time
     exam_start_time = _settings_started_at(view)
 
-    now_utc = datetime.utcnow()
+    now_utc = business_clock.utc_now()
 
     if existing_session:
         session = existing_session
@@ -5380,7 +5378,7 @@ def get_session_status(
         raise HTTPException(410, "Экзамен ещё не назначен на занятие") from exc
 
     if exam.status == "active":
-        now_utc = datetime.utcnow()
+        now_utc = business_clock.utc_now()
         exam_start_time = _settings_started_at(exam)
 
         _stamp_attempt_start(db, session, exam_start_time, now_utc)
@@ -5477,7 +5475,7 @@ def save_exam_progress(
         total_seconds = (exam.total_time_minutes or 45) * 60
         session.time_spent_seconds = min(
             total_seconds,
-            max(0, int((datetime.utcnow() - started_at).total_seconds())),
+            max(0, int((business_clock.utc_now() - started_at).total_seconds())),
         )
 
     db.commit()
@@ -5534,7 +5532,7 @@ def submit_exam(
     started_at = _exam_started_at(db, exam) or _to_naive_utc(session.started_at)
     total_seconds = (exam.total_time_minutes or 45) * 60
     server_time_spent = (
-        min(total_seconds, max(0, int((datetime.utcnow() - started_at).total_seconds())))
+        min(total_seconds, max(0, int((business_clock.utc_now() - started_at).total_seconds())))
         if started_at else 0
     )
 

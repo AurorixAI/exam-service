@@ -14,6 +14,7 @@ import pytest
 
 import src.main as main_module
 from src.api import router as router_module
+from src.core import business_clock
 from src.models.exam_models import ExamSession, GeneratedExam
 from tests.conftest import TEST_GROUP_ID, TEST_LESSON_ID, TEST_ORG_ID, TEST_USER_ID, make_actor, make_task
 from tests.sql_probe import count_statements
@@ -36,6 +37,7 @@ class FrozenDatetime(datetime):
 @pytest.fixture(autouse=True)
 def _frozen(monkeypatch):
     monkeypatch.setattr(router_module, "datetime", FrozenDatetime)
+    monkeypatch.setattr(business_clock, "utc_now", FrozenDatetime.utcnow)  # the router reads the time through the stand clock
     monkeypatch.setattr(router_module, "_business_now", lambda: datetime(2026, 11, 2, 14, 30, tzinfo=ZoneInfo("Asia/Tashkent")))
 
 
@@ -174,6 +176,7 @@ def test_the_sweeper_closes_an_expired_exam_and_reads_the_task_json_only_there(d
     db.expunge_all()
     monkeypatch.setattr(main_module, "SessionLocal", lambda: _Borrowed(db))
     monkeypatch.setattr(router_module, "datetime", FrozenDatetime)
+    monkeypatch.setattr(business_clock, "utc_now", FrozenDatetime.utcnow)  # the router reads the time through the stand clock
 
     with count_statements() as new:
         main_module._close_expired_exams_once()

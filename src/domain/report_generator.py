@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from src.core import business_clock
 from src.domain.exam_aggregate import aggregate_exam as _aggregate
 from src.domain.task_display import bind_report_task_statements
 from src.domain.gemini_client import call_gemini, narrative_enabled, parse_json_response
@@ -362,7 +363,7 @@ _in_flight_lock = threading.Lock()
 
 def _utcnow() -> datetime:
     """Naive UTC, like the DateTime columns (the connection runs in UTC - see db_timezone)."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return business_clock.utc_now()
 
 
 def _naive_utc(value: Optional[datetime]) -> Optional[datetime]:

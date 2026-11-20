@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from src.api import router as router_module
+from src.core import business_clock
 from src.models.exam_models import ExamSession
 from tests.conftest import TEST_SESSION_TOKEN, make_exam_in_db, make_session_in_db, make_task
 
@@ -28,6 +29,7 @@ class FrozenDatetime(datetime):
 def _frozen(monkeypatch):
     STATE["now"] = datetime(2026, 11, 3, 10, 0, 0)
     monkeypatch.setattr(router_module, "datetime", FrozenDatetime)
+    monkeypatch.setattr(business_clock, "utc_now", FrozenDatetime.utcnow)  # the router reads the time through the stand clock
 
 
 def _running_exam(db, *, tasks=None):
