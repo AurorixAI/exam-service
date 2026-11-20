@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 
+from src.core import business_clock
 from src.core.config import get_settings
 from src.core.exceptions import ExamServiceError
 from src.core.http_pool import close_pools
@@ -307,6 +308,7 @@ def create_app() -> FastAPI:
             "version": settings.app_version,
             "database": "ok" if db_ok else "error",
             "redis": "ok" if redis_ok else "error",
+            "test_clock": business_clock.TEST_CLOCK_MODE,  # TIME-TESTS: true only on the end-to-end stand; the smoke check of stage / prod requires false
         }
         return JSONResponse(status_code=200 if ready else 503, content=payload)
 

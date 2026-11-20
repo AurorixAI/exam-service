@@ -35,6 +35,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, defer
 
 from src.core import auth as core_auth
+from src.core import business_clock
 from src.core.auth import (
     ExamActor,
     exam_access_group,
@@ -805,12 +806,35 @@ _BUSINESS_TIMEZONE = ZoneInfo("Asia/Tashkent")
 
 
 def _business_now() -> datetime:
-    """ONE clock reading in business time (Asia/Tashkent): take the date and the minutes from the same value."""
-    return datetime.now(_BUSINESS_TIMEZONE)
+    """ONE clock reading in business time (Asia/Tashkent): take the date and the minutes from the same value.
+
+    TIME-TESTS: on the end-to-end stand the shared offset of the stand clock is added (0 and no Redis call everywhere else)."""
+    moment = datetime.now(_BUSINESS_TIMEZONE)
+    offset = business_clock.current_offset_seconds()
+    return moment + timedelta(seconds=offset) if offset else moment
 
 
 def _business_today() -> date:
     return _business_now().date()
+
+
+@router.get("/dev/clock", include_in_schema=False)
+def get_dev_clock() -> dict:
+    """TIME-TESTS: the stand clock as this service sees it (a helper of the end-to-end tests; READ only - the auth service writes the offset).
+
+    Outside the test mode the path does not exist (404); an unreadable offset is 503."""
+    if not business_clock.TEST_CLOCK_MODE:
+        raise HTTPException(status_code=404, detail="Not Found")
+    try:
+        offset = business_clock.current_offset_seconds()
+    except business_clock.TestClockError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    now_business = datetime.now(_BUSINESS_TIMEZONE) + timedelta(seconds=offset)
+    return {
+        "now_business": now_business.isoformat(timespec="seconds"),
+        "now_utc": now_business.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        "offset_seconds": offset,
+    }
 
 
 def _has_any_sessions(db: Session, exam_id: str) -> bool:
