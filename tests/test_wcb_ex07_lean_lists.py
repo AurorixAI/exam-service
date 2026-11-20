@@ -7,7 +7,7 @@ access in a loop would show up as N extra single-column SELECTs).  The router cl
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -24,20 +24,10 @@ NOW = datetime(2026, 11, 2, 9, 30, 0)
 TODAY = "2026-11-02"
 
 
-class FrozenDatetime(datetime):
-    @classmethod
-    def utcnow(cls):
-        return cls(NOW.year, NOW.month, NOW.day, NOW.hour, NOW.minute, NOW.second)
-
-    @classmethod
-    def now(cls, tz=None):
-        return cls(NOW.year, NOW.month, NOW.day, NOW.hour, NOW.minute, NOW.second, tzinfo=tz)
-
 
 @pytest.fixture(autouse=True)
 def _frozen(monkeypatch):
-    monkeypatch.setattr(router_module, "datetime", FrozenDatetime)
-    monkeypatch.setattr(business_clock, "utc_now", FrozenDatetime.utcnow)  # the router reads the time through the stand clock
+    monkeypatch.setattr(business_clock, "_real_now", lambda: NOW.replace(tzinfo=timezone.utc))  # the one point where the service reads the real time
     monkeypatch.setattr(router_module, "_business_now", lambda: datetime(2026, 11, 2, 14, 30, tzinfo=ZoneInfo("Asia/Tashkent")))
 
 
@@ -175,8 +165,7 @@ def test_the_sweeper_closes_an_expired_exam_and_reads_the_task_json_only_there(d
     db.commit()
     db.expunge_all()
     monkeypatch.setattr(main_module, "SessionLocal", lambda: _Borrowed(db))
-    monkeypatch.setattr(router_module, "datetime", FrozenDatetime)
-    monkeypatch.setattr(business_clock, "utc_now", FrozenDatetime.utcnow)  # the router reads the time through the stand clock
+    monkeypatch.setattr(business_clock, "_real_now", lambda: NOW.replace(tzinfo=timezone.utc))  # the one point where the service reads the real time
 
     with count_statements() as new:
         main_module._close_expired_exams_once()

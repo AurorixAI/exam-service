@@ -5,7 +5,7 @@ without a start kept «the full time» on every poll (the clock stood still).  T
 the same tasks."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -19,17 +19,11 @@ STATE = {"now": datetime(2026, 11, 3, 10, 0, 0)}
 CODE = "WEDTIME1"
 
 
-class FrozenDatetime(datetime):
-    @classmethod
-    def utcnow(cls):
-        return STATE["now"]
-
 
 @pytest.fixture(autouse=True)
 def _frozen(monkeypatch):
     STATE["now"] = datetime(2026, 11, 3, 10, 0, 0)
-    monkeypatch.setattr(router_module, "datetime", FrozenDatetime)
-    monkeypatch.setattr(business_clock, "utc_now", FrozenDatetime.utcnow)  # the router reads the time through the stand clock
+    monkeypatch.setattr(business_clock, "_real_now", lambda: STATE["now"].replace(tzinfo=timezone.utc))  # the one point where the service reads the real time
 
 
 def _running_exam(db, *, tasks=None):

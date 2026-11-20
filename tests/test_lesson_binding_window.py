@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 os.environ.setdefault("APP_ENV", "testing")
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -333,19 +333,18 @@ class TestEndpointsRefuseAnOverLesson:
 def test_the_business_clock_is_read_in_tashkent_once(monkeypatch):
     seen = []
 
-    class Fixed(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            seen.append(str(tz))
-            return datetime(2026, 10, 16, 13, 45, tzinfo=tz)
+    def fixed():
+        seen.append(1)
+        return datetime(2026, 10, 16, 8, 45, tzinfo=timezone.utc)  # 13:45 in Tashkent (UTC+5)
 
     from src.core import business_clock
 
-    monkeypatch.setattr(business_clock, "datetime", Fixed)  # the one place that reads the real clock
+    monkeypatch.setattr(business_clock, "_real_now", fixed)  # the one place that reads the real clock
     instant = router._business_now()
     assert (instant.date(), instant.hour * 60 + instant.minute) == (date(2026, 10, 16), 13 * 60 + 45)
+    assert str(instant.tzinfo) == "Asia/Tashkent"
     assert router._business_today() == date(2026, 10, 16)
-    assert seen == ["Asia/Tashkent", "Asia/Tashkent"]
+    assert len(seen) == 2
 
 
 def test_the_binding_check_reads_the_clock_once_for_the_date_and_the_minutes(auth, monkeypatch):

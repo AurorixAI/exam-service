@@ -7,10 +7,13 @@ never compared with a real ``created_at`` / ``occurred_at`` / ``started_at``.
 from __future__ import annotations
 
 import ast
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
+from sqlalchemy import DateTime
 
 from src.api import router as router_module
 from src.core import business_clock as bc
@@ -19,55 +22,191 @@ from tests.conftest import TEST_ORG_ID, business_today, make_actor, make_exam_in
 from tests.test_time_clock import CountingRedis
 
 SRC = Path(__file__).resolve().parents[1] / "src"
-FORBIDDEN = {("datetime", "utcnow"), ("datetime", "now"), ("date", "today"), ("datetime", "today"), ("time", "time")}
-# (file relative to src, call) -> reason.  The clock module is the one place that reads the real clock.
-ALLOWED: dict[tuple[str, str], str] = {}  # signature / token expiry: the service has none (it trusts auth-service); nothing else is excused
+CLOCK_MODULE = "core/business_clock.py"
+# Wall-clock readers.  ``time.monotonic`` / ``perf_counter`` are NOT here: they measure an interval, not a moment.
+DT_ATTRS = {"utcnow", "now", "today", "utcfromtimestamp", "fromtimestamp"}
+TIME_FUNCS = {"time", "time_ns", "gmtime", "localtime", "strftime", "ctime", "asctime"}
+SQL_NOW_FUNCS = {"now", "current_timestamp", "current_date", "localtimestamp", "statement_timestamp", "clock_timestamp", "transaction_timestamp"}
+SQL_NOW_RE = re.compile(r"\bnow\s*\(\s*\)|\b(?:current_timestamp|current_date|localtimestamp|statement_timestamp|clock_timestamp|transaction_timestamp)\b", re.I)
+# (file relative to src, kind) -> reason.  The clock module is the one place that reads the real clock; nothing else is excused.
+ALLOWED: dict[tuple[str, str], str] = {}
 
 
-def _real_clock_calls(path: Path):
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            owner = ast.unparse(node.func.value).split(".")[-1]
-            if (owner, node.func.attr) in FORBIDDEN:
-                yield node.lineno, f"{owner}.{node.func.attr}()"
+def _scan(source: str):
+    """[(line, kind, text)] of every way the source can read the wall clock (outside the clock module) or let the database do it.
+
+    kinds: ``call`` (``datetime.utcnow()``, ``dt.utcnow()``, ``time.time()``, ``from time import time; time()``), ``ref`` (a clock function used
+    WITHOUT a call: ``default=datetime.utcnow``), ``sql-func`` (``func.now()`` in a query or a column; a ``server_default`` of a model column is the
+    declared fallback and is skipped), ``sql-text`` (``text("... now() ...")``)."""
+    tree = ast.parse(source)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    time_names, from_time, dt_classes, dt_modules = {"time"}, {}, {"datetime", "date"}, {"datetime"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "time":
+                    time_names.add(a.asname or "time")
+                elif a.name == "datetime":
+                    dt_modules.add(a.asname or "datetime")
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "time":
+                for a in node.names:
+                    if a.name in TIME_FUNCS:
+                        from_time[a.asname or a.name] = a.name
+            elif node.module == "datetime":
+                for a in node.names:
+                    if a.name in {"datetime", "date"}:
+                        dt_classes.add(a.asname or a.name)
+
+    def in_server_default(node):
+        while node in parents:
+            parent = parents[node]
+            if isinstance(parent, ast.keyword) and parent.arg == "server_default":
+                return True
+            node = parent
+        return False
+
+    def clock_reader(node):
+        """The wall-clock reader that a Name / Attribute denotes, or None."""
+        if isinstance(node, ast.Attribute):
+            owner = ast.unparse(node.value)
+            if node.attr in TIME_FUNCS and owner in time_names:
+                return f"time.{node.attr}"
+            if node.attr in DT_ATTRS and (owner.split(".")[-1] in dt_classes or owner.split(".")[-1] == "date"):
+                return f"{owner}.{node.attr}"
+            if node.attr in {"utcnow", "utcfromtimestamp"}:  # any alias of a datetime class: ``dt.utcnow()``
+                return f"{owner}.{node.attr}"
+        elif isinstance(node, ast.Name):
+            if node.id in from_time:
+                return f"time.{from_time[node.id]}"
+            if node.id in {"utcnow", "utcfromtimestamp"}:
+                return node.id
+        return None
+
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Attribute, ast.Name)):
+            what = clock_reader(node)
+            parent = parents.get(node)
+            if what and not isinstance(parent, (ast.ImportFrom, ast.alias)) and not (isinstance(parent, ast.Attribute) and clock_reader(parent)):
+                found.add((node.lineno, "call" if isinstance(parent, ast.Call) and parent.func is node else "ref", what))
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Attribute) and f.attr in SQL_NOW_FUNCS and ast.unparse(f.value).split(".")[-1] in {"func", "sqlfunc"}:
+                if not in_server_default(node):
+                    found.add((node.lineno, "sql-func", ast.unparse(node)))
+            elif (isinstance(f, ast.Attribute) and f.attr == "text") or (isinstance(f, ast.Name) and f.id == "text"):
+                if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    if SQL_NOW_RE.search(node.args[0].value) and not in_server_default(node):
+                        found.add((node.lineno, "sql-text", node.args[0].value[:60]))
+    return sorted(found)
 
 
 def test_no_real_clock_read_in_src_outside_the_clock_module():
     found = []
     for path in sorted(SRC.rglob("*.py")):
         rel = path.relative_to(SRC).as_posix()
-        if rel == "core/business_clock.py":
+        if rel == CLOCK_MODULE:
             continue
-        for line, call in _real_clock_calls(path):
-            if (rel, call) not in ALLOWED:
-                found.append(f"{rel}:{line} {call}")
+        for line, kind, what in _scan(path.read_text(encoding="utf-8")):
+            if (rel, kind) not in ALLOWED:
+                found.append(f"{rel}:{line} {kind} {what}")
     assert not found, "read the time through src.core.business_clock: " + ", ".join(found)
 
 
-def test_the_guard_sees_a_violation():
-    tree = "import datetime\nx = datetime.datetime.utcnow()\ny = time.time()\n"
-    path = SRC.parent / "tests" / "_guard_probe.py"
-    path.write_text(tree, encoding="utf-8")
-    try:
-        assert [call for _, call in _real_clock_calls(path)] == ["datetime.utcnow()", "time.time()"]
-    finally:
-        path.unlink()
+@pytest.mark.parametrize("source, kind", [
+    ("import datetime\nx = datetime.datetime.utcnow()\n", "call"),
+    ("from datetime import datetime\nx = datetime.now(timezone.utc)\n", "call"),
+    ("from datetime import date\nx = date.today()\n", "call"),
+    ("import time\nx = time.time()\n", "call"),
+    ("from time import time\nx = time()\n", "call"),
+    ("from time import time as clock\nx = clock()\n", "call"),
+    ("import datetime as dt\nx = dt.datetime.utcnow()\n", "call"),
+    ("from datetime import datetime as dt\nx = dt.utcnow()\n", "call"),
+    ("from datetime import datetime\nc = Column(DateTime, default=datetime.utcnow)\n", "ref"),
+    ("import time\nf = time.time\n", "ref"),
+    ("import time\nx = time.time_ns()\n", "call"),
+    ("import time\nx = time.gmtime()\n", "call"),
+    ("import time\nx = time.localtime()\n", "call"),
+    ("import time\nx = time.strftime('%Y')\n", "call"),
+    ("from time import gmtime\nx = gmtime()\n", "call"),
+    ("q = db.query(X).filter(X.at < func.now())\n", "sql-func"),
+    ("q = db.query(sqlfunc.now())\n", "sql-func"),
+    ("q = func.current_timestamp()\n", "sql-func"),
+    ('db.execute(text("UPDATE t SET at = now() WHERE id = 1"))\n', "sql-text"),
+    ('db.execute(sqlalchemy.text("SELECT CURRENT_TIMESTAMP"))\n', "sql-text"),
+    ("c = Column(DateTime, onupdate=func.now())\n", "sql-func"),
+])
+def test_the_guard_catches_every_kind_of_violation(source, kind):
+    assert kind in [k for _, k, _ in _scan(source)], source
 
 
-def test_model_stamp_defaults_come_from_the_clock_module_with_the_type_of_the_column():
+@pytest.mark.parametrize("source", [
+    "import time\nx = time.monotonic() + time.perf_counter()\n",
+    "from datetime import datetime\nx = datetime(2026, 1, 1) + datetime.fromisoformat('2026-01-01')\n",
+    "c = Column(DateTime, default=utc_now, server_default=func.now())\n",
+    "c = Column(DateTime, server_default=text('now()'))\n",
+    'db.execute(text("SELECT pg_advisory_lock(:k)"))\n',
+    "x = business_clock.utc_now()\n",
+    "import asyncio\nawait asyncio.sleep(3)\n",
+])
+def test_the_guard_lets_a_clean_source_pass(source):
+    assert _scan(source) == [], source
+
+
+def test_the_clock_module_reads_the_real_time_in_one_place_only():
+    """``_real_now`` is the only function of the clock module that touches the wall clock; every other reader goes through it."""
+    source = (SRC / CLOCK_MODULE).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    readers = set()
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        if any(kind in {"call", "ref"} for _, kind, _ in _scan(ast.get_source_segment(source, fn).lstrip())):
+            readers.add(fn.name)
+    assert readers == {"_real_now"}, readers
+
+
+def test_the_single_point_pins_every_reader_of_the_clock(monkeypatch):
+    moment = datetime(2026, 11, 2, 9, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(bc, "_real_now", lambda: moment)
+    assert bc.utc_now() == datetime(2026, 11, 2, 9, 30) and bc.utc_now().tzinfo is None
+    assert bc.utc_now_aware() == moment and bc.utc_now_aware().utcoffset() == timedelta(0)
+    local = bc.business_now(ZoneInfo("Asia/Tashkent"))
+    assert (local.hour, local.minute) == (14, 30) and local.utcoffset() == timedelta(hours=5)
+    assert router_module._business_today().isoformat() == "2026-11-02"
+
+
+def _all_datetime_columns():
     from src.models import exam_models
 
-    checked = 0
     for table in exam_models.Base.metadata.tables.values():
         for column in table.columns:
-            if column.server_default is None or "now" not in str(column.server_default.arg).lower():
-                continue
-            assert column.default is not None, (table.name, column.name)  # a Python default; server_default stays as the fallback
-            value = column.default.arg(None)
-            assert (value.tzinfo is not None) == bool(column.type.timezone), (table.name, column.name)  # aware for timestamptz, naive otherwise
-            assert abs((value.replace(tzinfo=None) - bc.utc_now()).total_seconds()) < 1
-            checked += 1
+            if isinstance(column.type, DateTime):
+                yield table.name, column
+
+
+def test_every_datetime_column_stamps_from_the_clock_module_with_the_type_of_the_column():
+    """ALL ``DateTime`` columns, not only those with a ``server_default``: a Python default must come from the clock module and match the zone of the
+    column; an ``onupdate`` too."""
+    checked = 0
+    for table, column in _all_datetime_columns():
+        if column.default is None:
+            continue
+        func = column.default.arg
+        assert getattr(func, "__module__", "") == "src.core.business_clock", (table, column.name, func)
+        value = func(None)
+        assert (value.tzinfo is not None) == bool(column.type.timezone), (table, column.name)
+        assert abs((value.replace(tzinfo=None) - bc.utc_now()).total_seconds()) < 1
+        if column.onupdate is not None:
+            assert getattr(column.onupdate.arg, "__module__", "") == "src.core.business_clock", (table, column.name)
+        checked += 1
     assert checked >= 8
+
+
+def test_a_datetime_column_without_a_python_default_has_no_database_clock_either():
+    """No Python default and a ``server_default`` now() would let the database read ITS clock instead of the stand clock."""
+    for table, column in _all_datetime_columns():
+        if column.default is None:
+            assert column.server_default is None, (table, column.name)
 
 
 def test_the_four_timestamptz_columns_are_declared_with_a_zone():

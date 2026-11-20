@@ -7,7 +7,7 @@ The clock of the router is frozen (LESSONS 76/82)."""
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -22,16 +22,10 @@ API = "/api/v1"
 NOW = datetime(2026, 11, 2, 9, 30, 0)
 
 
-class FrozenDatetime(datetime):
-    @classmethod
-    def utcnow(cls):
-        return cls(NOW.year, NOW.month, NOW.day, NOW.hour, NOW.minute, NOW.second)
-
 
 @pytest.fixture(autouse=True)
 def _frozen_clock(monkeypatch):
-    monkeypatch.setattr(router_module, "datetime", FrozenDatetime)
-    monkeypatch.setattr(business_clock, "utc_now", FrozenDatetime.utcnow)  # the router reads the time through the stand clock
+    monkeypatch.setattr(business_clock, "_real_now", lambda: NOW.replace(tzinfo=timezone.utc))  # the one point where the service reads the real time
 
 
 def big_variants(variants=8, tasks=25):
