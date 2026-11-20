@@ -111,3 +111,9 @@ def business_now(zone: tzinfo) -> datetime:
     moment = datetime.now(zone)
     offset = current_offset_seconds()
     return moment + timedelta(seconds=offset) if offset else moment
+
+
+def utc_now_aware() -> datetime:
+    """Now as an AWARE UTC instant on the stand clock (``datetime.now(timezone.utc)`` outside the test mode): for the columns that are
+    ``timestamp with time zone`` and the places that always wrote an aware value."""
+    return utc_now().replace(tzinfo=timezone.utc)

@@ -126,7 +126,7 @@ class ExamReportRepository:
 
         for field, value in values.items():
             setattr(existing, field, value)
-        existing.updated_at = business_clock.utc_now()
+        existing.updated_at = business_clock.utc_now_aware()
         self.db.commit()
         self.db.refresh(existing)
         return existing
@@ -167,7 +167,7 @@ class SessionRepository:
         session.total_tasks = total_tasks
         session.time_spent_seconds = time_spent
         session.status = "submitted"
-        session.submitted_at = business_clock.utc_now()
+        session.submitted_at = business_clock.utc_now_aware()
         if distractor_analytics is not None:
             session.distractor_analytics = distractor_analytics
         if commit:

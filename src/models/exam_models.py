@@ -22,7 +22,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB as PostgreSQLJSONB
 from sqlalchemy.sql import func
 
-from src.core.business_clock import utc_now
+from src.core.business_clock import utc_now, utc_now_aware
 from src.models.shared import Base
 
 # Keep SQLite-based unit fixtures usable, while accurately modelling the
@@ -107,8 +107,8 @@ class GeneratedExam(Base):
     source_exam_id = Column(String(30), nullable=True)  # set when cloned
 
     created_by = Column(String(100))   # user_id from auth
-    created_at = Column(DateTime, default=utc_now, server_default=func.now())
-    updated_at = Column(DateTime, default=utc_now, server_default=func.now(), onupdate=utc_now)
+    created_at = Column(DateTime(timezone=True), default=utc_now_aware, server_default=func.now())  # timestamptz in the database (migration 001)
+    updated_at = Column(DateTime(timezone=True), default=utc_now_aware, server_default=func.now(), onupdate=utc_now_aware)
 
     __table_args__ = (
         Index(
@@ -285,5 +285,5 @@ class ExamSession(Base):
     status = Column(String(20), nullable=False, default="in_progress")
     # in_progress | submitted
 
-    started_at = Column(DateTime, default=utc_now, server_default=func.now())
-    submitted_at = Column(DateTime)
+    started_at = Column(DateTime(timezone=True), default=utc_now_aware, server_default=func.now())  # timestamptz in the database (migration 001)
+    submitted_at = Column(DateTime(timezone=True))

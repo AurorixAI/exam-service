@@ -54,17 +54,83 @@ def test_the_guard_sees_a_violation():
         path.unlink()
 
 
-def test_model_stamp_defaults_come_from_the_clock_module():
+def test_model_stamp_defaults_come_from_the_clock_module_with_the_type_of_the_column():
     from src.models import exam_models
 
-    for table in ("generated_exams", "exam_lifecycle_events", "exam_sessions", "exam_reports", "exam_deletions", "exam_print_packages"):
-        t = exam_models.Base.metadata.tables.get(table)
-        if t is None:
-            continue
-        for column in t.columns:
-            if column.server_default is not None and "now" in str(column.server_default.arg).lower():
-                assert column.default is not None, (table, column.name)  # a Python default (utc_now); server_default stays as the fallback
-                assert abs((column.default.arg(None) - bc.utc_now()).total_seconds()) < 1, (table, column.name)
+    checked = 0
+    for table in exam_models.Base.metadata.tables.values():
+        for column in table.columns:
+            if column.server_default is None or "now" not in str(column.server_default.arg).lower():
+                continue
+            assert column.default is not None, (table.name, column.name)  # a Python default; server_default stays as the fallback
+            value = column.default.arg(None)
+            assert (value.tzinfo is not None) == bool(column.type.timezone), (table.name, column.name)  # aware for timestamptz, naive otherwise
+            assert abs((value.replace(tzinfo=None) - bc.utc_now()).total_seconds()) < 1
+            checked += 1
+    assert checked >= 8
+
+
+def test_the_four_timestamptz_columns_are_declared_with_a_zone():
+    """migration 001: exam_sessions.started_at / submitted_at and generated_exams.created_at / updated_at are ``timestamp with time zone``."""
+    from src.models.exam_models import ExamSession, GeneratedExam
+
+    for column in (ExamSession.started_at, ExamSession.submitted_at, GeneratedExam.created_at, GeneratedExam.updated_at):
+        assert column.type.timezone is True, column
+    from src.models.exam_models import ExamLifecycleEvent, ExamReport
+
+    for column in (ExamLifecycleEvent.occurred_at, ExamReport.updated_at, ExamReport.generated_at):
+        assert column.type.timezone is False, column
+
+
+def test_aware_and_naive_stamps_of_the_clock_module_differ_only_by_the_zone():
+    naive, aware = bc.utc_now(), bc.utc_now_aware()
+    assert naive.tzinfo is None and aware.utcoffset() == timedelta(0)
+    assert abs((aware.replace(tzinfo=None) - naive).total_seconds()) < 1
+
+
+class _Rows:
+    """A query chain whose first() returns the given row (what PostgreSQL returns for ``timestamptz``: AWARE values)."""
+
+    def __init__(self, row):
+        self.row = row
+
+    def __getattr__(self, name):
+        return lambda *a, **k: self
+
+    def first(self):
+        return self.row
+
+
+@pytest.mark.parametrize("shift", [0, 5400])
+def test_aware_started_at_from_postgres_does_not_break_the_timers(stand, shift):
+    """exam_sessions.started_at as PostgreSQL returns it (aware): the timers subtract it from the stand clock without a TypeError."""
+    from types import SimpleNamespace
+
+    _shift(stand, shift)
+    started = bc.utc_now_aware() - timedelta(minutes=10)
+    exam = SimpleNamespace(id="E", settings={}, status="active", total_time_minutes=45)
+    assert router_module._exam_started_at(_Rows((started,)), exam).tzinfo is None
+    assert router_module._exam_deadline_passed(_Rows((started,)), exam) is False
+    assert 34 * 60 <= router_module._exam_remaining_seconds(_Rows((started,)), exam) <= 35 * 60
+    session = SimpleNamespace(started_at=started)
+    total, left = router_module._remaining_seconds(exam, session, None, bc.utc_now())
+    assert total == 45 * 60 and 34 * 60 <= left <= 35 * 60
+    old = bc.utc_now_aware() - timedelta(minutes=50)
+    assert router_module._exam_deadline_passed(_Rows((old,)), exam) is True
+
+
+def test_aware_submitted_at_and_report_stamps_do_not_break_the_report_cooldown(stand):
+    """exam_sessions.submitted_at (aware from PostgreSQL) is compared with the report's stamps and the cool-down is counted on the stand clock."""
+    from types import SimpleNamespace
+
+    from src.domain import report_generator
+
+    _shift(stand, 7200)
+    now = bc.utc_now_aware()
+    report = SimpleNamespace(updated_at=bc.utc_now(), generated_at=None, avg_score_pct=50, pass_rate_pct=50)
+    assert report_generator._last_generated_at(report).tzinfo is None
+    assert report_generator._naive_utc(now - timedelta(minutes=5)) < report_generator._last_generated_at(report)
+    assert abs((report_generator._utcnow() - bc.utc_now()).total_seconds()) < 1
 
 
 @pytest.fixture
